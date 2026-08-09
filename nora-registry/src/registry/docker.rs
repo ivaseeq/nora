@@ -215,7 +215,9 @@ async fn storage_get_with_fallback(
 ) -> Result<Bytes, crate::storage::StorageError> {
     match storage.get(ns_key).await {
         Ok(data) => Ok(data),
-        Err(_) if ns_key != legacy_key => storage.get(legacy_key).await,
+        Err(crate::storage::StorageError::NotFound) if ns_key != legacy_key => {
+            storage.get(legacy_key).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -234,7 +236,9 @@ async fn storage_get_reader_with_fallback(
 > {
     match storage.get_reader(ns_key).await {
         Ok(reader) => Ok(reader),
-        Err(_) if ns_key != legacy_key => storage.get_reader(legacy_key).await,
+        Err(crate::storage::StorageError::NotFound) if ns_key != legacy_key => {
+            storage.get_reader(legacy_key).await
+        }
         Err(e) => Err(e),
     }
 }
@@ -320,14 +324,12 @@ async fn storage_stat_with_fallback(
     storage: &Storage,
     ns_key: &str,
     legacy_key: &str,
-) -> Option<crate::storage::FileMeta> {
-    if let Some(meta) = storage.stat(ns_key).await {
-        return Some(meta);
+) -> crate::storage::Result<Option<crate::storage::FileMeta>> {
+    match storage.stat(ns_key).await? {
+        Some(meta) => Ok(Some(meta)),
+        None if ns_key != legacy_key => storage.stat(legacy_key).await,
+        None => Ok(None),
     }
-    if ns_key != legacy_key {
-        return storage.stat(legacy_key).await;
-    }
-    None
 }
 
 /// Metadata for a Docker image stored alongside manifests
@@ -1109,7 +1111,7 @@ async fn check_blob(
     // Use stat() instead of get() to avoid loading multi-GB blobs into memory
     // just to return Content-Length on a HEAD request (#526).
     match storage_stat_with_fallback(&state.storage, &key, &legacy_key).await {
-        Some(meta) => {
+        Ok(Some(meta)) => {
             // Mirror download_blob / HEAD-manifest: a proxy-cached blob still within its
             // cooldown is reported as held (403), not available — so HEAD and GET agree.
             // A local/internal blob has no proxy record (`New`) and acks normally.
@@ -1122,7 +1124,8 @@ async fn check_blob(
             )
                 .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => crate::registry::storage_error_response("docker", "stat", &key, &error),
     }
 }
 
@@ -1171,78 +1174,82 @@ async fn download_blob(
     let legacy_key = blob_key(None, &name, &digest);
 
     // Try local storage first — streaming read, never loads full blob into RAM (#580)
-    if let Ok((size, reader)) =
-        storage_get_reader_with_fallback(&state.storage, &key, &legacy_key).await
-    {
-        // Curation integrity check using digest from URL (no full-data rehash).
-        // Docker blobs are content-addressed: the URL digest IS the integrity.
-        if let Some(response) = crate::curation::verify_integrity_by_hash(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Docker,
-            &name,
-            Some(&digest),
-            &digest,
-        ) {
-            return response;
-        }
-
-        // Quarantine: a proxy-cached blob still within its cooldown window is held.
-        // A blob with no proxy record (a local push, or an entry pruned past 90d)
-        // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
-        // the 206 range serve and the 200 full serve below.
-        if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
-            return resp;
-        }
-
-        // Range request: 206 Partial Content, or 416 when the client asks past the end
-        // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
-        // only) does not apply — a ranged serve relies on the content-addressed storage
-        // key plus the client's own content-digest check, as Docker/Harbor do. An
-        // absent/malformed range falls through to the full 200 below.
-        if let Some(response) = crate::registry::range::range_response(
-            &state.storage,
-            &[&key, &legacy_key],
-            &headers,
-            size,
-            "application/octet-stream",
-            &[
-                (
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable".to_string(),
-                ),
-                (
-                    HeaderName::from_static("docker-content-digest"),
-                    digest.clone(),
-                ),
-            ],
-        )
-        .await
-        {
-            if response.status() == StatusCode::PARTIAL_CONTENT {
-                state.metrics.record_download("docker");
-                state.metrics.record_cache_hit("docker");
+    match storage_get_reader_with_fallback(&state.storage, &key, &legacy_key).await {
+        Ok((size, reader)) => {
+            // Curation integrity check using digest from URL (no full-data rehash).
+            // Docker blobs are content-addressed: the URL digest IS the integrity.
+            if let Some(response) = crate::curation::verify_integrity_by_hash(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Docker,
+                &name,
+                Some(&digest),
+                &digest,
+            ) {
+                return response;
             }
-            return response;
-        }
 
-        state.metrics.record_download("docker");
-        state.metrics.record_cache_hit("docker");
-        state.activity.push(ActivityEntry::new(
-            ActionType::Pull,
-            format!("{}@{}", name, &digest[..19.min(digest.len())]),
-            crate::registry_type::RegistryType::Docker,
-            "LOCAL",
-        ));
-        let stream = ReaderStream::new(VerifyingReader::new(reader, &digest));
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, size)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
-            .header("docker-content-digest", &digest)
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            // Quarantine: a proxy-cached blob still within its cooldown window is held.
+            // A blob with no proxy record (a local push, or an entry pruned past 90d)
+            // reads as `New` and is served; only `Pending` blocks (enforce). Covers both
+            // the 206 range serve and the 200 full serve below.
+            if let Some(resp) = quarantine_cache_serve_gate(&state, &digest) {
+                return resp;
+            }
+
+            // Range request: 206 Partial Content, or 416 when the client asks past the end
+            // (#657). A ranged response is partial, so the streaming SHA-256 verify (full-GET
+            // only) does not apply — a ranged serve relies on the content-addressed storage
+            // key plus the client's own content-digest check, as Docker/Harbor do. An
+            // absent/malformed range falls through to the full 200 below.
+            if let Some(response) = crate::registry::range::range_response(
+                &state.storage,
+                &[&key, &legacy_key],
+                &headers,
+                size,
+                "application/octet-stream",
+                &[
+                    (
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable".to_string(),
+                    ),
+                    (
+                        HeaderName::from_static("docker-content-digest"),
+                        digest.clone(),
+                    ),
+                ],
+            )
+            .await
+            {
+                if response.status() == StatusCode::PARTIAL_CONTENT {
+                    state.metrics.record_download("docker");
+                    state.metrics.record_cache_hit("docker");
+                }
+                return response;
+            }
+
+            state.metrics.record_download("docker");
+            state.metrics.record_cache_hit("docker");
+            state.activity.push(ActivityEntry::new(
+                ActionType::Pull,
+                format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                crate::registry_type::RegistryType::Docker,
+                "LOCAL",
+            ));
+            let stream = ReaderStream::new(VerifyingReader::new(reader, &digest));
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_LENGTH, size)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                .header("docker-content-digest", &digest)
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+        Err(crate::storage::StorageError::NotFound) => {}
+        Err(error) => {
+            return crate::registry::storage_error_response("docker", "get_reader", &key, &error);
+        }
     }
 
     // #733/#821: an internal-namespace image's blob with no local copy is never proxied
@@ -2147,8 +2154,24 @@ async fn get_manifest(
     // is skipped tag revalidation on those legacy entries.)
     let (cached, hosted) = match state.storage.get(&key).await {
         Ok(data) => (Some(data), key == legacy_key),
-        Err(_) if key != legacy_key => (state.storage.get(&legacy_key).await.ok(), true),
-        Err(_) => (None, true),
+        Err(crate::storage::StorageError::NotFound) if key != legacy_key => {
+            match state.storage.get(&legacy_key).await {
+                Ok(data) => (Some(data), true),
+                Err(crate::storage::StorageError::NotFound) => (None, true),
+                Err(error) => {
+                    return crate::registry::storage_error_response(
+                        "docker",
+                        "get",
+                        &legacy_key,
+                        &error,
+                    );
+                }
+            }
+        }
+        Err(crate::storage::StorageError::NotFound) => (None, true),
+        Err(error) => {
+            return crate::registry::storage_error_response("docker", "get", &key, &error);
+        }
     };
     // Digest references are immutable (content-addressed) → the cache is authoritative forever.
     // Tag references on PROXIED copies are MUTABLE: a tag can be re-pushed to point at a
@@ -2164,9 +2187,12 @@ async fn get_manifest(
     let revalidate = !hosted && !upstreams_to_try.is_empty();
     let cache_fresh = if cached.is_some() {
         let modified = if revalidate && !is_digest {
-            storage_stat_with_fallback(&state.storage, &key, &legacy_key)
-                .await
-                .map(|m| m.modified)
+            match storage_stat_with_fallback(&state.storage, &key, &legacy_key).await {
+                Ok(meta) => meta.map(|m| m.modified),
+                Err(error) => {
+                    return crate::registry::storage_error_response("docker", "stat", &key, &error);
+                }
+            }
         } else {
             None
         };
@@ -2320,8 +2346,14 @@ fn serve_cached_manifest(
 /// a manifest pointing at content we do not have must be rejected (`MANIFEST_BLOB_UNKNOWN`)
 /// rather than stored as a broken image. Bodies we cannot parse return `None` — malformed
 /// manifests are out of scope here.
-async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Option<String> {
-    let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+async fn missing_manifest_ref(
+    body: &[u8],
+    storage: &Storage,
+    name: &str,
+) -> crate::storage::Result<Option<String>> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Ok(None);
+    };
 
     // Image index / manifest list: referenced sub-manifests live under manifests/.
     if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
@@ -2329,14 +2361,14 @@ async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Opt
             if let Some(d) = m.get("digest").and_then(|v| v.as_str()) {
                 if storage
                     .stat(&format!("docker/{}/manifests/{}.json", name, d))
-                    .await
+                    .await?
                     .is_none()
                 {
-                    return Some(d.to_string());
+                    return Ok(Some(d.to_string()));
                 }
             }
         }
-        return None;
+        return Ok(None);
     }
 
     // Image manifest: the config descriptor and every layer are blobs.
@@ -2358,13 +2390,13 @@ async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Opt
     for d in refs {
         if storage
             .stat(&format!("docker/{}/blobs/{}", name, d))
-            .await
+            .await?
             .is_none()
         {
-            return Some(d.to_string());
+            return Ok(Some(d.to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 async fn put_manifest(
@@ -2391,7 +2423,18 @@ async fn put_manifest(
 
     // Reject a manifest that references content (config / layers / sub-manifests) we do
     // not have — a broken image must not be pushable (OCI MANIFEST_BLOB_UNKNOWN).
-    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &name).await {
+    let missing = match missing_manifest_ref(&body, &state.storage, &name).await {
+        Ok(missing) => missing,
+        Err(error) => {
+            return crate::registry::storage_error_response(
+                "docker",
+                "stat manifest references",
+                &name,
+                &error,
+            );
+        }
+    };
+    if let Some(missing) = missing {
         tracing::warn!(
             name = %name,
             reference = %reference,
@@ -3121,12 +3164,11 @@ async fn extract_docker_publish_date(
     if upstreams_empty {
         let key = manifest_key(ns, name, reference);
         let legacy = manifest_key(None, name, reference);
-        // Try namespaced first, then legacy
-        if let Some(date) = crate::curation::extract_mtime_as_publish_date(storage, &key).await {
-            return Some(date);
-        }
-        if key != legacy {
-            return crate::curation::extract_mtime_as_publish_date(storage, &legacy).await;
+        match storage_stat_with_fallback(storage, &key, &legacy).await {
+            Ok(meta) => return meta.map(|m| m.modified as i64),
+            Err(error) => {
+                tracing::warn!(%key, %error, "cannot read Docker manifest mtime for curation");
+            }
         }
     }
 

@@ -125,7 +125,7 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/maven", get(maven_list))
         .route("/ui/maven/{*path}", get(maven_detail))
         .route("/ui/npm", get(npm_list))
-        .route("/ui/npm/{name}", get(npm_detail))
+        .route("/ui/npm/{*name}", get(npm_detail))
         .route("/ui/cargo", get(cargo_list))
         .route("/ui/cargo/{name}", get(cargo_detail))
         .route("/ui/pypi", get(pypi_list))
@@ -167,7 +167,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
         .route("/api/ui/{registry_type}/list", get(api_list))
-        .route("/api/ui/{registry_type}/{name}", get(api_detail))
+        .route("/api/ui/{registry_type}/{*name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
 }
 
@@ -319,7 +319,7 @@ async fn maven_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (com, org, io, etc.)
-    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
+    let (entries, _) = api::get_maven_dir_listing(&state, "").await;
     let total = entries.len();
 
     Html(templates::render_maven_dir(
@@ -344,11 +344,11 @@ async fn maven_detail(
     let auth_enabled = state.auth.is_some();
 
     // Try hierarchical browsing: check if this is a directory or leaf artifact
-    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+    let (entries, is_leaf) = api::get_maven_dir_listing(&state, &path).await;
 
     if is_leaf || entries.is_empty() {
         // Leaf artifact — show files (JARs, POMs, etc.)
-        let detail = get_maven_detail(&state.storage, &path).await;
+        let detail = get_maven_detail(&state, &path).await;
         Html(render_maven_detail(&path, &detail, lang, auth_enabled))
     } else {
         // Namespace directory — show children
@@ -408,7 +408,7 @@ async fn npm_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_npm_detail(&state.storage, &name, show_prerelease, show_all).await;
+    let detail = get_npm_detail(&state, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "npm",
         &name,
@@ -464,7 +464,7 @@ async fn cargo_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_cargo_detail(&state.storage, &name, show_prerelease, show_all).await;
+    let detail = get_cargo_detail(&state, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "cargo",
         &name,
@@ -520,7 +520,7 @@ async fn pypi_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_pypi_detail(&state.storage, &name, show_prerelease, show_all).await;
+    let detail = get_pypi_detail(&state, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "pypi",
         &name,
@@ -541,7 +541,7 @@ async fn go_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (github.com, golang.org, etc.)
-    let (entries, _) = api::get_go_dir_listing(&state.storage, "").await;
+    let (entries, _) = api::get_go_dir_listing(&state, "").await;
     let total = entries.len();
 
     Html(templates::render_go_dir(
@@ -571,14 +571,14 @@ async fn go_detail(
     let auth_enabled = state.auth.is_some();
 
     // Try hierarchical browsing: check if this is a directory or leaf module
-    let (entries, is_leaf) = api::get_go_dir_listing(&state.storage, &name).await;
+    let (entries, is_leaf) = api::get_go_dir_listing(&state, &name).await;
 
     if is_leaf || entries.is_empty() {
         // Leaf module — show version detail page
         let base_url = resolve_base_url(&state);
         let show_prerelease = query.prerelease.unwrap_or(false);
         let show_all = query.all.unwrap_or(false);
-        let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
+        let detail = get_go_detail(&state, &name, show_prerelease, show_all).await;
         Html(render_package_detail(
             "go",
             &name,
@@ -640,7 +640,7 @@ async fn raw_detail(
     let auth_enabled = state.auth.is_some();
 
     // Check if this path is a directory (has children) or a single file
-    let (entries, is_dir) = api::get_raw_dir_listing(&state.storage, &name).await;
+    let (entries, is_dir) = api::get_raw_dir_listing(&state, &name).await;
 
     if is_dir && !entries.is_empty() {
         // Directory with children — render as browsable folder listing
@@ -654,7 +654,7 @@ async fn raw_detail(
         ))
     } else {
         // Single file or leaf directory — render detail page
-        let detail = api::get_raw_detail(&state.storage, &name).await;
+        let detail = api::get_raw_detail(&state, &name).await;
         Html(templates::render_package_detail(
             "raw",
             &name,
@@ -735,14 +735,7 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(
-        &state.storage,
-        registry_key,
-        &name,
-        show_prerelease,
-        show_all,
-    )
-    .await;
+    let detail = get_generic_detail(&state, registry_key, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         registry_key,
         &name,
@@ -765,7 +758,7 @@ async fn ansible_browse_root(
     );
     let auth_enabled = state.auth.is_some();
 
-    let entries = api::get_ansible_namespace_listing(&state.storage, "").await;
+    let entries = api::get_ansible_namespace_listing(&state, "").await;
     let total = entries.len();
 
     Html(templates::render_ansible_dir(
@@ -799,7 +792,7 @@ async fn ansible_browse(
     match segments.len() {
         // /ui/ansible/community → list collections in namespace
         1 => {
-            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let entries = api::get_ansible_namespace_listing(&state, &path).await;
             let total = entries.len();
             Html(templates::render_ansible_dir(
                 &path,
@@ -815,14 +808,8 @@ async fn ansible_browse(
             let show_prerelease = query.prerelease.unwrap_or(false);
             let show_all = query.all.unwrap_or(false);
             let full_name = format!("{}.{}", segments[0], segments[1]);
-            let detail = get_generic_detail(
-                &state.storage,
-                "ansible",
-                &full_name,
-                show_prerelease,
-                show_all,
-            )
-            .await;
+            let detail =
+                get_generic_detail(&state, "ansible", &full_name, show_prerelease, show_all).await;
             Html(render_package_detail(
                 "ansible",
                 &full_name,
@@ -1081,5 +1068,86 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+}
+
+#[cfg(test)]
+mod named_npm_route_tests {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn encoded_repository_qualified_npm_link_opens_detail_page() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let context = create_test_context_with_config(|config| {
+            config.npm.repositories = vec![crate::config::NpmRepository::Hosted {
+                name: "npm-private".to_string(),
+                write_policy: crate::config::NpmWritePolicy::AllowOnce,
+            }];
+            config.npm.default_repository = Some("npm-private".to_string());
+        });
+        let blob = b"tarball";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.0.0",
+            "dist": {
+                "integrity": format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(blob))
+                )
+            }
+        }))
+        .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.0.0.json",
+                &manifest,
+            )
+            .await
+            .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                &crate::npm_layout::hosted_blob_key_from_manifest(
+                    "npm-private",
+                    "@scope/pkg",
+                    &manifest,
+                )
+                .unwrap(),
+                blob,
+            )
+            .await
+            .unwrap();
+        context.state.repo_index.invalidate("npm");
+        assert!(
+            context
+                .state
+                .repo_index
+                .rebuild_for_test(
+                    crate::registry_type::RegistryType::Npm,
+                    &context.state.storage,
+                )
+                .await
+        );
+
+        let list = send(&context.app, Method::GET, "/ui/npm", "").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_html = String::from_utf8(body_bytes(list).await.to_vec()).unwrap();
+        let detail_path = "/ui/npm/repositories%2Fnpm-private%2F%40scope%2Fpkg";
+        assert!(list_html.contains(detail_path));
+
+        let detail = send(&context.app, Method::GET, detail_path, "").await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_html = String::from_utf8(body_bytes(detail).await.to_vec()).unwrap();
+        assert!(detail_html.contains(&format!(
+            "npm install @scope/pkg --registry {}/repository/npm-private",
+            context.state.config.server.public_base_url()
+        )));
     }
 }

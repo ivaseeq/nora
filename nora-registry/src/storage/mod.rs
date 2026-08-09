@@ -5,7 +5,7 @@ mod local;
 mod object;
 
 pub use local::LocalStorage;
-pub use object::ObjectStorage;
+pub use object::{ObjectStorage, ObjectStoreOptions};
 
 use crate::hash_pin_store::HashPinStore;
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
@@ -33,6 +33,9 @@ pub enum StorageError {
 
     #[error("Object not found")]
     NotFound,
+
+    #[error("Object already exists")]
+    AlreadyExists,
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -87,10 +90,24 @@ pub enum RepinOutcome {
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn put(&self, key: &str, data: &[u8]) -> Result<()>;
+    /// Atomically create `key`, returning [`StorageError::AlreadyExists`] if a
+    /// concurrent writer or a pre-existing object already owns the key.
+    ///
+    /// The default fails closed instead of emulating this with `stat` + `put`,
+    /// which would allow two callers to win the race. Production backends must
+    /// override this method with a backend-native conditional create.
+    async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<()> {
+        Err(StorageError::Network(
+            "atomic create is not supported by this storage backend".to_string(),
+        ))
+    }
     async fn get(&self, key: &str) -> Result<Bytes>;
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
-    async fn stat(&self, key: &str) -> Option<FileMeta>;
+    /// Return metadata when the object exists. Only a backend-confirmed
+    /// not-found becomes `Ok(None)`; authorization, timeout and provider errors
+    /// remain errors so callers cannot mistake uncertainty for absence.
+    async fn stat(&self, key: &str) -> Result<Option<FileMeta>>;
     /// List keys under `prefix` together with their size/mtime.
     ///
     /// Returns the metadata the listing already carries instead of forcing a
@@ -102,13 +119,17 @@ pub trait StorageBackend: Send + Sync {
         let keys = self.list(prefix).await?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            if let Some(meta) = self.stat(&key).await {
+            if let Some(meta) = self.stat(&key).await? {
                 out.push((key, meta));
             }
         }
         Ok(out)
     }
     async fn health_check(&self) -> bool;
+    /// Refresh cached backend reachability. Object stores implement a
+    /// result- and wall-time-bounded probe; local storage keeps its existing
+    /// direct write check.
+    async fn refresh_reachability(&self) {}
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
@@ -161,6 +182,11 @@ pub trait StorageBackend: Send + Sync {
 pub struct Storage {
     inner: Arc<dyn StorageBackend>,
     pin_store: Option<Arc<HashPinStore>>,
+    /// Global admission control for full listings. Background size/index
+    /// rebuilds and any remaining callers cannot fan out concurrent expensive
+    /// scans against the same backend. Reachability uses its separate bounded
+    /// probe and deliberately does not acquire this permit.
+    scan_permit: Arc<tokio::sync::Semaphore>,
 }
 
 impl Storage {
@@ -169,6 +195,7 @@ impl Storage {
         Self {
             inner: Arc::new(LocalStorage::new(path)),
             pin_store: Some(Arc::new(HashPinStore::new(pin_path))),
+            scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -180,19 +207,41 @@ impl Storage {
         secret_key: Option<&str>,
         virtual_hosted: bool,
     ) -> Self {
+        Self::new_s3_with_options(
+            s3_url,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            virtual_hosted,
+            ObjectStoreOptions::default(),
+        )
+    }
+
+    pub fn new_s3_with_options(
+        s3_url: &str,
+        bucket: &str,
+        region: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        virtual_hosted: bool,
+        options: ObjectStoreOptions,
+    ) -> Self {
         tracing::warn!(
             "Hash pin store disabled for S3 backend — integrity verification unavailable"
         );
         Self {
-            inner: Arc::new(ObjectStorage::new(
+            inner: Arc::new(ObjectStorage::new_with_options(
                 s3_url,
                 bucket,
                 region,
                 access_key,
                 secret_key,
                 virtual_hosted,
+                options,
             )),
             pin_store: None,
+            scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -201,16 +250,32 @@ impl Storage {
         service_account_path: Option<&str>,
         base_url: Option<&str>,
     ) -> Self {
+        Self::new_gcs_with_options(
+            bucket,
+            service_account_path,
+            base_url,
+            ObjectStoreOptions::default(),
+        )
+    }
+
+    pub fn new_gcs_with_options(
+        bucket: &str,
+        service_account_path: Option<&str>,
+        base_url: Option<&str>,
+        options: ObjectStoreOptions,
+    ) -> Self {
         tracing::warn!(
             "Hash pin store disabled for GCS backend — integrity verification unavailable"
         );
         Self {
-            inner: Arc::new(ObjectStorage::new_gcs(
+            inner: Arc::new(ObjectStorage::new_gcs_with_options(
                 bucket,
                 service_account_path,
                 base_url,
+                options,
             )),
             pin_store: None,
+            scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -223,6 +288,7 @@ impl Storage {
         Self {
             inner,
             pin_store: None,
+            scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -293,6 +359,103 @@ impl Storage {
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
+                    .inc();
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically create `key` without replacing an existing object.
+    ///
+    /// Exactly one concurrent caller can succeed. Only that winner records a
+    /// hash pin; losing callers leave both the stored bytes and existing pin
+    /// untouched.
+    pub async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<()> {
+        validate_storage_key(key)?;
+        match self.inner.put_if_absent(key, data).await {
+            Ok(()) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "ok"])
+                    .inc();
+                if let Some(ref pins) = self.pin_store {
+                    let pins = Arc::clone(pins);
+                    let key_owned = key.to_string();
+                    let data_owned = data.to_vec();
+                    // Match put(): the winning create is not reported complete
+                    // until its integrity pin is durable.
+                    match tokio::task::spawn_blocking(move || pins.record(&key_owned, &data_owned))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put_if_absent", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                        Err(e) => {
+                            STORAGE_OPERATIONS
+                                .with_label_values(&["put_if_absent", "pin_error"])
+                                .inc();
+                            tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
+                            return Err(StorageError::Io(std::io::Error::other(format!(
+                                "hash-pin record failed: {e}"
+                            ))));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(StorageError::AlreadyExists) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "already_exists"])
+                    .inc();
+                // The create may have published the body and then failed while
+                // durably recording its local hash pin. An exact client retry
+                // is the only safe automatic repair: read the already-existing
+                // bytes without overwriting them, compare to the candidate,
+                // and fill the missing pin only on byte identity.
+                if let Some(ref pins) = self.pin_store {
+                    if pins.get(key).is_none() {
+                        let existing = self.inner.get(key).await?;
+                        if existing.as_ref() == data {
+                            let pins = Arc::clone(pins);
+                            let key_owned = key.to_string();
+                            let data_owned = data.to_vec();
+                            match tokio::task::spawn_blocking(move || {
+                                pins.record(&key_owned, &data_owned)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    STORAGE_OPERATIONS
+                                        .with_label_values(&["put_if_absent", "pin_error"])
+                                        .inc();
+                                    return Err(StorageError::Io(std::io::Error::other(format!(
+                                        "hash-pin retry repair failed: {e}"
+                                    ))));
+                                }
+                                Err(e) => {
+                                    STORAGE_OPERATIONS
+                                        .with_label_values(&["put_if_absent", "pin_error"])
+                                        .inc();
+                                    return Err(StorageError::Io(std::io::Error::other(format!(
+                                        "hash-pin retry repair task panicked: {e}"
+                                    ))));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(StorageError::AlreadyExists)
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["put_if_absent", "error"])
                     .inc();
                 Err(e)
             }
@@ -470,6 +633,11 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(prefix)?;
         }
+        let _permit = self
+            .scan_permit
+            .acquire()
+            .await
+            .expect("storage scan semaphore is never closed");
         let keys = self.inner.list(prefix).await?;
         Ok(keys
             .into_iter()
@@ -484,6 +652,11 @@ impl Storage {
         if !prefix.is_empty() {
             validate_storage_key(prefix)?;
         }
+        let _permit = self
+            .scan_permit
+            .acquire()
+            .await
+            .expect("storage scan semaphore is never closed");
         let entries = self.inner.list_with_meta(prefix).await?;
         Ok(entries
             .into_iter()
@@ -491,15 +664,17 @@ impl Storage {
             .collect())
     }
 
-    pub async fn stat(&self, key: &str) -> Option<FileMeta> {
-        if validate_storage_key(key).is_err() {
-            return None;
-        }
+    pub async fn stat(&self, key: &str) -> Result<Option<FileMeta>> {
+        validate_storage_key(key)?;
         self.inner.stat(key).await
     }
 
     pub async fn health_check(&self) -> bool {
         self.inner.health_check().await
+    }
+
+    pub async fn refresh_reachability_cache(&self) {
+        self.inner.refresh_reachability().await;
     }
 
     pub async fn total_size(&self) -> u64 {
@@ -571,6 +746,11 @@ impl Storage {
 
     /// Refresh cached total_size. No-op for local storage, computes for S3.
     pub async fn refresh_total_size_cache(&self) {
+        let _permit = self
+            .scan_permit
+            .acquire()
+            .await
+            .expect("storage scan semaphore is never closed");
         self.inner.refresh_total_size().await;
     }
 
@@ -728,6 +908,70 @@ mod tests {
         );
         // And the recorded pin must match the bytes (a subsequent get verifies).
         assert_eq!(&storage.get("raw/x/app.bin").await.unwrap()[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_pins_only_the_winning_bytes() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+
+        storage.put_if_absent(key, b"winner").await.unwrap();
+        let winner_pin = hex::encode(Sha256::digest(b"winner"));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(winner_pin.as_str()),
+            "the successful create must persist its pin before returning"
+        );
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"loser").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(winner_pin.as_str()),
+            "a losing create must not replace the existing pin"
+        );
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_exact_retry_repairs_missing_pin_without_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+        let src = dir.path().join("published-before-pin.bin");
+        std::fs::write(&src, b"winner").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+        assert_eq!(storage.get_pin_hash(key), None);
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"winner").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(
+            storage.get_pin_hash(key).as_deref(),
+            Some(hex::encode(Sha256::digest(b"winner")).as_str())
+        );
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_different_retry_never_pins_candidate_or_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("store").to_str().unwrap());
+        let key = "raw/x/immutable.bin";
+        let src = dir.path().join("published-before-pin.bin");
+        std::fs::write(&src, b"winner").unwrap();
+        storage.put_from_path(key, &src, None).await.unwrap();
+
+        assert!(matches!(
+            storage.put_if_absent(key, b"loser").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        assert_eq!(storage.get_pin_hash(key), None);
+        assert_eq!(&storage.get(key).await.unwrap()[..], b"winner");
     }
 
     #[test]

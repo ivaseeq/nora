@@ -145,7 +145,14 @@ async fn sparse_index(
     // published versions / yanks never appear. A hosted index (no upstream) is locally
     // authoritative, and a positive `metadata_ttl` re-introduces a bounded staleness window.
     if let Some(ref data) = cached {
-        let modified = state.storage.stat(&index_key).await.map(|m| m.modified);
+        let modified = match state.storage.stat(&index_key).await {
+            Ok(meta) => meta.map(|m| m.modified),
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "cargo", "stat", &index_key, &error,
+                );
+            }
+        };
         if crate::cache_ttl::mutable_ref_fresh(
             state.config.cargo.proxy.is_some(),
             state.config.cargo.metadata_ttl,
@@ -697,7 +704,13 @@ async fn publish(
     let _guard = lock.lock().await;
 
     // Check version immutability
-    if state.storage.stat(&crate_key).await.is_some() {
+    let crate_exists = match state.storage.stat(&crate_key).await {
+        Ok(meta) => meta.is_some(),
+        Err(error) => {
+            return crate::registry::storage_error_response("cargo", "stat", &crate_key, &error);
+        }
+    };
+    if crate_exists {
         let err = serde_json::json!({
             "errors": [{"detail": format!("crate version `{}@{}` already exists", name, vers)}]
         });
@@ -1087,8 +1100,8 @@ mod tests {
             async fn delete(&self, _key: &str) -> StorageResult<()> {
                 Ok(())
             }
-            async fn stat(&self, _key: &str) -> Option<crate::storage::FileMeta> {
-                None
+            async fn stat(&self, _key: &str) -> StorageResult<Option<crate::storage::FileMeta>> {
+                Ok(None)
             }
             async fn health_check(&self) -> bool {
                 true

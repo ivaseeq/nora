@@ -661,7 +661,12 @@ pub(crate) async fn regenerate_repodata(
         None => {
             // Signing turned off after having been on: a stale signature that
             // no longer matches repomd.xml would hard-fail repo_gpgcheck.
-            if storage.stat(&asc_key).await.is_some() {
+            if storage
+                .stat(&asc_key)
+                .await
+                .map_err(|e| format!("stat stale repomd.xml.asc: {e}"))?
+                .is_some()
+            {
                 storage
                     .delete(&asc_key)
                     .await
@@ -876,7 +881,13 @@ async fn download(
     // check `get_verified` does below and relies on the client's own checksum
     // (primary.xml records one) — the docker #657 precedent.
     if is_package {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("rpm", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if let Some(response) = crate::registry::range::range_response(
                 &state.storage,
                 &[&key],
@@ -945,7 +956,7 @@ async fn check_exists(
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.storage.stat(&key).await {
-        Some(meta) => (
+        Ok(Some(meta)) => (
             StatusCode::OK,
             [
                 (header::CONTENT_LENGTH, meta.size.to_string()),
@@ -953,7 +964,8 @@ async fn check_exists(
             ],
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => crate::registry::storage_error_response("rpm", "stat", &key, &error),
     }
 }
 
@@ -2082,7 +2094,7 @@ mod proxy_tests {
     /// Wait for the background `spawn_cache` write to land.
     async fn await_cached(state: &crate::AppState, key: &str) {
         for _ in 0..100 {
-            if state.storage.stat(key).await.is_some() {
+            if state.storage.stat(key).await.unwrap().is_some() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

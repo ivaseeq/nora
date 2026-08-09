@@ -499,7 +499,7 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Failed { .. }));
-        assert!(storage.stat(KEY).await.is_none());
+        assert!(storage.stat(KEY).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -563,7 +563,7 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Failed { .. }));
-        assert!(storage.stat(KEY).await.is_none());
+        assert!(storage.stat(KEY).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -585,7 +585,7 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Failed { .. }));
-        assert!(storage.stat(KEY).await.is_none());
+        assert!(storage.stat(KEY).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -641,7 +641,7 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Imported { .. }));
-        assert!(storage.stat(KEY).await.is_none());
+        assert!(storage.stat(KEY).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -667,6 +667,6 @@ mod tests {
         )
         .await;
         assert!(matches!(out, Outcome::Imported { .. }));
-        assert!(storage.stat(KEY).await.is_some());
+        assert!(storage.stat(KEY).await.unwrap().is_some());
     }
 }

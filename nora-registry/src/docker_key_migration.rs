@@ -130,11 +130,19 @@ pub async fn migrate_docker_keys(
         let namespaced_key = format!("docker/{namespace}/{rest}");
 
         // Check if the namespaced equivalent already exists
-        let ns_exists = storage.stat(&namespaced_key).await.is_some();
+        let ns_exists = storage
+            .stat(&namespaced_key)
+            .await
+            .map_err(|e| format!("Failed to stat {namespaced_key}: {e}"))?
+            .is_some();
 
         if ns_exists {
             // Namespaced key exists — just remove the legacy duplicate
-            let freed = storage.stat(key).await.map_or(0, |m| m.size);
+            let freed = storage
+                .stat(key)
+                .await
+                .map_err(|e| format!("Failed to stat {key}: {e}"))?
+                .map_or(0, |m| m.size);
 
             if options.dry_run {
                 info!(
@@ -168,7 +176,11 @@ pub async fn migrate_docker_keys(
         } else {
             // No namespaced equivalent — copy data then delete legacy
             if options.dry_run {
-                let size = storage.stat(key).await.map_or(0, |m| m.size);
+                let size = storage
+                    .stat(key)
+                    .await
+                    .map_err(|e| format!("Failed to stat {key}: {e}"))?
+                    .map_or(0, |m| m.size);
                 info!(
                     legacy_key = %key,
                     namespaced_key = %namespaced_key,
@@ -195,8 +207,11 @@ pub async fn migrate_docker_keys(
                         }
 
                         // Verify write: check size matches
-                        let written_size =
-                            storage.stat(&namespaced_key).await.map_or(0, |m| m.size);
+                        let written_size = storage
+                            .stat(&namespaced_key)
+                            .await
+                            .map_err(|e| format!("Failed to verify {namespaced_key}: {e}"))?
+                            .map_or(0, |m| m.size);
                         if written_size != data_len {
                             warn!(
                                 key = %namespaced_key,

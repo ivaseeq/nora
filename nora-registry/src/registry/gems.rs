@@ -71,7 +71,18 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
     // Eager cache read — preserve data for serve-stale fallback
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "gems",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
@@ -192,7 +203,18 @@ async fn compact_index(
     // Eager cache read — preserve data for serve-stale fallback
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "gems",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.gems.metadata_ttl) {
                 state.metrics.record_download("gems");
                 state.metrics.record_cache_hit("gems");
@@ -408,7 +430,12 @@ async fn download_gem(
     //
     // #754: only fetch on a cache MISS — on a cache hit the digest is already recorded
     // (quarantine `record` is idempotent), so a cheap local stat skips the round-trip.
-    let cached_meta = state.storage.stat(&storage_key).await;
+    let cached_meta = match state.storage.stat(&storage_key).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            return crate::registry::storage_error_response("gems", "stat", &storage_key, &error);
+        }
+    };
     let already_cached = cached_meta.is_some();
     let publish_date = if state.config.gems.proxy.is_none() {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &storage_key).await
@@ -623,7 +650,12 @@ async fn download_gemspec(State(state): State<AppState>, Path(filename): Path<St
 
     // Mirror the .gem's release date so the gemspec matures together (#748/#750).
     // #754: only fetch on a cache MISS (idempotent record → date ignored on a hit).
-    let already_cached = state.storage.stat(&storage_key).await.is_some();
+    let already_cached = match state.storage.stat(&storage_key).await {
+        Ok(meta) => meta.is_some(),
+        Err(error) => {
+            return crate::registry::storage_error_response("gems", "stat", &storage_key, &error);
+        }
+    };
     let publish_date = if !already_cached
         && state.config.gems.proxy.is_some()
         && state.config.server.trust_upstream_dates

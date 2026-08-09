@@ -7,8 +7,9 @@ use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, WriteMultipart};
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
@@ -17,18 +18,41 @@ use super::{FileMeta, Result, StorageBackend, StorageError};
 /// download client paces the store read. object_store's request timeout covers
 /// the whole body of an attempt, and its retry deadline runs from the FIRST
 /// request while gating every transparent ranged resume of a streamed body —
-/// with the defaults (30 s attempt, 180 s deadline) any transfer slower than
-/// object-size / 180 s is reset mid-stream. Size both for the slowest
+/// with short library defaults, a transfer slower than the retry deadline can
+/// be reset mid-stream. Size both limits for the slowest
 /// tolerated download instead.
-const STREAM_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+const DEFAULT_RETRY_TIMEOUT: Duration = Duration::from_secs(7200);
+const DEFAULT_MAX_RETRIES: usize = 10;
+const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn streaming_client_options() -> object_store::ClientOptions {
-    object_store::ClientOptions::new().with_timeout(STREAM_ATTEMPT_TIMEOUT)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStoreOptions {
+    pub request_timeout: Duration,
+    pub retry_timeout: Duration,
+    pub max_retries: usize,
+    pub health_probe_timeout: Duration,
 }
 
-fn streaming_retry_config() -> object_store::RetryConfig {
+impl Default for ObjectStoreOptions {
+    fn default() -> Self {
+        Self {
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            retry_timeout: DEFAULT_RETRY_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
+            health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
+        }
+    }
+}
+
+fn streaming_client_options(options: ObjectStoreOptions) -> object_store::ClientOptions {
+    object_store::ClientOptions::new().with_timeout(options.request_timeout)
+}
+
+fn streaming_retry_config(options: ObjectStoreOptions) -> object_store::RetryConfig {
     object_store::RetryConfig {
-        retry_timeout: STREAM_ATTEMPT_TIMEOUT.saturating_mul(2),
+        retry_timeout: options.retry_timeout,
+        max_retries: options.max_retries,
         ..Default::default()
     }
 }
@@ -55,6 +79,7 @@ pub struct ObjectStorage {
     /// task stalls or dies, the stale flag would otherwise pin readiness forever. A refresh
     /// older than `HEALTH_MAX_STALE_SECS` is treated as unreachable (#872).
     last_refresh_unix: std::sync::atomic::AtomicU64,
+    health_probe_timeout: Duration,
 }
 
 /// Reachability older than this is treated as unknown → unreachable. 2.5× the 60s background
@@ -71,6 +96,7 @@ impl ObjectStorage {
     /// endpoint VERBATIM (`<endpoint>/<key>`), so the endpoint itself must include the
     /// bucket host (e.g. `https://<bucket>.oss-<region>.aliyuncs.com`). Needed for
     /// providers that reject signed path-style requests, e.g. Alibaba Cloud OSS.
+    #[cfg(test)]
     pub fn new(
         s3_url: &str,
         bucket: &str,
@@ -78,6 +104,26 @@ impl ObjectStorage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         virtual_hosted: bool,
+    ) -> Self {
+        Self::new_with_options(
+            s3_url,
+            bucket,
+            region,
+            access_key,
+            secret_key,
+            virtual_hosted,
+            ObjectStoreOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        s3_url: &str,
+        bucket: &str,
+        region: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        virtual_hosted: bool,
+        options: ObjectStoreOptions,
     ) -> Self {
         let url = s3_url.trim_end_matches('/');
         let allow_http = url.starts_with("http://");
@@ -88,9 +134,9 @@ impl ObjectStorage {
             .with_region(region)
             // One combined ClientOptions: with_client_options REPLACES the
             // options with_allow_http would have accumulated.
-            .with_client_options(streaming_client_options().with_allow_http(allow_http))
+            .with_client_options(streaming_client_options(options).with_allow_http(allow_http))
             .with_virtual_hosted_style_request(virtual_hosted)
-            .with_retry(streaming_retry_config());
+            .with_retry(streaming_retry_config(options));
 
         match (access_key, secret_key) {
             (Some(ak), Some(sk)) => {
@@ -110,6 +156,7 @@ impl ObjectStorage {
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+            health_probe_timeout: options.health_probe_timeout,
         }
     }
 
@@ -122,21 +169,36 @@ impl ObjectStorage {
     /// key material at all. `base_url` overrides the endpoint for emulators
     /// (fake-gcs-server) or private access endpoints; an `http://` base_url
     /// also skips request signing (emulators don't verify signatures).
+    #[cfg(test)]
     pub fn new_gcs(
         bucket: &str,
         service_account_path: Option<&str>,
         base_url: Option<&str>,
     ) -> Self {
+        Self::new_gcs_with_options(
+            bucket,
+            service_account_path,
+            base_url,
+            ObjectStoreOptions::default(),
+        )
+    }
+
+    pub fn new_gcs_with_options(
+        bucket: &str,
+        service_account_path: Option<&str>,
+        base_url: Option<&str>,
+        options: ObjectStoreOptions,
+    ) -> Self {
         let mut builder = GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket)
-            .with_retry(streaming_retry_config());
+            .with_retry(streaming_retry_config(options));
         // `with_client_options` would replace every env-derived client option
         // (`GOOGLE_PROXY_URL`, ...), so merge only the timeout — and only when
         // the operator has not set `GOOGLE_TIMEOUT` themselves.
         if std::env::var_os("GOOGLE_TIMEOUT").is_none() {
             builder = builder.with_config(
                 object_store::gcp::GoogleConfigKey::Client(object_store::ClientConfigKey::Timeout),
-                format!("{}s", STREAM_ATTEMPT_TIMEOUT.as_secs()),
+                format!("{}s", options.request_timeout.as_secs()),
             );
         }
         if let Some(path) = service_account_path {
@@ -144,9 +206,12 @@ impl ObjectStorage {
         }
         if let Some(url) = base_url {
             let allow_http = url.starts_with("http://");
-            builder = builder
-                .with_base_url(url)
-                .with_client_options(streaming_client_options().with_allow_http(allow_http));
+            builder = builder.with_base_url(url).with_config(
+                object_store::gcp::GoogleConfigKey::Client(
+                    object_store::ClientConfigKey::AllowHttp,
+                ),
+                allow_http.to_string(),
+            );
             if allow_http {
                 builder = builder.with_skip_signature(true);
             }
@@ -160,6 +225,7 @@ impl ObjectStorage {
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+            health_probe_timeout: options.health_probe_timeout,
         }
     }
 }
@@ -207,6 +273,7 @@ fn decode_object_key(key: &str) -> String {
 fn map_err(e: object_store::Error) -> StorageError {
     match e {
         object_store::Error::NotFound { .. } => StorageError::NotFound,
+        object_store::Error::AlreadyExists { .. } => StorageError::AlreadyExists,
         other => StorageError::Network(other.to_string()),
     }
 }
@@ -218,6 +285,17 @@ impl StorageBackend for ObjectStorage {
         let path = Path::from(encoded);
         let payload = PutPayload::from(data.to_vec());
         self.store.put(&path, payload).await.map_err(map_err)?;
+        Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<()> {
+        let encoded = encode_object_key(key);
+        let path = Path::from(encoded);
+        let payload = PutPayload::from(data.to_vec());
+        self.store
+            .put_opts(&path, payload, PutMode::Create.into())
+            .await
+            .map_err(map_err)?;
         Ok(())
     }
 
@@ -304,25 +382,30 @@ impl StorageBackend for ObjectStorage {
             .collect())
     }
 
-    async fn stat(&self, key: &str) -> Option<FileMeta> {
+    async fn stat(&self, key: &str) -> Result<Option<FileMeta>> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
         let meta = match self.store.head(&path).await {
             Ok(m) => m,
-            Err(_) if key.contains('@') => {
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
                 // Fallback: try legacy _at_ encoding for pre-#534 data
                 let legacy_path = Path::from(encode_object_key_legacy(key));
-                self.store.head(&legacy_path).await.ok()?
+                match self.store.head(&legacy_path).await {
+                    Ok(meta) => meta,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(map_err(error)),
+                }
             }
-            Err(_) => return None,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(map_err(error)),
         };
 
         let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
 
-        Some(FileMeta {
+        Ok(Some(FileMeta {
             size: meta.size,
             modified,
-        })
+        }))
     }
 
     async fn health_check(&self) -> bool {
@@ -340,6 +423,24 @@ impl StorageBackend for ObjectStorage {
             )
     }
 
+    async fn refresh_reachability(&self) {
+        // Pull at most one result and cap wall time independently from the
+        // transfer-oriented object-store request timeout. An empty bucket is a
+        // successful response (`Ok(None)`). This probe never computes size and
+        // never materializes a bucket listing.
+        let mut objects = self.store.list(None);
+        let reachable = matches!(
+            tokio::time::timeout(self.health_probe_timeout, objects.try_next()).await,
+            Ok(Ok(_))
+        );
+        self.cached_reachable
+            .store(reachable, std::sync::atomic::Ordering::Relaxed);
+        self.last_refresh_unix.store(
+            crate::cache_ttl::now_unix(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     async fn total_size(&self) -> u64 {
         self.cached_total_size
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -350,22 +451,25 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn refresh_total_size(&self) {
-        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
-
-        self.cached_reachable
-            .store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
-        // Stamp every run (success or failure): this marks the maintenance loop as alive so
-        // `health_check` can expire the cached verdict if the loop stops (#872).
-        self.last_refresh_unix.store(
-            crate::cache_ttl::now_unix(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        if let Ok(objects) = result {
-            let total: u64 = objects.iter().map(|m| m.size).sum();
-            self.cached_total_size
-                .store(total, std::sync::atomic::Ordering::Relaxed);
-            self.size_cache_initialized
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Stream metadata and retain only the accumulator. A failed scan keeps
+        // the last successful size and has no effect on readiness.
+        let mut objects = self.store.list(None);
+        let mut total = 0u64;
+        loop {
+            match objects.try_next().await {
+                Ok(Some(meta)) => total = total.saturating_add(meta.size),
+                Ok(None) => {
+                    self.cached_total_size
+                        .store(total, std::sync::atomic::Ordering::Relaxed);
+                    self.size_cache_initialized
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "object-store size scan failed; retaining cached size");
+                    return;
+                }
+            }
         }
     }
 
@@ -475,6 +579,63 @@ mod tests {
         assert!(!storage.health_check().await);
     }
 
+    #[tokio::test]
+    async fn reachability_probe_is_wall_time_bounded() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_raw(EMPTY_LIST_XML, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        let storage = ObjectStorage::new_with_options(
+            &server.uri(),
+            "test-bucket",
+            "us-east-1",
+            None,
+            None,
+            false,
+            ObjectStoreOptions {
+                request_timeout: Duration::from_secs(30),
+                retry_timeout: Duration::from_secs(30),
+                max_retries: 0,
+                health_probe_timeout: Duration::from_millis(25),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), storage.refresh_reachability())
+            .await
+            .expect("reachability must obey its independent wall-time budget");
+        assert!(!storage.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn reachability_and_size_caches_are_independent() {
+        let storage = ObjectStorage {
+            store: Box::new(object_store::memory::InMemory::new()),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(false),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+            health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
+        };
+        storage.put("raw/a", b"abc").await.unwrap();
+
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+        assert!(!storage
+            .size_cache_initialized
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(storage.total_size().await, 0);
+
+        storage.refresh_total_size().await;
+        assert_eq!(storage.total_size().await, 3);
+        assert!(storage.health_check().await);
+    }
+
     /// Cached reachability self-expires (#872): a `true` verdict whose last refresh is older
     /// than `HEALTH_MAX_STALE_SECS` (a stalled or dead maintenance loop) must NOT keep the pod
     /// ready. Only a recent refresh keeps `health_check` true.
@@ -530,6 +691,7 @@ mod tests {
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+            health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
         };
 
         let key = "npm/@scope/pkg/versions/1.0.0.json";
@@ -558,6 +720,52 @@ mod tests {
         let listed_plain = storage.list("npm/plainpkg/versions/").await.unwrap();
         assert_eq!(listed_plain, vec![plain.to_string()]);
         assert!(storage.get(&listed_plain[0]).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_put_if_absent_has_exactly_one_winner() {
+        const CONTENDERS: usize = 16;
+        let storage = std::sync::Arc::new(ObjectStorage {
+            store: Box::new(object_store::memory::InMemory::new()),
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+            health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
+        });
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONTENDERS));
+
+        let mut handles = Vec::new();
+        for i in 0..CONTENDERS {
+            let storage = std::sync::Arc::clone(&storage);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let payload = vec![i as u8; 4096];
+                barrier.wait().await;
+                (i as u8, storage.put_if_absent("raw/shared", &payload).await)
+            }));
+        }
+
+        let mut winner = None;
+        let mut conflicts = 0;
+        for handle in handles {
+            let (candidate, result) = handle.await.expect("task panicked");
+            match result {
+                Ok(()) => assert!(
+                    winner.replace(candidate).is_none(),
+                    "more than one conditional object put succeeded"
+                ),
+                Err(StorageError::AlreadyExists) => conflicts += 1,
+                Err(e) => panic!("unexpected conditional-put error: {e}"),
+            }
+        }
+
+        let winner = winner.expect("one contender must create the object");
+        assert_eq!(conflicts, CONTENDERS - 1);
+        let stored = storage.get("raw/shared").await.unwrap();
+        assert_eq!(stored.len(), 4096);
+        assert!(stored.iter().all(|byte| *byte == winner));
     }
 
     #[test]
@@ -590,10 +798,10 @@ mod tests {
         assert_eq!(storage.backend_name(), "gcs");
     }
 
-    /// Empty ListObjectsV2 body so `refresh_total_size`'s `list(None)` succeeds against the mock.
+    /// Empty ListObjectsV2 body so the bounded reachability probe succeeds against the mock.
     const EMPTY_LIST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
 
-    /// Run one `refresh_total_size` (a ListObjectsV2) against a mock server and return the
+    /// Run one reachability probe (a ListObjectsV2) against a mock server and return the
     /// request path the client actually used. Also covers the cached-reachability true
     /// path (#869): a successful refresh flips `health_check()` to true.
     async fn observed_list_path(virtual_hosted: bool) -> String {
@@ -614,7 +822,7 @@ mod tests {
             virtual_hosted,
         );
         assert!(!storage.health_check().await);
-        storage.refresh_total_size().await;
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
         let requests = server.received_requests().await.unwrap();
         requests[0].url.path().to_string()
@@ -660,6 +868,15 @@ mod tests {
             StorageError::NotFound => {}
             other => panic!("Expected NotFound, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_error_mapping_already_exists() {
+        let err = object_store::Error::AlreadyExists {
+            path: "test/key".to_string(),
+            source: "exists".into(),
+        };
+        assert!(matches!(map_err(err), StorageError::AlreadyExists));
     }
 
     #[test]

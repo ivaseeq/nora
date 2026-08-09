@@ -32,8 +32,8 @@ All endpoints require authentication. Anonymous read is opt-in via `anonymous_re
 | Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
 |--------|:---:|:---:|---|---|
 | Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
-| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
-| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | named hosted/proxy/group at `/repository/{name}/`; `/maven2/` alias |
+| npm | ✅ | ✅ | `registry.npmjs.org` | named hosted/proxy/group at `/repository/{name}/`; `/npm/` alias |
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
 | PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
 | Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
@@ -99,15 +99,24 @@ nora
 docker tag myapp:latest localhost:4000/myapp:latest
 docker push localhost:4000/myapp:latest
 
-# npm
-npm config set registry http://localhost:4000/npm/
-npm publish
+# Nexus-compatible npm topology: publish to hosted, install through the group
+export NORA_NPM_REPOSITORIES_JSON='[{"kind":"hosted","name":"npm-private","write_policy":"allow"},{"kind":"proxy","name":"npm-registry","url":"https://registry.npmjs.org"},{"kind":"group","name":"npm-group","members":["npm-private","npm-registry"]}]'
+export NORA_NPM_DEFAULT_REPOSITORY=npm-group
+npm config set registry http://localhost:4000/repository/npm-group/
+npm publish --registry http://localhost:4000/repository/npm-private/
 
 # Go
 GOPROXY=http://localhost:4000/go go get golang.org/x/text@latest
 ```
 
 See [full documentation](https://getnora.dev) for all registries.
+
+For production, Maven and npm use Nexus-style named `hosted`, `proxy`, and
+`group` repositories under one `/repository/{name}/` namespace. Repository
+names are globally unique across both formats, groups own no storage, and one
+NORA process is the supported writer topology. The legacy `/maven2/` and
+`/npm/` routes remain compatibility aliases, not the recommended deployment
+model.
 
 ## Features
 

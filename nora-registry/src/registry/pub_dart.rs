@@ -88,7 +88,13 @@ async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): Raw
 
     let cached_data = state.storage.get(&key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("pub", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
             }
@@ -173,7 +179,13 @@ async fn package_listing(
     let key = format!("pub/api/packages/{}.json", package);
     let cached_data = state.storage.get(&key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("pub", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
             }
@@ -301,7 +313,13 @@ async fn version_metadata(
     let key = format!("pub/api/packages/{}/versions/{}.json", package, version);
     let cached_data = state.storage.get(&key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("pub", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
             }
@@ -381,7 +399,13 @@ async fn package_advisories(
     let key = format!("pub/api/packages/{}/advisories.json", package);
     let cached_data = state.storage.get(&key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("pub", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.pub_dart.metadata_ttl) {
                 return pub_json_response(data.to_vec());
             }

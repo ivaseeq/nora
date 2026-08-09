@@ -241,7 +241,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_local_index(data, false);
     }
 
     // #68 namespace isolation: never forward a search term that matches an internal
@@ -260,7 +260,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_local_index(data, false);
     }
 
     // Try upstream with short timeout (UX-critical path)
@@ -307,7 +307,7 @@ async fn search_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            with_local_index(data, true)
         }
     }
 }
@@ -336,7 +336,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_local_index(data, false);
     }
 
     // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
@@ -354,7 +354,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return with_local_index(data, false);
     }
 
     let qs = raw_query.0.unwrap_or_default();
@@ -400,7 +400,7 @@ async fn autocomplete_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            with_local_index(data, true)
         }
     }
 }
@@ -448,7 +448,18 @@ async fn registration_index(
 
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "nuget",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
@@ -612,7 +623,18 @@ async fn registration_page(
 
     // TTL cache
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "nuget",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
@@ -724,7 +746,18 @@ async fn version_list(state: AppState, id: &str) -> Response {
 
     // TTL cache
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "nuget",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.nuget.metadata_ttl) {
                 state.metrics.record_download("nuget");
                 state.metrics.record_cache_hit("nuget");
@@ -1074,7 +1107,14 @@ async fn flatcontainer_download(
                 let proxy_url2 = proxy_url.clone();
                 let id2 = id_lower.clone();
                 tokio::spawn(async move {
-                    if state2.storage.stat(&index_key).await.is_none() {
+                    let missing = match state2.storage.stat(&index_key).await {
+                        Ok(meta) => meta.is_none(),
+                        Err(error) => {
+                            tracing::warn!(%index_key, %error, "cannot check NuGet index cache");
+                            return;
+                        }
+                    };
+                    if missing {
                         let url = format!(
                             "{}/v3-flatcontainer/{}/index.json",
                             proxy_url2.trim_end_matches('/'),
@@ -1341,6 +1381,17 @@ fn with_json_stale(data: Vec<u8>) -> Response {
     )
         .into_response()
 }
+
+fn with_local_index(data: Result<Vec<u8>, ()>, stale: bool) -> Response {
+    match data {
+        Ok(data) if stale => with_json_stale(data),
+        Ok(data) => with_json(data),
+        Err(()) => {
+            tracing::warn!("NuGet local search index unavailable");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
 // ── Local search helpers ───────────────────────────────────────────────
 
 /// Read cached version list from flatcontainer index.json.
@@ -1409,8 +1460,13 @@ async fn local_search_results(
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+) -> Result<Vec<u8>, ()> {
+    let packages = tokio::time::timeout(
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
+        state.repo_index.get_strict("nuget", &state.storage),
+    )
+    .await
+    .map_err(|_| ())??;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1452,7 +1508,7 @@ async fn local_search_results(
         "totalHits": total_hits,
         "data": page,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Ok(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Build local autocomplete results from the in-memory repo index.
@@ -1467,8 +1523,13 @@ async fn local_autocomplete_results(
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
-    let packages = state.repo_index.get("nuget", &state.storage).await;
+) -> Result<Vec<u8>, ()> {
+    let packages = tokio::time::timeout(
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
+        state.repo_index.get_strict("nuget", &state.storage),
+    )
+    .await
+    .map_err(|_| ())??;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();
@@ -1502,7 +1563,7 @@ async fn local_autocomplete_results(
         "totalHits": total_hits,
         "data": names,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Ok(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Generate NuGet v3 service index from scratch, advertising only resources

@@ -622,7 +622,13 @@ pub(crate) async fn regenerate_indexes(
     let repo_prefix = format!("deb/{repo}/");
     for name in RESERVED {
         let key = format!("{repo_prefix}{name}");
-        if !desired.contains(name) && storage.stat(&key).await.is_some() {
+        if !desired.contains(name)
+            && storage
+                .stat(&key)
+                .await
+                .map_err(|e| format!("stat stale {name}: {e}"))?
+                .is_some()
+        {
             storage
                 .delete(&key)
                 .await
@@ -813,7 +819,13 @@ async fn download(
     // pin check `get_verified` does below and relies on the client's own
     // checksum (the Packages index records one) — the docker #657 precedent.
     if is_package {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("deb", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if let Some(response) = crate::registry::range::range_response(
                 &state.storage,
                 &[&key],
@@ -883,7 +895,7 @@ async fn check_exists(
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.storage.stat(&key).await {
-        Some(meta) => (
+        Ok(Some(meta)) => (
             StatusCode::OK,
             [
                 (header::CONTENT_LENGTH, meta.size.to_string()),
@@ -891,7 +903,8 @@ async fn check_exists(
             ],
         )
             .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => crate::registry::storage_error_response("deb", "stat", &key, &error),
     }
 }
 

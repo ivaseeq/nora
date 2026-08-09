@@ -414,7 +414,13 @@ pub async fn extract_mtime_as_publish_date(
     storage: &crate::storage::Storage,
     key: &str,
 ) -> Option<i64> {
-    storage.stat(key).await.map(|m| m.modified as i64)
+    match storage.stat(key).await {
+        Ok(meta) => meta.map(|m| m.modified as i64),
+        Err(error) => {
+            tracing::warn!(%key, %error, "cannot read artifact mtime for curation");
+            None
+        }
+    }
 }
 
 /// Parse an ISO 8601 / RFC 3339 date string to a Unix timestamp (seconds).

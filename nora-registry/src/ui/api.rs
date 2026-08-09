@@ -14,8 +14,37 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use utoipa::ToSchema;
+
+async fn display_stat(storage: &Storage, key: &str) -> Option<crate::storage::FileMeta> {
+    match storage.stat(key).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            tracing::warn!(%key, %error, "UI metadata lookup failed");
+            None
+        }
+    }
+}
+
+fn snapshot_keys(state: &AppState, registry: &str, prefix: &str) -> Vec<String> {
+    state
+        .repo_index
+        .objects(registry)
+        .iter()
+        .filter(|object| object.key.starts_with(prefix))
+        .map(|object| object.key.clone())
+        .collect()
+}
+
+fn snapshot_meta(state: &AppState, registry: &str, key: &str) -> Option<crate::storage::FileMeta> {
+    state
+        .repo_index
+        .objects(registry)
+        .iter()
+        .find(|object| object.key == key)
+        .map(|object| object.meta.clone())
+}
 
 #[derive(Serialize)]
 pub struct RegistryStats {
@@ -206,45 +235,76 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             size_bytes: size,
         });
 
-        let proxy_upstreams: Vec<String> = match reg {
-            RegistryType::Docker => state
-                .config
-                .docker
-                .upstreams
-                .iter()
-                .map(|u| u.url.clone())
-                .collect(),
-            RegistryType::Maven => state
-                .config
-                .maven
-                .proxies
-                .iter()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Npm => state.config.npm.proxy.clone().into_iter().collect(),
-            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-            RegistryType::PyPI => state
-                .config
-                .pypi
-                .upstreams()
-                .iter()
-                .map(|u| u.url().to_string())
-                .collect(),
-            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-            RegistryType::Raw => vec![],
-            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-            RegistryType::Rpm => vec![],
-            RegistryType::Deb => vec![],
-        };
+        let proxy_upstreams: Vec<String> =
+            match reg {
+                RegistryType::Docker => state
+                    .config
+                    .docker
+                    .upstreams
+                    .iter()
+                    .map(|u| u.url.clone())
+                    .collect(),
+                RegistryType::Maven => {
+                    let mut upstreams: std::collections::BTreeSet<String> = state
+                        .config
+                        .maven
+                        .proxies
+                        .iter()
+                        .map(|proxy| proxy.url().to_string())
+                        .collect();
+                    upstreams.extend(state.config.maven.repositories.iter().filter_map(
+                        |repository| match repository {
+                            crate::config::MavenRepository::Proxy { url, .. } => Some(url.clone()),
+                            _ => None,
+                        },
+                    ));
+                    upstreams.into_iter().collect()
+                }
+                RegistryType::Npm => {
+                    let mut upstreams: std::collections::BTreeSet<String> =
+                        state.config.npm.proxy.clone().into_iter().collect();
+                    upstreams.extend(state.config.npm.repositories.iter().filter_map(
+                        |repository| match repository {
+                            crate::config::NpmRepository::Proxy { url, .. } => Some(url.clone()),
+                            _ => None,
+                        },
+                    ));
+                    upstreams.into_iter().collect()
+                }
+                RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+                RegistryType::PyPI => state
+                    .config
+                    .pypi
+                    .upstreams()
+                    .iter()
+                    .map(|u| u.url().to_string())
+                    .collect(),
+                RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+                RegistryType::Raw => vec![],
+                RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+                RegistryType::Terraform => {
+                    state.config.terraform.proxy.clone().into_iter().collect()
+                }
+                RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+                RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+                RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+                RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+                RegistryType::Rpm => vec![],
+                RegistryType::Deb => vec![],
+            };
 
+        let mount_path = match reg {
+            RegistryType::Maven if !state.config.maven.repositories.is_empty() => {
+                "/repository/{repository}/".to_string()
+            }
+            RegistryType::Npm if !state.config.npm.repositories.is_empty() => {
+                "/repository/{repository}/".to_string()
+            }
+            _ => reg.mount_point().to_string(),
+        };
         mount_points.push(MountPoint {
             registry: reg.display_name().to_string(),
-            mount_path: reg.mount_point().to_string(),
+            mount_path,
             proxy_upstreams,
         });
     }
@@ -288,11 +348,11 @@ pub async fn api_detail(
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         "npm" => {
-            let detail = get_npm_detail(&state.storage, &name, true, true).await;
+            let detail = get_npm_detail(&state, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         "cargo" => {
-            let detail = get_cargo_detail(&state.storage, &name, true, true).await;
+            let detail = get_cargo_detail(&state, &name, true, true).await;
             Json(serde_json::to_value(detail).unwrap_or_default())
         }
         _ => Json(serde_json::json!({})),
@@ -363,10 +423,10 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     // E.g. for "library/nginx", find keys in docker/library/nginx/manifests/
     // AND docker/docker.io/library/nginx/manifests/, docker/ghcr.io/library/nginx/manifests/, etc.
     let prefix = format!("docker/{}/manifests/", name);
-    let mut keys = state.storage.list(&prefix).await.unwrap_or_default();
+    let mut keys = snapshot_keys(state, "docker", &prefix);
 
     // Also collect namespaced keys by scanning all docker/ keys for this image name
-    let all_docker_keys = state.storage.list("docker/").await.unwrap_or_default();
+    let all_docker_keys = snapshot_keys(state, "docker", "docker/");
     for key in &all_docker_keys {
         if let Some(rest) = key.strip_prefix("docker/") {
             if let Some(idx) = rest.find("/manifests/") {
@@ -415,7 +475,7 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
             // Get file stats for created timestamp if metadata doesn't have push_timestamp
             let created = if metadata.push_timestamp > 0 {
                 format_timestamp(metadata.push_timestamp)
-            } else if let Some(file_meta) = state.storage.stat(key).await {
+            } else if let Some(file_meta) = display_stat(&state.storage, key).await {
                 format_timestamp(file_meta.modified)
             } else {
                 "N/A".to_string()
@@ -489,45 +549,143 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
-/// List immediate children of a Maven namespace path for hierarchical browsing.
-/// Returns (entries, is_leaf_artifact). A leaf artifact has maven-metadata.xml.
-pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
-    let prefix = if path.is_empty() {
-        "maven/".to_string()
-    } else {
-        format!("maven/{}/", path)
-    };
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+fn direct_maven_objects(
+    state: &AppState,
+    repository: &str,
+) -> Vec<(String, crate::storage::FileMeta)> {
+    let prefix = format!("maven/repositories/{repository}/");
+    state
+        .repo_index
+        .maven_objects()
+        .iter()
+        .filter_map(|object| {
+            object
+                .key
+                .strip_prefix(&prefix)
+                .map(|path| (path.to_string(), object.meta.clone()))
+        })
+        .collect()
+}
 
-    if keys.is_empty() {
-        return (vec![], false);
+fn logical_maven_objects(
+    state: &AppState,
+    repository: &str,
+) -> Option<Vec<(String, crate::storage::FileMeta)>> {
+    use crate::config::MavenRepository;
+
+    match state.config.maven.repository(repository)? {
+        MavenRepository::Hosted { .. } | MavenRepository::Proxy { .. } => {
+            Some(direct_maven_objects(state, repository))
+        }
+        MavenRepository::Group { members, .. } => {
+            let mut selected = BTreeMap::new();
+            for member in members {
+                for (path, meta) in direct_maven_objects(state, member) {
+                    // Same first-member precedence as the protocol group GET.
+                    selected.entry(path).or_insert(meta);
+                }
+            }
+            Some(selected.into_iter().collect())
+        }
+    }
+}
+
+fn legacy_maven_objects(state: &AppState) -> Vec<(String, crate::storage::FileMeta)> {
+    state
+        .repo_index
+        .maven_objects()
+        .iter()
+        .filter_map(|object| {
+            object
+                .key
+                .strip_prefix("maven/")
+                .filter(|path| !path.starts_with("repositories/"))
+                .map(|path| (path.to_string(), object.meta.clone()))
+        })
+        .collect()
+}
+
+fn maven_repository_rows(state: &AppState) -> Vec<RepoInfo> {
+    state
+        .config
+        .maven
+        .repositories
+        .iter()
+        .map(|repository| {
+            let objects = logical_maven_objects(state, repository.name()).unwrap_or_default();
+            let versions = objects
+                .iter()
+                .filter(|(path, _)| {
+                    !crate::gc::is_checksum_sidecar(path) && !path.ends_with("maven-metadata.xml")
+                })
+                .count();
+            let size = objects.iter().map(|(_, meta)| meta.size).sum();
+            let modified = objects
+                .iter()
+                .map(|(_, meta)| meta.modified)
+                .max()
+                .unwrap_or(0);
+            RepoInfo {
+                name: repository.name().to_string(),
+                versions,
+                size,
+                updated: format_timestamp(modified),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// List immediate children of a logical Maven repository path from the last
+/// background snapshot. Named groups merge member objects in configured order;
+/// groups never acquire a physical storage prefix of their own.
+pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>, bool) {
+    if !state.config.maven.repositories.is_empty() && path.is_empty() {
+        return (maven_repository_rows(state), false);
     }
 
-    // Leaf = no subdirectories (only direct files like JARs, POMs, checksums)
-    let has_subdirs = keys.iter().any(|k| {
-        k.strip_prefix(&prefix)
-            .is_some_and(|r| !r.is_empty() && r.contains('/'))
-    });
+    let (objects, logical_path) = if state.config.maven.repositories.is_empty() {
+        (legacy_maven_objects(state), path)
+    } else {
+        let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
+        let Some(objects) = logical_maven_objects(state, repository) else {
+            return (Vec::new(), false);
+        };
+        (objects, logical_path)
+    };
+    let prefix = if logical_path.is_empty() {
+        String::new()
+    } else {
+        format!("{logical_path}/")
+    };
+    let keys: Vec<_> = objects
+        .iter()
+        .filter_map(|(key, meta)| key.strip_prefix(&prefix).map(|rest| (rest, meta)))
+        .collect();
+    if keys.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    // Leaf = no subdirectories (only direct files like JARs, POMs, checksums).
+    let has_subdirs = keys
+        .iter()
+        .any(|(rest, _)| !rest.is_empty() && rest.contains('/'));
     if !has_subdirs {
         return (vec![], true);
     }
 
     // Group by immediate child segment (skip direct files like maven-metadata.xml)
     let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.is_empty() || !rest.contains('/') {
-                continue;
-            }
-            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
-            let entry = groups.entry(child_name).or_insert((0, 0, 0));
-            entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
-            }
+    for (rest, meta) in keys {
+        if rest.is_empty() || !rest.contains('/') {
+            continue;
+        }
+        let child_name = rest.split('/').next().unwrap_or(rest).to_string();
+        let entry = groups.entry(child_name).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
         }
     }
 
@@ -546,91 +704,230 @@ pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoIn
     (result, false)
 }
 
-pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
-    let prefix = format!("maven/{}/", path);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+pub async fn get_maven_detail(state: &AppState, path: &str) -> MavenDetail {
+    let (objects, logical_path) = if state.config.maven.repositories.is_empty() {
+        (legacy_maven_objects(state), path)
+    } else {
+        let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
+        let Some(objects) = logical_maven_objects(state, repository) else {
+            return MavenDetail { artifacts: vec![] };
+        };
+        (objects, logical_path)
+    };
+    let prefix = if logical_path.is_empty() {
+        String::new()
+    } else {
+        format!("{logical_path}/")
+    };
 
     let mut artifacts = Vec::new();
-    for key in &keys {
+    for (key, meta) in objects {
         if let Some(filename) = key.strip_prefix(&prefix) {
             if filename.contains('/') {
                 continue;
             }
-            let size = storage.stat(key).await.map(|m| m.size).unwrap_or(0);
             artifacts.push(MavenArtifact {
                 filename: filename.to_string(),
-                size,
+                size: meta.size,
             });
         }
     }
+    artifacts.sort_by(|left, right| left.filename.cmp(&right.filename));
 
     MavenDetail { artifacts }
 }
 
+#[cfg(test)]
+mod named_maven_tests {
+    use super::*;
+    use crate::config::{MavenRepository, MavenVersionPolicy, MavenWritePolicy};
+
+    #[tokio::test]
+    async fn group_browser_deduplicates_with_first_member_precedence_without_storage_scans() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.maven.repositories = vec![
+                MavenRepository::Hosted {
+                    name: "first".to_string(),
+                    version_policy: MavenVersionPolicy::Mixed,
+                    write_policy: MavenWritePolicy::AllowOnce,
+                },
+                MavenRepository::Hosted {
+                    name: "second".to_string(),
+                    version_policy: MavenVersionPolicy::Mixed,
+                    write_policy: MavenWritePolicy::AllowOnce,
+                },
+                MavenRepository::Group {
+                    name: "public".to_string(),
+                    members: vec!["first".to_string(), "second".to_string()],
+                },
+            ];
+        });
+        let logical = "com/example/app/1.0/app-1.0.jar";
+        ctx.state
+            .storage
+            .put(&format!("maven/repositories/first/{logical}"), b"first")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                &format!("maven/repositories/second/{logical}"),
+                b"second-copy",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "maven/repositories/second/com/example/app/1.0/app-1.0.pom",
+                b"pom",
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("maven");
+        assert!(
+            ctx.state
+                .repo_index
+                .rebuild_for_test(RegistryType::Maven, &ctx.state.storage)
+                .await
+        );
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let mut snapshot_only = ctx.state.clone();
+        snapshot_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
+
+        let objects = logical_maven_objects(&snapshot_only, "public").unwrap();
+        let duplicate = objects.iter().find(|(path, _)| path == logical).unwrap();
+        assert_eq!(duplicate.1.size, 5, "first group member must win");
+        assert_eq!(
+            objects.len(),
+            2,
+            "duplicate logical path must be counted once"
+        );
+
+        let detail = get_maven_detail(&snapshot_only, "public/com/example/app/1.0").await;
+        assert_eq!(
+            detail
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app-1.0.jar", "app-1.0.pom"]
+        );
+        assert!(
+            list_attempts.lock().is_empty(),
+            "Maven browser request path must use only the published snapshot"
+        );
+    }
+}
+
 pub async fn get_npm_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
-    let metadata_key = format!("npm/{}/metadata.json", name);
+    let storage = &state.storage;
+    let Some((repository, package)) = name
+        .strip_prefix("repositories/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return PackageDetail {
+            versions: vec![],
+            prerelease_count: 0,
+            total_stable: 0,
+            metadata: PackageMetadata::default(),
+        };
+    };
+
+    let package_leaf = package.split('/').next_back().unwrap_or(package);
+    let hosted_versions_prefix = format!("npm/repositories/{repository}/{package}/versions/");
+    let hosted_version_keys = snapshot_keys(state, "npm", &hosted_versions_prefix);
+    let mut version_rows: Vec<(String, serde_json::Value, String, String)> = Vec::new();
+    let metadata_json = if hosted_version_keys.is_empty() {
+        let packument_key =
+            format!("npm/repositories/{repository}/proxy/packuments/{package}.json");
+        storage.get(&packument_key).await.ok().and_then(|data| {
+            let metadata = serde_json::from_slice::<serde_json::Value>(&data).ok()?;
+            let time = metadata.get("time").and_then(|value| value.as_object());
+            if let Some(versions) = metadata.get("versions").and_then(|value| value.as_object()) {
+                for (version, info) in versions {
+                    let published = time
+                        .and_then(|times| times.get(version))
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.get(..10).unwrap_or(value).to_string())
+                        .unwrap_or_else(|| "N/A".to_string());
+                    version_rows.push((
+                        version.clone(),
+                        info.clone(),
+                        published,
+                        format!(
+                            "npm/repositories/{repository}/proxy/tarballs/{package}/{package_leaf}-{version}.tgz"
+                        ),
+                    ));
+                }
+            }
+            Some(metadata)
+        })
+    } else {
+        for key in hosted_version_keys {
+            let Some(version) = key
+                .rsplit('/')
+                .next()
+                .and_then(|part| part.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(data) = storage.get(&key).await else {
+                continue;
+            };
+            let Ok(info) = serde_json::from_slice::<serde_json::Value>(&data) else {
+                continue;
+            };
+            let Some(blob_key) =
+                crate::npm_layout::hosted_blob_key_from_manifest(repository, package, &data)
+            else {
+                continue;
+            };
+            let published = display_stat(storage, &key)
+                .await
+                .map(|meta| format_timestamp(meta.modified))
+                .unwrap_or_else(|| "N/A".to_string());
+            version_rows.push((version.to_string(), info, published, blob_key));
+        }
+        let package_key = format!("npm/repositories/{repository}/{package}/pkg.json");
+        storage
+            .get(&package_key)
+            .await
+            .ok()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+    };
 
     let mut stable_versions = Vec::new();
     let mut prerelease_count: usize = 0;
-
-    // Parse metadata.json for version info
-    if let Ok(data) = storage.get(&metadata_key).await {
-        if let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&data) {
-            if let Some(versions_obj) = metadata.get("versions").and_then(|v| v.as_object()) {
-                let time_obj = metadata.get("time").and_then(|t| t.as_object());
-
-                for (version, info) in versions_obj {
-                    let is_prerelease = version.contains('-');
-
-                    let meta_size = info
-                        .get("dist")
-                        .and_then(|d| d.get("unpackedSize"))
-                        .and_then(|s| s.as_u64())
-                        .unwrap_or(0);
-
-                    let published = time_obj
-                        .and_then(|t| t.get(version))
-                        .and_then(|p| p.as_str())
-                        .map(|s| s.get(..10).unwrap_or(s).to_string())
-                        .unwrap_or_else(|| "N/A".to_string());
-
-                    // Count pre-release, skip unless toggled
-                    if is_prerelease {
-                        prerelease_count += 1;
-                        if !show_prerelease {
-                            continue;
-                        }
-                    }
-
-                    // Check if tarball is actually cached on disk
-                    // For scoped packages (@scope/name), tarball uses just the "name" part
-                    let name_part = if name.contains('/') {
-                        name.rsplit('/').next().unwrap_or(name)
-                    } else {
-                        name
-                    };
-                    let tarball_key =
-                        format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
-                        (meta.size, true)
-                    } else {
-                        (meta_size, false)
-                    };
-
-                    stable_versions.push(VersionInfo {
-                        version: version.clone(),
-                        size,
-                        published,
-                        cached,
-                    });
-                }
+    for (version, info, published, tarball_key) in version_rows {
+        let is_prerelease = version.contains('-');
+        if is_prerelease {
+            prerelease_count += 1;
+            if !show_prerelease {
+                continue;
             }
         }
+        let declared_size = info
+            .get("dist")
+            .and_then(|dist| dist.get("unpackedSize"))
+            .and_then(|size| size.as_u64())
+            .unwrap_or(0);
+        let (size, cached) = display_stat(storage, &tarball_key)
+            .await
+            .map_or((declared_size, false), |meta| (meta.size, true));
+        stable_versions.push(VersionInfo {
+            version,
+            size,
+            published,
+            cached,
+        });
     }
 
     // Sort by version (semver-like, newest first)
@@ -658,56 +955,51 @@ pub async fn get_npm_detail(
         stable_versions.truncate(20);
     }
 
-    // Extract package-level metadata from the same JSON
     let mut metadata = PackageMetadata::default();
-    if let Ok(data) = storage.get(&metadata_key).await {
-        if let Ok(meta_json) = serde_json::from_slice::<serde_json::Value>(&data) {
-            metadata.description = meta_json
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            metadata.license = meta_json
-                .get("license")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            metadata.author = meta_json.get("author").and_then(|v| {
-                // author can be a string or { name: "..." }
-                v.as_str().map(|s| s.to_string()).or_else(|| {
-                    v.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string())
-                })
-            });
-            metadata.homepage = meta_json
-                .get("homepage")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .filter(|s| sanitize_href(s).is_some())
-                .map(|s| s.to_string());
-            metadata.repository = meta_json
-                .get("repository")
-                .and_then(|v| {
-                    // repository can be a string or { url: "..." }
-                    v.as_str()
-                        .map(|s| s.to_string())
-                        .or_else(|| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
-                })
-                .map(|s| {
-                    s.trim_start_matches("git+")
-                        .trim_end_matches(".git")
-                        .to_string()
-                })
-                .filter(|s| sanitize_href(s).is_some());
-            metadata.keywords = meta_json
-                .get("keywords")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-        }
+    if let Some(meta_json) = metadata_json {
+        metadata.description = meta_json
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        metadata.license = meta_json
+            .get("license")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        metadata.author = meta_json.get("author").and_then(|v| {
+            v.as_str().map(|s| s.to_string()).or_else(|| {
+                v.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+        });
+        metadata.homepage = meta_json
+            .get("homepage")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .filter(|s| sanitize_href(s).is_some())
+            .map(|s| s.to_string());
+        metadata.repository = meta_json
+            .get("repository")
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+            })
+            .map(|s| {
+                s.trim_start_matches("git+")
+                    .trim_end_matches(".git")
+                    .to_string()
+            })
+            .filter(|s| sanitize_href(s).is_some());
+        metadata.keywords = meta_json
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     PackageDetail {
@@ -719,20 +1011,21 @@ pub async fn get_npm_detail(
 }
 
 pub async fn get_cargo_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("cargo/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "cargo", &prefix);
 
     let mut versions = Vec::new();
     for key in keys.iter().filter(|k| ends_with_ci(k, ".crate")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             let parts: Vec<_> = rest.split('/').collect();
             if !parts.is_empty() {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                     (meta.size, format_timestamp(meta.modified))
                 } else {
                     (0, "N/A".to_string())
@@ -813,19 +1106,20 @@ pub async fn get_cargo_detail(
 }
 
 pub async fn get_pypi_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("pypi/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "pypi", &prefix);
 
     let mut versions = Vec::new();
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
             if let Some(version) = extract_pypi_version(name, filename) {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                     (meta.size, format_timestamp(meta.modified))
                 } else {
                     (0, "N/A".to_string())
@@ -853,13 +1147,14 @@ pub async fn get_pypi_detail(
 
 /// List immediate children of a Go namespace path for hierarchical browsing.
 /// Returns (entries, is_leaf_module). A leaf module has an `@v/` subdirectory.
-pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+pub async fn get_go_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>, bool) {
+    let storage = &state.storage;
     let prefix = if path.is_empty() {
         "go/".to_string()
     } else {
         format!("go/{}/", path)
     };
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "go", &prefix);
 
     if keys.is_empty() {
         return (vec![], false);
@@ -888,7 +1183,7 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
             }
             let entry = groups.entry(child_name).or_insert((0, 0, 0));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
+            if let Some(meta) = display_stat(storage, key).await {
                 entry.1 += meta.size;
                 if meta.modified > entry.2 {
                     entry.2 = meta.modified;
@@ -922,8 +1217,8 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
 /// Filenames follow the Galaxy convention: `{namespace}-{name}-{version}.tar.gz`.
 /// Namespace and name are `[a-z0-9_]+`, so the first `-` is an unambiguous separator.
 /// Does NOT call `storage.stat` — avoids latency on large collection counts.
-pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
-    let keys = storage.list("ansible/download/").await.unwrap_or_default();
+pub async fn get_ansible_namespace_listing(state: &AppState, path: &str) -> Vec<RepoInfo> {
+    let keys = snapshot_keys(state, "ansible", "ansible/download/");
 
     if keys.is_empty() {
         return vec![];
@@ -992,11 +1287,12 @@ pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec
 }
 
 pub async fn get_go_detail(
-    storage: &Storage,
+    state: &AppState,
     module: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("go/{}/@v/", module);
 
     // Read version list file (populated by go proxy on list requests)
@@ -1014,7 +1310,7 @@ pub async fn get_go_detail(
     }
 
     // Also scan for .zip files that might exist without being in the list
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "go", &prefix);
     for key in keys.iter().filter(|k| ends_with_ci(k, ".zip")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.strip_suffix(".zip") {
@@ -1025,8 +1321,7 @@ pub async fn get_go_detail(
         }
     }
 
-    let list_ts = storage
-        .stat(&list_key)
+    let list_ts = display_stat(storage, &list_key)
         .await
         .map(|m| format_timestamp(m.modified))
         .unwrap_or_else(|| "N/A".to_string());
@@ -1034,7 +1329,7 @@ pub async fn get_go_detail(
     let mut versions = Vec::new();
     for v in &known_versions {
         let zip_key = format!("{}{}.zip", prefix, v);
-        let (size, published, cached) = if let Some(meta) = storage.stat(&zip_key).await {
+        let (size, published, cached) = if let Some(meta) = display_stat(storage, &zip_key).await {
             (meta.size, format_timestamp(meta.modified), true)
         } else {
             (0, list_ts.clone(), false)
@@ -1061,25 +1356,24 @@ pub async fn get_go_detail(
 /// Generic detail for new-format registries (NuGet, Gems, Terraform, Ansible, Pub, Conan).
 /// Reads version info from storage using registry-specific paths.
 pub async fn get_generic_detail(
-    storage: &Storage,
+    state: &AppState,
     registry: &str,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
     let name_lower = name.to_lowercase();
+    let storage = &state.storage;
 
     match registry {
         "nuget" => get_nuget_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "conan" => get_conan_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "rpm" => get_rpm_detail(storage, name, show_all).await,
-        "deb" => get_deb_detail(storage, name, show_all).await,
+        "conan" => get_conan_detail(state, &name_lower, show_prerelease, show_all).await,
+        "rpm" => get_rpm_detail(state, name, show_all).await,
+        "deb" => get_deb_detail(state, name, show_all).await,
         "gems" => get_gems_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "pub" => get_pub_detail(storage, &name_lower, show_prerelease, show_all).await,
-        "ansible" => get_ansible_detail(storage, &name_lower, show_prerelease, show_all).await,
-        _ => {
-            get_storage_scan_detail(storage, registry, &name_lower, show_prerelease, show_all).await
-        }
+        "pub" => get_pub_detail(state, &name_lower, show_prerelease, show_all).await,
+        "ansible" => get_ansible_detail(state, &name_lower, show_prerelease, show_all).await,
+        _ => get_storage_scan_detail(state, registry, &name_lower, show_prerelease, show_all).await,
     }
 }
 
@@ -1100,8 +1394,7 @@ async fn get_nuget_detail(
     if let Ok(data) = storage.get(&key).await {
         if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&data) {
             if let Some(versions) = index.get("versions").and_then(|v| v.as_array()) {
-                let fallback_ts = storage
-                    .stat(&key)
+                let fallback_ts = display_stat(storage, &key)
                     .await
                     .map(|m| format_timestamp(m.modified))
                     .unwrap_or_else(|| "N/A".to_string());
@@ -1134,7 +1427,8 @@ async fn get_nuget_detail(
                     // Check if .nupkg is cached locally
                     let nupkg_key =
                         format!("nuget/flatcontainer/{}/{}/{}.{}.nupkg", name, v, name, v);
-                    let (size, cached) = if let Some(meta) = storage.stat(&nupkg_key).await {
+                    let (size, cached) = if let Some(meta) = display_stat(storage, &nupkg_key).await
+                    {
                         (meta.size, true)
                     } else {
                         (0, false)
@@ -1276,15 +1570,16 @@ async fn load_nuget_package_metadata(storage: &Storage, key: &str) -> PackageMet
 }
 
 async fn get_conan_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     // Conan: conan/{name}/{version}/_/_/revisions.json (metadata)
     // Actual files: conan/{name}/{version}/_/_/{rrev}/export/* or /packages/*/
     let prefix = format!("conan/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "conan", &prefix);
     let mut version_data: HashMap<String, (u64, u64, bool)> = HashMap::new(); // (size, mtime, has_content)
 
     for key in &keys {
@@ -1294,7 +1589,7 @@ async fn get_conan_detail(
                     .entry(version.to_string())
                     .or_insert((0, 0, false));
                 let is_content = !ends_with_ci(key, "/revisions.json");
-                if let Some(meta) = storage.stat(key).await {
+                if let Some(meta) = display_stat(storage, key).await {
                     if is_content {
                         entry.0 += meta.size;
                         entry.2 = true;
@@ -1331,9 +1626,10 @@ async fn get_conan_detail(
 /// (NEVRA). Reads the per-package metadata sidecars written at upload —
 /// never the .rpm payloads. No prerelease filter: NEVRA strings always
 /// contain '-' and would all be misclassified as prerelease.
-async fn get_rpm_detail(storage: &Storage, repo: &str, show_all: bool) -> PackageDetail {
+async fn get_rpm_detail(state: &AppState, repo: &str, show_all: bool) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("rpm/{}/.nora-meta/", repo);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "rpm", &prefix);
     let mut versions = Vec::new();
 
     for key in &keys {
@@ -1383,9 +1679,10 @@ async fn get_rpm_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
 /// (package_version_arch). Reads the per-package control sidecars written at
 /// upload — never the .deb payloads. No prerelease filter: Debian versions
 /// routinely contain '-' and would all be misclassified as prerelease.
-async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> PackageDetail {
+async fn get_deb_detail(state: &AppState, repo: &str, show_all: bool) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("deb/{}/.nora-meta/", repo);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "deb", &prefix);
     let mut versions = Vec::new();
 
     for key in &keys {
@@ -1401,8 +1698,7 @@ async fn get_deb_detail(storage: &Storage, repo: &str, show_all: bool) -> Packag
                 .unwrap_or("")
                 .to_string()
         };
-        let published = storage
-            .stat(key)
+        let published = display_stat(storage, key)
             .await
             .map(|m| format_timestamp(m.modified))
             .unwrap_or_else(|| "N/A".to_string());
@@ -1436,8 +1732,7 @@ async fn get_gems_detail(
     // Read compact index: gems/info/{name}
     // Format: "VERSION DEPS|checksum:HEX" per line, first line is "---"
     let info_key = format!("gems/info/{}", name);
-    let info_ts = storage
-        .stat(&info_key)
+    let info_ts = display_stat(storage, &info_key)
         .await
         .map(|m| format_timestamp(m.modified))
         .unwrap_or_else(|| "N/A".to_string());
@@ -1458,11 +1753,12 @@ async fn get_gems_detail(
 
                 // Check if .gem is cached
                 let gem_key = format!("gems/gems/{}-{}.gem", name, version);
-                let (size, published, cached) = if let Some(meta) = storage.stat(&gem_key).await {
-                    (meta.size, format_timestamp(meta.modified), true)
-                } else {
-                    (0, info_ts.clone(), false)
-                };
+                let (size, published, cached) =
+                    if let Some(meta) = display_stat(storage, &gem_key).await {
+                        (meta.size, format_timestamp(meta.modified), true)
+                    } else {
+                        (0, info_ts.clone(), false)
+                    };
 
                 versions.push(VersionInfo {
                     version,
@@ -1487,14 +1783,15 @@ async fn get_gems_detail(
 }
 
 async fn get_pub_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     // Pub: pub/packages/{name}/versions/{version}.tar.gz
     let prefix = format!("pub/packages/{}/versions/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "pub", &prefix);
     let mut versions = Vec::new();
 
     for key in &keys {
@@ -1504,7 +1801,7 @@ async fn get_pub_detail(
         if let Some(rest) = key.strip_prefix(&prefix) {
             let version = rest.trim_end_matches(".tar.gz").to_string();
             if !version.is_empty() {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                     (meta.size, format_timestamp(meta.modified))
                 } else {
                     (0, "N/A".to_string())
@@ -1532,11 +1829,12 @@ async fn get_pub_detail(
 /// Ansible Galaxy collection detail: list versions of `{ns}.{name}`.
 /// Files stored as `ansible/download/{ns}-{name}-{ver}.tar.gz`.
 async fn get_ansible_detail(
-    storage: &Storage,
+    state: &AppState,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     // name comes as "community.general" → split to (ns, collection)
     let (ns, col) = match name.split_once('.') {
         Some(pair) => pair,
@@ -1550,7 +1848,7 @@ async fn get_ansible_detail(
         }
     };
 
-    let keys = storage.list("ansible/download/").await.unwrap_or_default();
+    let keys = snapshot_keys(state, "ansible", "ansible/download/");
     let prefix = format!("{}-{}-", ns, col);
     let mut versions = Vec::new();
 
@@ -1561,7 +1859,7 @@ async fn get_ansible_detail(
         {
             if let Some(version) = filename.strip_prefix(&prefix) {
                 if !version.is_empty() {
-                    let (size, published) = if let Some(meta) = storage.stat(key).await {
+                    let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                         (meta.size, format_timestamp(meta.modified))
                     } else {
                         (0, "N/A".to_string())
@@ -1590,14 +1888,15 @@ async fn get_ansible_detail(
 
 /// Fallback: scan storage for files matching {registry}/{name}/*
 async fn get_storage_scan_detail(
-    storage: &Storage,
+    state: &AppState,
     registry: &str,
     name: &str,
     show_prerelease: bool,
     show_all: bool,
 ) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("{}/{}/", registry, name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, registry, &prefix);
     let mut versions = Vec::new();
     for key in &keys {
         if let Some(rest) = key.strip_prefix(&prefix) {
@@ -1608,7 +1907,7 @@ async fn get_storage_scan_detail(
                 .trim_end_matches(".tgz")
                 .to_string();
             if !version.is_empty() && !version.contains('/') {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
+                let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                     (meta.size, format_timestamp(meta.modified))
                 } else {
                     (0, "N/A".to_string())
@@ -1732,16 +2031,17 @@ fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
     }
 }
 
-pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
+pub async fn get_raw_detail(state: &AppState, group: &str) -> PackageDetail {
+    let storage = &state.storage;
     let prefix = format!("raw/{}/", group);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "raw", &prefix);
 
     let mut versions = Vec::new();
 
     if keys.is_empty() {
         // Root-level file: "raw/myfile.txt" (no subdirectory)
         let direct_key = format!("raw/{}", group);
-        if let Some(meta) = storage.stat(&direct_key).await {
+        if let Some(meta) = snapshot_meta(state, "raw", &direct_key) {
             versions.push(VersionInfo {
                 version: group.to_string(),
                 size: meta.size,
@@ -1759,7 +2059,7 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
 
     for key in &keys {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            let (size, published) = if let Some(meta) = storage.stat(key).await {
+            let (size, published) = if let Some(meta) = display_stat(storage, key).await {
                 (meta.size, format_timestamp(meta.modified))
             } else {
                 (0, "N/A".to_string())
@@ -1783,14 +2083,15 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
 
 /// List immediate children (subfolders + files) of a raw directory path.
 /// Returns (entries, is_directory). If the path is a single file, returns empty vec + false.
-pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+pub async fn get_raw_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>, bool) {
+    let storage = &state.storage;
     let prefix = format!("raw/{}/", path);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let keys = snapshot_keys(state, "raw", &prefix);
 
     if keys.is_empty() {
         // Check if it's a direct file
         let direct_key = format!("raw/{}", path);
-        if storage.stat(&direct_key).await.is_some() {
+        if snapshot_meta(state, "raw", &direct_key).is_some() {
             return (vec![], false); // It's a file, not a directory
         }
         return (vec![], true); // Empty directory
@@ -1811,7 +2112,7 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
                 .entry(child_name)
                 .or_insert((0, 0, 0, is_direct_file));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
+            if let Some(meta) = display_stat(storage, key).await {
                 entry.1 += meta.size;
                 if meta.modified > entry.2 {
                     entry.2 = meta.modified;
@@ -1835,4 +2136,130 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
 
     (result, true)
+}
+
+#[cfg(test)]
+mod named_npm_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn browser_detail_handlers_never_scan_storage() {
+        let ctx = crate::test_helpers::create_test_context();
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(std::sync::Arc::new(backend));
+        state.repo_index = std::sync::Arc::new(crate::repo_index::RepoIndex::new());
+
+        for registry in RegistryType::all() {
+            assert!(
+                state
+                    .repo_index
+                    .rebuild_for_test(*registry, &state.storage)
+                    .await,
+                "background snapshot must build for {}",
+                registry.as_str()
+            );
+        }
+        list_attempts.lock().clear();
+
+        let _ = get_docker_detail(&state, "library/example").await;
+        let _ = get_npm_detail(&state, "repositories/npm-private/example", true, true).await;
+        let _ = get_cargo_detail(&state, "example", true, true).await;
+        let _ = get_pypi_detail(&state, "example", true, true).await;
+        let _ = get_go_dir_listing(&state, "example.com").await;
+        let _ = get_go_detail(&state, "example.com/module", true, true).await;
+        let _ = get_ansible_namespace_listing(&state, "").await;
+        let _ = get_raw_dir_listing(&state, "example").await;
+        let _ = get_raw_detail(&state, "example").await;
+        for registry in [
+            "nuget",
+            "conan",
+            "rpm",
+            "deb",
+            "gems",
+            "pub",
+            "ansible",
+            "terraform",
+        ] {
+            let _ = get_generic_detail(&state, registry, "example", true, true).await;
+        }
+
+        assert!(
+            list_attempts.lock().is_empty(),
+            "browser request paths must read the published snapshot, not LIST storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn detail_reads_named_hosted_manifest_and_tarball() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let ctx = crate::test_helpers::create_test_context();
+        let storage = ctx.state.storage.clone();
+        let blob = b"tarball";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.2.3",
+            "description": "example",
+            "dist": {
+                "integrity": format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(blob))
+                )
+            }
+        }))
+        .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.2.3.json",
+                &manifest,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/pkg.json",
+                br#"{"name":"@scope/pkg","description":"example"}"#,
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &crate::npm_layout::hosted_blob_key_from_manifest(
+                    "npm-private",
+                    "@scope/pkg",
+                    &manifest,
+                )
+                .unwrap(),
+                blob,
+            )
+            .await
+            .unwrap();
+
+        // Direct fixture writes bypass the publish handlers, so reproduce the
+        // generation invalidation a real hosted publish performs.
+        ctx.state.repo_index.invalidate("npm");
+        assert!(
+            ctx.state
+                .repo_index
+                .rebuild_for_test(RegistryType::Npm, &storage)
+                .await
+        );
+        let detail = get_npm_detail(
+            &ctx.state,
+            "repositories/npm-private/@scope/pkg",
+            true,
+            true,
+        )
+        .await;
+
+        assert_eq!(detail.versions.len(), 1);
+        assert_eq!(detail.versions[0].version, "1.2.3");
+        assert!(detail.versions[0].cached);
+        assert_eq!(detail.versions[0].size, 7);
+        assert_eq!(detail.metadata.description.as_deref(), Some("example"));
+    }
 }
