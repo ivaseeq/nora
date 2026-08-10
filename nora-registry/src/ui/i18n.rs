@@ -57,7 +57,6 @@ pub struct Translations {
     pub stat_uploads: &'static str,
     pub stat_artifacts: &'static str,
     pub stat_cache_hit: &'static str,
-    pub stat_storage: &'static str,
     pub stats_since_restart: &'static str,
 
     // Registry cards
@@ -175,7 +174,6 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     stat_uploads: "Uploads",
     stat_artifacts: "Artifacts",
     stat_cache_hit: "Cache Hit",
-    stat_storage: "Storage",
     stats_since_restart: "since restart",
 
     // Registry cards
@@ -285,7 +283,6 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     stat_uploads: "Публикации",
     stat_artifacts: "Артефакты",
     stat_cache_hit: "Кэш",
-    stat_storage: "Хранилище",
     stats_since_restart: "с момента перезапуска",
 
     // Registry cards
@@ -395,7 +392,6 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     stat_uploads: "上传量",
     stat_artifacts: "制品数",
     stat_cache_hit: "缓存命中",
-    stat_storage: "存储",
     stats_since_restart: "自重启以来",
 
     // Registry cards

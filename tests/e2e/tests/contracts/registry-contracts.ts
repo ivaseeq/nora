@@ -430,7 +430,6 @@ export const DASHBOARD: DashboardContract = {
     '#stat-uploads',
     '#stat-artifacts',
     '#stat-cache-hit',
-    '#stat-storage',
   ],
   registryCardSelector: 'a[id^="registry-"]',
   hasMountPointsTable: true,

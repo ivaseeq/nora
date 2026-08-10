@@ -1870,28 +1870,6 @@ async fn run_server(mut config: Config, storage: Storage) {
         "System endpoints"
     );
 
-    // Physical size is intentionally isolated from readiness and request paths.
-    // The first tick runs immediately; subsequent full scans run every five
-    // minutes and retain the last successful value on failure.
-    let size_state = state.clone();
-    let size_cancel = cancel_token.clone();
-    let size_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = size_cancel.cancelled() => return,
-                _ = interval.tick() => {
-                    size_state.storage.refresh_total_size_cache().await;
-                    metrics::STORAGE_BYTES
-                        .with_label_values(&["total"])
-                        .set(size_state.storage.total_size().await as i64);
-                }
-            }
-        }
-    });
-    scheduler_handles.push(size_handle);
-
     // Background task: flush token last_used + periodic maintenance every 30 seconds
     let metrics_state = state.clone();
     let metrics_cancel = cancel_token.clone();
@@ -1911,8 +1889,8 @@ async fn run_server(mut config: Config, storage: Storage) {
             metrics_state.auth_failures.cleanup();
 
             // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-            // boot pass runs right away. Reachability is a one-result probe with
-            // its own short wall-time bound; it never waits for the physical-size scan.
+            // boot pass runs right away). Reachability is a one-result probe with
+            // its own short wall-time bound.
             if !tick_count.is_multiple_of(2) {
                 metrics_state.storage.refresh_reachability_cache().await;
                 // Per-registry artifact counts + logical bytes from the cached index,

@@ -3916,14 +3916,6 @@ mod integration_tests {
             true
         }
 
-        async fn total_size(&self) -> u64 {
-            self.objects
-                .lock()
-                .values()
-                .map(|data| data.len() as u64)
-                .sum()
-        }
-
         fn backend_name(&self) -> &'static str {
             "fault-injecting-maven-test"
         }
@@ -5142,10 +5134,6 @@ mod integration_tests {
 
             async fn health_check(&self) -> bool {
                 true
-            }
-
-            async fn total_size(&self) -> u64 {
-                0
             }
 
             fn backend_name(&self) -> &'static str {

@@ -48,8 +48,11 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `nora_storage_bytes` | gauge | registry | Storage size in bytes per registry |
+| `nora_storage_bytes` | gauge | registry | Logical indexed bytes per registry when available; no physical `total` series |
 | `nora_storage_operations_total` | counter | operation, status | Storage operations (put, get, delete). `status="integrity_fail"`/`"verify_error"` on `operation="get"` mean a stored artifact failed hash-pin verification and was refused (fail-closed, #582) — see [Integrity recovery](#integrity-recovery). |
+
+An unavailable logical size (currently npm) is omitted rather than exported as
+a misleading zero-valued series.
 
 ### Circuit Breaker
 
@@ -87,11 +90,11 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 
 The included dashboard (`dist/grafana-dashboard.json`) provides:
 
-- **Row 1** — Key stats: request rate, error rate, p50/p99 latency, cache hit rate, storage used
+- **Row 1** — Key stats: request rate, error rate, p50/p99 latency, cache hit rate
 - **Row 2** — Request rate by registry, HTTP latency percentiles (p50/p95/p99)
 - **Row 3** — Error rate by registry, upstream proxy latency by registry
 - **Row 4** — Cache hit/miss rate, downloads/uploads by registry
-- **Row 5** — Storage by registry, circuit breaker state table, security alerts (URL leaks, CB rejections)
+- **Row 5** — Circuit breaker state table, security alerts (URL leaks, CB rejections)
 - **Row 6** — Retention & GC bytes freed, last run timestamps, storage operations
 
 The dashboard includes a `registry` template variable to filter by specific protocol.

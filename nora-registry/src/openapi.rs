@@ -14,6 +14,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::activity_log::ActivityEntry;
 use crate::auth::{TokenListItem, TokenListResponse};
 use crate::health::StorageHealth;
+use crate::repo_index::RepoInfo;
 use crate::ui::api::{DashboardResponse, GlobalStats, MountPoint, RegistryCardStats};
 use crate::AppState;
 
@@ -149,6 +150,7 @@ use crate::AppState;
             DashboardResponse,
             GlobalStats,
             RegistryCardStats,
+            RepoInfo,
             MountPoint,
             ActivityEntry,
             DockerVersion,
@@ -1473,5 +1475,23 @@ mod tests {
             path["delete"]["responses"]["400"]["description"],
             "Invalid package/tag, protected latest tag, or group endpoint"
         );
+    }
+
+    #[test]
+    fn size_fields_document_availability_instead_of_ambiguous_zero() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for schema in [
+            "StorageHealth",
+            "GlobalStats",
+            "RegistryCardStats",
+            "RepoInfo",
+        ] {
+            assert!(
+                document["components"]["schemas"][schema]["properties"]
+                    .get("size_available")
+                    .is_some(),
+                "{schema} must document size_available"
+            );
+        }
     }
 }

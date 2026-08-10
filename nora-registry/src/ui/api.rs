@@ -1,11 +1,11 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use super::components::{format_size, format_timestamp, html_escape, sanitize_href};
+use super::components::{format_available_size, format_timestamp, html_escape, sanitize_href};
 use super::templates::encode_uri_component;
 use crate::activity_log::ActivityEntry;
 use crate::registry_type::RegistryType;
-use crate::repo_index::RepoInfo;
+use crate::repo_index::{IndexStatus, RepoInfo};
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use crate::Storage;
@@ -160,7 +160,10 @@ pub struct GlobalStats {
     pub uploads: u64,
     pub artifacts: u64,
     pub cache_hit_percent: f64,
+    /// Retained for API compatibility; zero when `size_available` is false.
     pub storage_bytes: u64,
+    /// Physical total storage is intentionally not scanned in the background.
+    pub size_available: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -169,7 +172,10 @@ pub struct RegistryCardStats {
     pub artifact_count: usize,
     pub downloads: u64,
     pub uploads: u64,
+    /// Retained for API compatibility; zero when `size_available` is false.
     pub size_bytes: u64,
+    /// Whether `size_bytes` came from a published logical index snapshot.
+    pub size_available: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -209,7 +215,6 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
 }
 
 pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardResponse> {
-    let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
     let mut registry_card_stats = Vec::new();
     let mut mount_points = Vec::new();
@@ -221,10 +226,19 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
 
         let name = reg.as_str();
         let repos = state.repo_index.get(name, &state.storage).await;
-        let size: u64 = repos.iter().map(|r| r.size).sum();
+        let size_available = *reg != RegistryType::Npm
+            && if repos.is_empty() {
+                state.repo_index.status(name) == Some(IndexStatus::Ready)
+            } else {
+                repos.iter().all(|repo| repo.size_available)
+            };
+        let size: u64 = if size_available {
+            repos.iter().map(|r| r.size).sum()
+        } else {
+            0
+        };
         let versions: usize = repos.iter().map(|r| r.versions).sum();
 
-        total_storage += size;
         total_artifacts += versions;
 
         registry_card_stats.push(RegistryCardStats {
@@ -233,6 +247,7 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
             downloads: state.metrics.get_registry_downloads(name),
             uploads: state.metrics.get_registry_uploads(name),
             size_bytes: size,
+            size_available,
         });
 
         let proxy_upstreams: Vec<String> =
@@ -314,7 +329,8 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
         uploads: state.metrics.uploads(),
         artifacts: total_artifacts as u64,
         cache_hit_percent: state.metrics.cache_hit_rate(),
-        storage_bytes: total_storage,
+        storage_bytes: 0,
+        size_available: false,
     };
 
     let activity = state.activity.recent(20);
@@ -328,6 +344,28 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
         uptime_seconds,
         startup_duration_ms: state.startup_duration_ms,
     })
+}
+
+#[cfg(test)]
+mod dashboard_size_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn physical_and_npm_sizes_are_explicitly_unavailable() {
+        let ctx = crate::test_helpers::create_test_context();
+        let dashboard = api_dashboard(State(ctx.state.clone())).await.0;
+
+        assert_eq!(dashboard.global_stats.storage_bytes, 0);
+        assert!(!dashboard.global_stats.size_available);
+
+        let npm = dashboard
+            .registry_stats
+            .iter()
+            .find(|registry| registry.name == "npm")
+            .expect("default config enables npm");
+        assert_eq!(npm.size_bytes, 0);
+        assert!(!npm.size_available);
+    }
 }
 
 pub async fn api_list(
@@ -407,7 +445,7 @@ pub async fn api_search(
                     detail_url,
                     html_escape(&repo.name),
                     repo.versions,
-                    format_size(repo.size),
+                    format_available_size(repo.size, repo.size_available),
                     &repo.updated
                 )
             })
@@ -629,6 +667,7 @@ fn maven_repository_rows(state: &AppState) -> Vec<RepoInfo> {
                 name: repository.name().to_string(),
                 versions,
                 size,
+                size_available: true,
                 updated: format_timestamp(modified),
                 ..Default::default()
             }
@@ -695,6 +734,7 @@ pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInf
             name,
             versions: count,
             size,
+            size_available: true,
             updated: format_timestamp(modified),
             ..Default::default()
         })
@@ -1170,7 +1210,8 @@ pub async fn get_go_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>,
     }
 
     // Group by immediate child segment (skip @latest and other direct files)
-    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    // (object count, bytes, latest mtime, complete metadata)
+    let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
     for key in &keys {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if rest.is_empty() || !rest.contains('/') {
@@ -1181,23 +1222,26 @@ pub async fn get_go_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>,
             if child_name.starts_with('@') {
                 continue;
             }
-            let entry = groups.entry(child_name).or_insert((0, 0, 0));
+            let entry = groups.entry(child_name).or_insert((0, 0, 0, true));
             entry.0 += 1;
             if let Some(meta) = display_stat(storage, key).await {
                 entry.1 += meta.size;
                 if meta.modified > entry.2 {
                     entry.2 = meta.modified;
                 }
+            } else {
+                entry.3 = false;
             }
         }
     }
 
     let mut result: Vec<RepoInfo> = groups
         .into_iter()
-        .map(|(name, (count, size, modified))| RepoInfo {
+        .map(|(name, (count, size, modified, size_available))| RepoInfo {
             name,
             versions: count,
             size,
+            size_available,
             updated: format_timestamp(modified),
             ..Default::default()
         })
@@ -2098,7 +2142,8 @@ pub async fn get_raw_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>
     }
 
     // Group by immediate child segment
-    let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
+    // (object count, bytes, latest mtime, direct file, complete metadata)
+    let mut groups: HashMap<String, (usize, u64, u64, bool, bool)> = HashMap::new();
 
     for key in &keys {
         if let Some(rest) = key.strip_prefix(&prefix) {
@@ -2110,32 +2155,98 @@ pub async fn get_raw_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>
 
             let entry = groups
                 .entry(child_name)
-                .or_insert((0, 0, 0, is_direct_file));
+                .or_insert((0, 0, 0, is_direct_file, true));
             entry.0 += 1;
             if let Some(meta) = display_stat(storage, key).await {
                 entry.1 += meta.size;
                 if meta.modified > entry.2 {
                     entry.2 = meta.modified;
                 }
+            } else {
+                entry.4 = false;
             }
         }
     }
 
     let mut result: Vec<RepoInfo> = groups
         .into_iter()
-        .map(|(name, (count, size, modified, is_file))| RepoInfo {
-            name,
-            versions: count,
-            size,
-            updated: format_timestamp(modified),
-            is_file,
-        })
+        .map(
+            |(name, (count, size, modified, is_file, size_available))| RepoInfo {
+                name,
+                versions: count,
+                size,
+                size_available,
+                updated: format_timestamp(modified),
+                is_file,
+            },
+        )
         .collect();
 
     // Sort: directories first, then files, alphabetical within each group
     result.sort_by(|a, b| a.is_file.cmp(&b.is_file).then_with(|| a.name.cmp(&b.name)));
 
     (result, true)
+}
+
+#[cfg(test)]
+mod size_availability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn directory_sizes_require_complete_metadata() {
+        let ctx = crate::test_helpers::create_test_context();
+        let go_key = "go/example.com/acme/module/@v/v1.0.0.zip";
+        let raw_key = "raw/example/dir/file.txt";
+        ctx.state.storage.put(go_key, b"go-bytes").await.unwrap();
+        ctx.state.storage.put(raw_key, b"raw-bytes").await.unwrap();
+        // TestContext starts the index worker immediately, so force both
+        // snapshots dirty after writing the fixtures.
+        ctx.state.repo_index.invalidate("go");
+        ctx.state.repo_index.invalidate("raw");
+        assert!(
+            ctx.state
+                .repo_index
+                .rebuild_for_test(RegistryType::Go, &ctx.state.storage)
+                .await
+        );
+        assert!(
+            ctx.state
+                .repo_index
+                .rebuild_for_test(RegistryType::Raw, &ctx.state.storage)
+                .await
+        );
+
+        let (go_rows, go_is_leaf) = get_go_dir_listing(&ctx.state, "example.com").await;
+        assert!(!go_is_leaf);
+        assert_eq!(go_rows.len(), 1);
+        assert_eq!(go_rows[0].size, b"go-bytes".len() as u64);
+        assert!(go_rows[0].size_available);
+
+        let (raw_rows, raw_is_directory) = get_raw_dir_listing(&ctx.state, "example").await;
+        assert!(raw_is_directory);
+        assert_eq!(
+            raw_rows.len(),
+            1,
+            "raw snapshot: {:?}",
+            ctx.state.repo_index.objects("raw")
+        );
+        assert_eq!(raw_rows[0].size, b"raw-bytes".len() as u64);
+        assert!(raw_rows[0].size_available);
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone())
+            .fail_stat(go_key)
+            .fail_stat(raw_key);
+        let mut unavailable_state = ctx.state.clone();
+        unavailable_state.storage = Storage::from_backend(std::sync::Arc::new(backend));
+
+        let (go_rows, _) = get_go_dir_listing(&unavailable_state, "example.com").await;
+        assert_eq!(go_rows.len(), 1);
+        assert!(!go_rows[0].size_available);
+
+        let (raw_rows, _) = get_raw_dir_listing(&unavailable_state, "example").await;
+        assert_eq!(raw_rows.len(), 1);
+        assert!(!raw_rows[0].size_available);
+    }
 }
 
 #[cfg(test)]

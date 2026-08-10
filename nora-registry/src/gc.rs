@@ -1981,16 +1981,8 @@ mod tests {
             self.inner.health_check().await
         }
 
-        async fn total_size(&self) -> u64 {
-            self.inner.total_size().await
-        }
-
         fn backend_name(&self) -> &'static str {
             "list-omitting-test"
-        }
-
-        async fn refresh_total_size(&self) {
-            self.inner.refresh_total_size_cache().await;
         }
 
         async fn put_from_path(
@@ -2048,16 +2040,8 @@ mod tests {
             self.inner.health_check().await
         }
 
-        async fn total_size(&self) -> u64 {
-            self.inner.total_size().await
-        }
-
         fn backend_name(&self) -> &'static str {
             "stat-notify-test"
-        }
-
-        async fn refresh_total_size(&self) {
-            self.inner.refresh_total_size_cache().await;
         }
 
         async fn put_from_path(
@@ -2388,9 +2372,6 @@ mod tests {
         }
         async fn health_check(&self) -> bool {
             true
-        }
-        async fn total_size(&self) -> u64 {
-            0
         }
         fn backend_name(&self) -> &'static str {
             "stat-none-test"

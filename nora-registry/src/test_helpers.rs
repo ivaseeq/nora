@@ -279,16 +279,8 @@ impl StorageBackend for FaultInjectBackend {
         self.inner.health_check().await
     }
 
-    async fn total_size(&self) -> u64 {
-        self.inner.total_size().await
-    }
-
     fn backend_name(&self) -> &'static str {
         "fault-inject"
-    }
-
-    async fn refresh_total_size(&self) {
-        self.inner.refresh_total_size_cache().await;
     }
 
     async fn put_from_path(&self, key: &str, src: &Path) -> crate::storage::Result<()> {

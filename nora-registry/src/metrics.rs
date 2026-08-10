@@ -313,11 +313,11 @@ pub static UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create UPLOADS_TOTAL metric at startup")
 });
 
-/// Storage size in bytes by registry (#431)
+/// Logical artifact size in bytes by registry (#431)
 pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_storage_bytes",
-        "Stored artifact bytes per registry (label \"total\" = full storage footprint incl. metadata)",
+        "Logical artifact bytes per registry when exposed by an authoritative index snapshot",
         &["registry"]
     )
     .expect("failed to create STORAGE_BYTES metric at startup")

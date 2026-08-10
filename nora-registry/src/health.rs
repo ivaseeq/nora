@@ -27,7 +27,11 @@ pub struct HealthStatus {
 pub struct StorageHealth {
     pub backend: String,
     pub reachable: bool,
+    /// Retained for API compatibility. Physical bucket-size scanning is not
+    /// performed, so this is zero whenever `size_available` is false.
     pub total_size_bytes: u64,
+    /// Whether `total_size_bytes` contains a measured physical storage size.
+    pub size_available: bool,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -38,7 +42,6 @@ pub fn routes() -> Router<AppState> {
 
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
-    let total_size = state.storage.total_size().await;
 
     let status = if storage_reachable {
         "healthy"
@@ -63,7 +66,8 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         storage: StorageHealth {
             backend: state.storage.backend_name().to_string(),
             reachable: storage_reachable,
-            total_size_bytes: total_size,
+            total_size_bytes: 0,
+            size_available: false,
         },
         registries,
         upstreams,
@@ -154,15 +158,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_json_has_storage_size() {
+    async fn test_health_json_marks_physical_size_unavailable() {
         let ctx = create_test_context();
-
-        // Put some data to have non-zero size
-        ctx.state
-            .storage
-            .put("test/artifact", b"hello world")
-            .await
-            .unwrap();
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -171,10 +168,8 @@ mod tests {
 
         let storage = json.get("storage").unwrap();
         let size = storage.get("total_size_bytes").unwrap().as_u64().unwrap();
-        assert!(
-            size > 0,
-            "total_size_bytes should be > 0 after storing data"
-        );
+        assert_eq!(size, 0);
+        assert_eq!(storage.get("size_available").unwrap(), false);
     }
 
     #[tokio::test]
@@ -186,6 +181,7 @@ mod tests {
 
         let size = json["storage"]["total_size_bytes"].as_u64().unwrap();
         assert_eq!(size, 0, "empty storage should report 0 bytes");
+        assert_eq!(json["storage"]["size_available"], false);
     }
 
     /// Storage unreachable → `/health` stays 200 (liveness = process up) and reports

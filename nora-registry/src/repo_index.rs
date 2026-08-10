@@ -20,13 +20,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tracing::info;
+use utoipa::ToSchema;
 
 /// Repository info for UI display
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, ToSchema, Default)]
 pub struct RepoInfo {
     pub name: String,
     pub versions: usize,
+    /// Retained as a numeric compatibility field. A zero value is meaningful
+    /// only when `size_available` is true.
     pub size: u64,
+    /// Whether `size` was derived from an authoritative index snapshot.
+    #[serde(default)]
+    pub size_available: bool,
     pub updated: String,
     /// True for root-level files in raw storage (not directories)
     #[serde(default)]
@@ -159,14 +165,20 @@ impl RegistryIndex {
         // the version dirs — materialises as a RepoInfo with zero versions. It
         // is not a repository, so it must not inflate the per-registry count
         // that `/api/ui/stats` and `nora_artifacts_total` report (it would show
-        // maven:2 for a single pushed jar). Size is unaffected: `total_size`
-        // sums every bucket, so `storage_bytes` stays == on-disk `du`.
+        // maven:2 for a single pushed jar).
         self.data.read().iter().filter(|r| r.versions > 0).count()
     }
 
-    /// Sum of artifact bytes in this registry's cached index (no rebuild).
-    pub fn total_size(&self) -> u64 {
-        self.data.read().iter().map(|r| r.size).sum()
+    /// Sum logical artifact bytes only when the published rows declare that
+    /// value available. `None` avoids exporting a misleading zero series.
+    pub fn total_size(&self) -> Option<u64> {
+        let data = self.data.read();
+        if data.is_empty() {
+            return (self.status() == IndexStatus::Ready).then_some(0);
+        }
+        data.iter()
+            .all(|row| row.size_available)
+            .then(|| data.iter().map(|row| row.size).sum())
     }
 }
 
@@ -424,7 +436,8 @@ impl RepoIndex {
     pub fn sizes(&self) -> HashMap<RegistryType, u64> {
         self.indexes
             .iter()
-            .map(|(rt, idx)| (*rt, idx.total_size()))
+            .filter(|(rt, _)| **rt != RegistryType::Npm)
+            .filter_map(|(rt, idx)| idx.total_size().map(|size| (*rt, size)))
             .collect()
     }
 }
@@ -627,7 +640,6 @@ async fn build_npm_index(storage: &Storage) -> Option<BuiltIndex> {
                 let blob = by_key.get(blob_key.as_str()).copied();
                 let entry = packages.entry(name).or_insert((0, 0, 0));
                 entry.0 += 1;
-                entry.1 += meta.size + blob.map(|value| value.size).unwrap_or(0);
                 entry.2 = entry
                     .2
                     .max(meta.modified)
@@ -636,14 +648,18 @@ async fn build_npm_index(storage: &Storage) -> Option<BuiltIndex> {
             crate::npm_layout::NpmObjectKind::ProxyTarball(_) => {
                 let entry = packages.entry(name).or_insert((0, 0, 0));
                 entry.0 += 1;
-                entry.1 += meta.size;
                 entry.2 = entry.2.max(meta.modified);
             }
             _ => {}
         }
     }
 
-    Some(BuiltIndex::with_objects(to_sorted_vec(packages), keys))
+    let mut rows = to_sorted_vec(packages);
+    for row in &mut rows {
+        row.size = 0;
+        row.size_available = false;
+    }
+    Some(BuiltIndex::with_objects(rows, keys))
 }
 
 async fn build_cargo_index(storage: &Storage) -> Option<BuiltIndex> {
@@ -750,6 +766,7 @@ async fn build_raw_index(storage: &Storage) -> Option<BuiltIndex> {
             name,
             versions,
             size,
+            size_available: true,
             updated: if modified > 0 {
                 format_timestamp(modified)
             } else {
@@ -854,6 +871,7 @@ fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
             name,
             versions,
             size,
+            size_available: true,
             updated: if modified > 0 {
                 format_timestamp(modified)
             } else {
@@ -1105,6 +1123,30 @@ mod tests {
         let cached = idx.get_cached();
         assert_eq!(cached.len(), 2);
         assert_eq!(cached[0].name, "a");
+    }
+
+    #[test]
+    fn unavailable_size_is_not_exported_as_zero() {
+        let idx = RegistryIndex::new();
+        idx.set(
+            BuiltIndex::repos(vec![RepoInfo {
+                name: "npm-package".to_string(),
+                versions: 1,
+                size: 0,
+                size_available: false,
+                ..Default::default()
+            }]),
+            1,
+        );
+        assert_eq!(idx.total_size(), None);
+    }
+
+    #[test]
+    fn npm_size_series_is_omitted_even_for_an_empty_ready_index() {
+        let index = RepoIndex::new();
+        let npm = index.indexes.get(&RegistryType::Npm).unwrap();
+        npm.set(BuiltIndex::repos(Vec::new()), 1);
+        assert!(!index.sizes().contains_key(&RegistryType::Npm));
     }
 
     #[test]
@@ -1373,6 +1415,9 @@ mod tests {
             .iter()
             .any(|entry| entry.name == "repositories/npm-registry/@scope/pkg"));
         assert_eq!(repos.iter().map(|entry| entry.versions).sum::<usize>(), 3);
+        assert!(repos
+            .iter()
+            .all(|entry| entry.size == 0 && !entry.size_available));
         assert!(
             !repos
                 .iter()
@@ -1479,9 +1524,6 @@ mod tests {
             }
             async fn health_check(&self) -> bool {
                 true
-            }
-            async fn total_size(&self) -> u64 {
-                0
             }
             fn backend_name(&self) -> &'static str {
                 "counting-test"

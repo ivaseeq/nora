@@ -17,7 +17,6 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         data.global_stats.uploads,
         data.global_stats.artifacts,
         data.global_stats.cache_hit_percent,
-        data.global_stats.storage_bytes,
         lang,
     );
 
@@ -35,6 +34,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                 r.downloads,
                 r.uploads,
                 r.size_bytes,
+                r.size_available,
                 &format!("/ui/{}", r.name),
                 t,
             )
@@ -266,7 +266,7 @@ pub fn render_registry_list_paginated(
                     detail_url,
                     html_escape(&repo.name),
                     versions_display,
-                    format_size(repo.size),
+                    format_available_size(repo.size, repo.size_available),
                     &repo.updated
                 )
             })
@@ -617,7 +617,9 @@ pub fn render_raw_dir(
                 </tr>
             "##,
                 href, icon, href, html_escape(&entry.name),
-                versions_display, format_size(entry.size), &entry.updated
+                versions_display,
+                format_available_size(entry.size, entry.size_available),
+                &entry.updated
             )
         })
         .collect();
@@ -749,7 +751,7 @@ pub fn render_maven_dir(
                 href,
                 html_escape(&entry.name),
                 entry.versions,
-                format_size(entry.size),
+                format_available_size(entry.size, entry.size_available),
                 &entry.updated,
             )
         })
@@ -877,7 +879,7 @@ pub fn render_go_dir(
                 href,
                 html_escape(&entry.name),
                 entry.versions,
-                format_size(entry.size),
+                format_available_size(entry.size, entry.size_available),
                 &entry.updated,
             )
         })

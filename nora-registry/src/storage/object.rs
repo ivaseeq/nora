@@ -9,7 +9,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutPayload, WriteMultipart};
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{FileMeta, Result, StorageBackend, StorageError};
@@ -64,10 +64,6 @@ pub struct ObjectStorage {
     store: Box<dyn ObjectStore>,
     /// "s3" or "gcs" — surfaced in /health.
     name: &'static str,
-    /// Cached total size in bytes, refreshed by background task.
-    cached_total_size: std::sync::atomic::AtomicU64,
-    /// Whether cached_total_size has been initialized at least once.
-    size_cache_initialized: std::sync::atomic::AtomicBool,
     /// Outcome of the last background refresh, served by `health_check()`.
     /// Starts `false` so readiness gates until the boot refresh confirms the
     /// store — a live probe here would list the whole bucket on every kubelet
@@ -152,8 +148,6 @@ impl ObjectStorage {
         Self {
             store: Box::new(store),
             name: "s3",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
             health_probe_timeout: options.health_probe_timeout,
@@ -221,8 +215,6 @@ impl ObjectStorage {
         Self {
             store: Box::new(store),
             name: "gcs",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
             health_probe_timeout: options.health_probe_timeout,
@@ -275,6 +267,17 @@ fn map_err(e: object_store::Error) -> StorageError {
         object_store::Error::NotFound { .. } => StorageError::NotFound,
         object_store::Error::AlreadyExists { .. } => StorageError::AlreadyExists,
         other => StorageError::Network(other.to_string()),
+    }
+}
+
+/// Low-cardinality, non-sensitive classification for reachability logs. Never
+/// log the provider error itself here: SDK errors can include endpoint paths or
+/// signed request material, while operators only need a stable failure class.
+fn reachability_error_class(error: &object_store::Error) -> &'static str {
+    match error {
+        object_store::Error::NotFound { .. } => "not_found",
+        object_store::Error::AlreadyExists { .. } => "already_exists",
+        _ => "provider",
     }
 }
 
@@ -428,11 +431,43 @@ impl StorageBackend for ObjectStorage {
         // transfer-oriented object-store request timeout. An empty bucket is a
         // successful response (`Ok(None)`). This probe never computes size and
         // never materializes a bucket listing.
+        let started = Instant::now();
         let mut objects = self.store.list(None);
-        let reachable = matches!(
-            tokio::time::timeout(self.health_probe_timeout, objects.try_next()).await,
-            Ok(Ok(_))
-        );
+        let result = tokio::time::timeout(self.health_probe_timeout, objects.try_next()).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let reachable = match result {
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    backend = self.name,
+                    outcome = "success",
+                    error_class = "none",
+                    duration_ms,
+                    "Object-store reachability probe completed"
+                );
+                true
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    backend = self.name,
+                    outcome = "error",
+                    error_class = reachability_error_class(&error),
+                    duration_ms,
+                    "Object-store reachability probe failed"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    backend = self.name,
+                    outcome = "timeout",
+                    error_class = "timeout",
+                    duration_ms,
+                    timeout_ms = self.health_probe_timeout.as_millis() as u64,
+                    "Object-store reachability probe failed"
+                );
+                false
+            }
+        };
         self.cached_reachable
             .store(reachable, std::sync::atomic::Ordering::Relaxed);
         self.last_refresh_unix.store(
@@ -441,36 +476,8 @@ impl StorageBackend for ObjectStorage {
         );
     }
 
-    async fn total_size(&self) -> u64 {
-        self.cached_total_size
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     fn backend_name(&self) -> &'static str {
         self.name
-    }
-
-    async fn refresh_total_size(&self) {
-        // Stream metadata and retain only the accumulator. A failed scan keeps
-        // the last successful size and has no effect on readiness.
-        let mut objects = self.store.list(None);
-        let mut total = 0u64;
-        loop {
-            match objects.try_next().await {
-                Ok(Some(meta)) => total = total.saturating_add(meta.size),
-                Ok(None) => {
-                    self.cached_total_size
-                        .store(total, std::sync::atomic::Ordering::Relaxed);
-                    self.size_cache_initialized
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "object-store size scan failed; retaining cached size");
-                    return;
-                }
-            }
-        }
     }
 
     async fn put_from_path(&self, key: &str, src: &std::path::Path) -> Result<()> {
@@ -575,7 +582,6 @@ mod tests {
     async fn test_health_check_cached_not_live() {
         let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
         assert!(!storage.health_check().await);
-        storage.refresh_total_size().await;
         assert!(!storage.health_check().await);
     }
 
@@ -612,12 +618,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reachability_and_size_caches_are_independent() {
+    async fn reachability_refresh_marks_a_live_store_ready() {
         let storage = ObjectStorage {
             store: Box::new(object_store::memory::InMemory::new()),
             name: "s3",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -625,14 +629,6 @@ mod tests {
         storage.put("raw/a", b"abc").await.unwrap();
 
         storage.refresh_reachability().await;
-        assert!(storage.health_check().await);
-        assert!(!storage
-            .size_cache_initialized
-            .load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(storage.total_size().await, 0);
-
-        storage.refresh_total_size().await;
-        assert_eq!(storage.total_size().await, 3);
         assert!(storage.health_check().await);
     }
 
@@ -687,8 +683,6 @@ mod tests {
         let storage = ObjectStorage {
             store: Box::new(object_store::memory::InMemory::new()),
             name: "s3",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -728,8 +722,6 @@ mod tests {
         let storage = std::sync::Arc::new(ObjectStorage {
             store: Box::new(object_store::memory::InMemory::new()),
             name: "s3",
-            cached_total_size: std::sync::atomic::AtomicU64::new(0),
-            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
             health_probe_timeout: DEFAULT_HEALTH_PROBE_TIMEOUT,
@@ -841,21 +833,6 @@ mod tests {
     #[tokio::test]
     async fn test_virtual_hosted_uses_endpoint_verbatim() {
         assert_eq!(observed_list_path(true).await, "/");
-    }
-
-    #[test]
-    fn test_s3_total_size_returns_zero_before_init() {
-        let storage = ObjectStorage::new(
-            "http://localhost:9000",
-            "test-bucket",
-            "us-east-1",
-            Some("access"),
-            Some("secret"),
-            false,
-        );
-        assert!(!storage
-            .size_cache_initialized
-            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

@@ -1106,9 +1106,6 @@ mod tests {
             async fn health_check(&self) -> bool {
                 true
             }
-            async fn total_size(&self) -> u64 {
-                0
-            }
             fn backend_name(&self) -> &'static str {
                 "failing-get-test"
             }

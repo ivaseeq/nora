@@ -467,23 +467,23 @@ fn header_dark(lang: Lang) -> String {
     )
 }
 
-/// Render global stats row (5-column grid)
+/// Render global stats row. Physical bucket size is intentionally absent: it
+/// would require an unbounded full-store scan unrelated to request serving.
 pub fn render_global_stats(
     downloads: u64,
     uploads: u64,
     artifacts: u64,
     cache_hit_percent: f64,
-    storage_bytes: u64,
     lang: Lang,
 ) -> String {
     let t = get_translations(lang);
     // Downloads / uploads / cache-hit derive from Prometheus counters, which reset
     // on process restart (#626). Rather than clutter the labels, each such card
-    // carries a hover tooltip (`title`) + a small ⓘ marker; current-state cards
-    // (artifacts, storage) have neither.
+    // carries a hover tooltip (`title`) + a small ⓘ marker; the current artifact
+    // count has neither.
     format!(
         r##"
-        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-6">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-6">
             <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
                 <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
@@ -500,10 +500,6 @@ pub fn render_global_stats(
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
                 <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200">{:.1}%</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
-                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
-                <div id="stat-storage" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
-            </div>
         </div>
         "##,
         t.stats_since_restart,
@@ -516,10 +512,16 @@ pub fn render_global_stats(
         artifacts,
         t.stats_since_restart,
         t.stat_cache_hit,
-        cache_hit_percent,
-        t.stat_storage,
-        format_size(storage_bytes)
+        cache_hit_percent
     )
+}
+
+pub fn format_available_size(bytes: u64, available: bool) -> String {
+    if available {
+        format_size(bytes)
+    } else {
+        "—".to_string()
+    }
 }
 
 /// Render registry card with extended metrics
@@ -531,6 +533,7 @@ pub fn render_registry_card(
     downloads: u64,
     uploads: u64,
     size_bytes: u64,
+    size_available: bool,
     href: &str,
     t: &Translations,
 ) -> String {
@@ -572,7 +575,7 @@ pub fn render_registry_card(
         t.artifacts,
         artifact_count,
         t.size,
-        format_size(size_bytes),
+        format_available_size(size_bytes, size_available),
         t.downloads,
         downloads,
         t.uploads,
@@ -724,15 +727,6 @@ pub fn render_polling_script() -> String {
                 document.getElementById('stat-uploads').textContent = data.global_stats.uploads;
                 document.getElementById('stat-artifacts').textContent = data.global_stats.artifacts;
                 document.getElementById('stat-cache-hit').textContent = data.global_stats.cache_hit_percent.toFixed(1) + '%';
-
-                // Format storage size
-                const bytes = data.global_stats.storage_bytes;
-                let sizeStr;
-                if (bytes >= 1073741824) sizeStr = (bytes / 1073741824).toFixed(1) + ' GB';
-                else if (bytes >= 1048576) sizeStr = (bytes / 1048576).toFixed(1) + ' MB';
-                else if (bytes >= 1024) sizeStr = (bytes / 1024).toFixed(1) + ' KB';
-                else sizeStr = bytes + ' B';
-                document.getElementById('stat-storage').textContent = sizeStr;
 
                 // Update uptime
                 const uptime = document.getElementById('uptime');
@@ -1062,6 +1056,19 @@ mod tests {
     // pollution.
     fn enabled_set(regs: &[RegistryType]) -> HashSet<RegistryType> {
         regs.iter().copied().collect()
+    }
+
+    #[test]
+    fn global_stats_omit_physical_storage_tile() {
+        let html = render_global_stats(1, 2, 3, 4.0, Lang::En);
+        assert!(!html.contains("stat-storage"));
+        assert!(html.contains("stat-artifacts"));
+    }
+
+    #[test]
+    fn unavailable_size_renders_as_dash() {
+        assert_eq!(format_available_size(0, false), "—");
+        assert_eq!(format_available_size(1024, true), "1.0 KB");
     }
 
     #[test]

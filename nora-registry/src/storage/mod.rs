@@ -130,11 +130,7 @@ pub trait StorageBackend: Send + Sync {
     /// result- and wall-time-bounded probe; local storage keeps its existing
     /// direct write check.
     async fn refresh_reachability(&self) {}
-    /// Total size of all stored artifacts in bytes
-    async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
-    /// Refresh any cached size data. No-op for backends without caching.
-    async fn refresh_total_size(&self) {}
     /// Move or copy a file from `src` into storage under `key`.
     ///
     /// Local backend: atomic `rename`, with streaming copy fallback on EXDEV.
@@ -677,10 +673,6 @@ impl Storage {
         self.inner.refresh_reachability().await;
     }
 
-    pub async fn total_size(&self) -> u64 {
-        self.inner.total_size().await
-    }
-
     pub fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
     }
@@ -742,16 +734,6 @@ impl Storage {
     /// Number of pinned hashes (0 if pin store is disabled).
     pub fn pinned_count(&self) -> usize {
         self.pin_store.as_ref().map_or(0, |p| p.len())
-    }
-
-    /// Refresh cached total_size. No-op for local storage, computes for S3.
-    pub async fn refresh_total_size_cache(&self) {
-        let _permit = self
-            .scan_permit
-            .acquire()
-            .await
-            .expect("storage scan semaphore is never closed");
-        self.inner.refresh_total_size().await;
     }
 
     /// Move or copy a file from `src` into storage under `key`.
