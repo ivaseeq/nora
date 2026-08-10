@@ -51,8 +51,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use crate::registry_type::RegistryType;
+
+/// Shared lock for unit tests that mutate the process-wide configuration environment.
+///
+/// Keep this at the `config` module boundary so tests in sibling config modules use the same
+/// lock. A module-local lock does not prevent `NORA_STORAGE_MODE` writers from racing.
+#[cfg(test)]
+static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // --- Shared defaults (used by submodules via `super::default_*`) ---
 
@@ -1140,10 +1149,6 @@ mod tests {
     use super::*;
     use crate::digest_quarantine::QuarantineMode;
     use crate::secrets::ProtectedString;
-    use std::sync::{LazyLock, Mutex};
-
-    /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
-    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_rate_limit_default() {
@@ -1279,6 +1284,7 @@ mod tests {
 
     #[test]
     fn test_env_override_anonymous_read() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
         config.apply_env_overrides().unwrap();
@@ -1330,6 +1336,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_anon_pull() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_DOCKER_ANON_PULL", "true");
         config.apply_env_overrides().unwrap();
@@ -1372,6 +1379,7 @@ mod tests {
 
     #[test]
     fn test_env_override_server() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_HOST", "0.0.0.0");
         std::env::set_var("NORA_PORT", "8080");
@@ -1482,6 +1490,7 @@ mod tests {
 
     #[test]
     fn test_env_override_auth() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ENABLED", "true");
         std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
@@ -1497,6 +1506,7 @@ mod tests {
 
     #[test]
     fn test_env_override_maven_proxies() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var(
             "NORA_MAVEN_PROXIES",
@@ -1513,6 +1523,7 @@ mod tests {
 
     #[test]
     fn test_env_override_maven_immutable() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         assert!(config.maven.immutable_releases); // default true
         std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
@@ -1523,6 +1534,7 @@ mod tests {
 
     #[test]
     fn test_env_override_named_maven_repositories() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var(
             "NORA_MAVEN_REPOSITORIES_JSON",
@@ -1588,6 +1600,7 @@ mod tests {
 
     #[test]
     fn test_env_override_npm() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
         std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
@@ -1615,6 +1628,7 @@ mod tests {
 
     #[test]
     fn test_env_override_raw() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_RAW_ENABLED", "false");
         std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
@@ -1630,6 +1644,7 @@ mod tests {
 
     #[test]
     fn test_env_override_rate_limit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
         std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
@@ -2133,6 +2148,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_proxies_and_backward_compat() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // Test new NORA_DOCKER_PROXIES name
         std::env::remove_var("NORA_DOCKER_UPSTREAMS");
         std::env::set_var(
@@ -2167,6 +2183,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
         config.apply_env_overrides().unwrap();
@@ -2179,6 +2196,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy_auth() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
         config.apply_env_overrides().unwrap();
