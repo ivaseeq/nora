@@ -30,6 +30,22 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 |--------|------|--------|-------------|
 | `nora_cache_requests_total` | counter | registry, result | Cache lookups (`result`: hit / miss) |
 
+### Proxy Cache Cleanup
+
+These low-cardinality metrics are registered when access-aware Maven/npm proxy
+cache cleanup is enabled. They are intentionally not added to the bundled UI or
+Grafana dashboard.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_proxy_cache_cleanup_deleted_total` | counter | registry | Rebuildable proxy-cache payloads deleted after age, idle and identity revalidation |
+| `nora_proxy_cache_cleanup_bytes_freed_total` | counter | registry | Proxy-cache payload bytes deleted |
+| `nora_proxy_cache_cleanup_skipped_total` | counter | reason | Candidates retained for a bounded fail-closed reason |
+| `nora_proxy_cache_cleanup_duration_seconds` | histogram | — | Cleanup pass duration |
+| `nora_proxy_cache_cleanup_last_run_timestamp` | gauge | — | Unix timestamp of the last completed pass |
+| `nora_proxy_cache_touch_queue_depth` | gauge | — | Distinct access markers waiting for background persistence |
+| `nora_proxy_cache_touch_failures_total` | counter | reason | Access-marker persistence failures by bounded error class |
+
 ### Upstream Proxy
 
 | Metric | Type | Labels | Description |

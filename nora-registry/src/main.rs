@@ -40,6 +40,7 @@ mod migrate;
 mod mirror;
 mod npm_layout;
 mod openapi;
+mod proxy_cache_cleanup;
 mod proxy_coalesce;
 mod rate_limit;
 mod registry;
@@ -212,12 +213,21 @@ enum CurationCommand {
 /// holding a `publish_lock` (handlers never touch `cleanup_lock`).
 pub type PublishLocks = Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
+const PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD: usize = 16_384;
+
 /// Get or create a per-key publish lock for TOCTOU protection.
 ///
 /// Used by both `AppState::publish_lock()` and GC metadata cleanup to ensure
 /// all metadata writes to the same key are serialized.
 pub fn acquire_publish_lock(locks: &PublishLocks, key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = locks.lock();
+    if map.len() >= PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD && !map.contains_key(key) {
+        // A background scan can touch many distinct keys before the periodic
+        // maintenance pass runs. Remove only map-owned idle entries; a lock
+        // held or awaited elsewhere has an additional strong reference and is
+        // never evicted, preserving per-key serialization.
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -266,6 +276,8 @@ pub struct AppState {
     /// Single-flight coalescer for proxy cache misses. In-memory and
     /// rebuildable; immutable cached bytes remain authoritative in storage.
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
+    /// Durable, bounded access tracking for configured Maven/npm proxy caches.
+    pub(crate) proxy_cache_access: Option<proxy_cache_cleanup::ProxyCacheAccess>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
@@ -296,6 +308,13 @@ impl AppState {
         acquire_publish_lock(&self.publish_locks, key)
     }
 
+    /// Queue a cache access while the caller holds `publish_lock(key)`.
+    pub async fn record_proxy_cache_access_locked(&self, key: &str) {
+        if let Some(access) = &self.proxy_cache_access {
+            access.record_locked(key).await;
+        }
+    }
+
     /// Background-cache proxy data and invalidate the registry index.
     ///
     /// Use for ALL proxy caching instead of manual `tokio::spawn` + `storage.put`.
@@ -304,8 +323,11 @@ impl AppState {
     pub fn spawn_cache(&self, registry: &'static str, key: String, data: Bytes) {
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
+        let publish_locks = self.publish_locks.clone();
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
+                let lock = acquire_publish_lock(&publish_locks, &key);
+                let _guard = lock.lock().await;
                 if storage.put(&key, &data).await.is_ok() {
                     repo_index.invalidate(registry);
                 }
@@ -323,8 +345,11 @@ impl AppState {
     pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
+        let publish_locks = self.publish_locks.clone();
         tokio::spawn(
             std::panic::AssertUnwindSafe(async move {
+                let lock = acquire_publish_lock(&publish_locks, &key);
+                let _guard = lock.lock().await;
                 cache_immutable(&storage, &repo_index, registry, &key, &data).await;
             })
             .catch_unwind()
@@ -397,6 +422,28 @@ mod immutable_cache_tests {
             stored.as_ref() == b"first candidate" || stored.as_ref() == b"second candidate",
             "stored bytes must equal one contender and must never be overwritten"
         );
+    }
+}
+
+#[cfg(test)]
+mod publish_lock_tests {
+    use super::{acquire_publish_lock, PublishLocks, PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn opportunistic_prune_removes_only_idle_lock_entries() {
+        let locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        for index in 0..PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD {
+            drop(acquire_publish_lock(&locks, &format!("idle-{index}")));
+        }
+        let active = acquire_publish_lock(&locks, "idle-0");
+        let inserted = acquire_publish_lock(&locks, "new-key");
+
+        let map = locks.lock();
+        assert_eq!(map.len(), 2);
+        assert!(Arc::ptr_eq(map.get("idle-0").unwrap(), &active));
+        assert!(Arc::ptr_eq(map.get("new-key").unwrap(), &inserted));
     }
 }
 
@@ -1676,6 +1723,23 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let proxy_cache_access = if config.proxy_cache_cleanup.enabled {
+        Some(
+            proxy_cache_cleanup::ProxyCacheAccess::start_session(
+                storage.clone(),
+                publish_locks.clone(),
+            )
+            .await
+            .expect("Failed to start durable proxy-cache access session"),
+        )
+    } else {
+        proxy_cache_cleanup::ProxyCacheAccess::mark_tracking_disabled(&storage)
+            .await
+            .expect("Failed to invalidate disabled proxy-cache access tracking state");
+        None
+    };
+
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -1692,7 +1756,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         http_client,
         no_redirect_http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
-        publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        publish_locks,
         maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         maven_revalidation_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
@@ -1700,6 +1764,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         oidc: oidc_validator.map(Arc::new),
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
+        proxy_cache_access,
         digest_store,
         signer,
         leak_finders,
@@ -1710,7 +1775,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
     state.circuit_breaker.init_gauges(&registry_names);
 
-    // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
+    // Shared lock: GC, retention and proxy-cache cleanup must not run concurrently.
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -1768,6 +1833,26 @@ async fn run_server(mut config: Config, storage: Storage) {
             rules = state.config.retention.rules.len(),
             dry_run = state.config.retention.dry_run,
             "Retention scheduler started"
+        );
+    }
+
+    if let Some(access) = state.proxy_cache_access.clone() {
+        scheduler_handles.push(access.spawn_worker(cancel_token.clone()));
+        scheduler_handles.push(proxy_cache_cleanup::spawn_proxy_cache_cleanup_scheduler(
+            state.storage.clone(),
+            state.publish_locks.clone(),
+            state.repo_index.clone(),
+            state.config.clone(),
+            access,
+            cleanup_lock.clone(),
+            cancel_token.clone(),
+        ));
+        info!(
+            interval_secs = state.config.proxy_cache_cleanup.interval_secs,
+            min_cache_age_secs = state.config.proxy_cache_cleanup.min_cache_age_secs,
+            min_idle_secs = state.config.proxy_cache_cleanup.min_idle_secs,
+            dry_run = state.config.proxy_cache_cleanup.dry_run,
+            "Proxy-cache cleanup scheduler started"
         );
     }
 
@@ -1971,11 +2056,19 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Signal background schedulers to stop and wait for them (#306)
     cancel_token.cancel();
+    let mut schedulers_stopped_cleanly = true;
     if !scheduler_handles.is_empty() {
         info!("Waiting for background schedulers to finish (10s timeout)...");
-        if !stop_background_schedulers(scheduler_handles, std::time::Duration::from_secs(10)).await
-        {
+        schedulers_stopped_cleanly =
+            stop_background_schedulers(scheduler_handles, std::time::Duration::from_secs(10)).await;
+        if !schedulers_stopped_cleanly {
             warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
+        }
+    }
+
+    if schedulers_stopped_cleanly {
+        if let Some(access) = &state.proxy_cache_access {
+            access.close_clean_session().await;
         }
     }
 

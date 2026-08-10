@@ -699,6 +699,17 @@ impl RepoIndex {
         self.rebuild_one(registry, storage).await.succeeded()
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_objects_for_test(
+        &self,
+        registry: RegistryType,
+        objects: Vec<(String, FileMeta)>,
+    ) {
+        let index = self.indexes.get(&registry).expect("known registry");
+        let generation = index.requested_generation.load(Ordering::Acquire);
+        index.set(BuiltIndex::with_objects(Vec::new(), objects), generation);
+    }
+
     /// Get counts for stats (no rebuild, just current state)
     pub fn counts(&self) -> HashMap<RegistryType, usize> {
         self.indexes

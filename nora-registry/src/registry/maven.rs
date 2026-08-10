@@ -152,6 +152,10 @@ impl DirectRepository {
     fn is_proxy(&self) -> bool {
         !self.proxies.is_empty()
     }
+
+    fn tracks_proxy_cache(&self) -> bool {
+        self.name.is_some() && self.is_proxy()
+    }
 }
 
 // ============================================================================
@@ -436,6 +440,27 @@ fn spawn_proxy_cache(state: &AppState, path: &str, key: String, data: Bytes) {
     }
 }
 
+async fn record_still_cached_maven_access(state: &AppState, key: &str, expected: &[u8]) -> bool {
+    let lock = state.publish_lock(key);
+    let _guard = lock.lock().await;
+    match state.storage.get(key).await {
+        Ok(current) if current.as_ref() == expected => {
+            state.record_proxy_cache_access_locked(key).await;
+            true
+        }
+        Ok(_) | Err(StorageError::NotFound) => false,
+        Err(_) => {
+            tracing::warn!(
+                key,
+                backend = state.storage.backend_name(),
+                error_class = "cache_recheck_failed",
+                "Maven stale cache access could not be revalidated"
+            );
+            false
+        }
+    }
+}
+
 /// True when a URL points at Maven Central (one of its canonical hosts) — the only
 /// Maven upstream with a per-artifact date source (its search API). A private mirror
 /// (Nexus/Artifactory) returns false, so its coordinates are never sent to the public
@@ -562,12 +587,18 @@ async fn download_direct(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let lock = state.publish_lock(&mutation_lock_key(&repository, document_path));
+        let mutation_key = mutation_lock_key(&repository, document_path);
+        let lock = state.publish_lock(&mutation_key);
         let _guard = lock.lock().await;
         let document_key = repository.storage_key(document_path);
+        let cache_lock = (mutation_key != document_key).then(|| state.publish_lock(&document_key));
+        let _cache_guard = match cache_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let latest = match state.storage.get(&document_key).await {
-            Ok(latest) => latest,
-            Err(StorageError::NotFound) if !is_mutable_maven_path(document_path) => prelock_base,
+            Ok(latest) => Some(latest),
+            Err(StorageError::NotFound) if !is_mutable_maven_path(document_path) => None,
             Err(StorageError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
                 tracing::error!(
@@ -578,12 +609,18 @@ async fn download_direct(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        let Some(checksum) = checksum_hex(suffix, &latest) else {
+        let checksum_source = latest.as_ref().unwrap_or(&prelock_base);
+        let Some(checksum) = checksum_hex(suffix, checksum_source) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
         let key = repository.storage_key(&path);
-        if let Err(error) = state.storage.put(&key, checksum.as_bytes()).await {
-            tracing::warn!(%error, %key, "Failed to refresh derived Maven checksum");
+        // If the immutable base has not landed yet (or cleanup removed it
+        // between the recursive response and this lock), return the derived
+        // checksum but do not leave an orphan sidecar behind.
+        if latest.is_some() {
+            if let Err(error) = state.storage.put(&key, checksum.as_bytes()).await {
+                tracing::warn!(%error, %key, "Failed to refresh derived Maven checksum");
+            }
         }
         return with_content_type(&path, Bytes::from(checksum)).into_response();
     }
@@ -653,7 +690,7 @@ async fn download_direct(
     // #754: the Central query only happens on a cache MISS. On a cache hit the digest
     // is already recorded (quarantine `record` is idempotent → the date is ignored),
     // so a cheap local stat skips the upstream round-trip — a cache hit never pays it.
-    let cached_meta = match state.storage.stat(&key).await {
+    let mut cached_meta = match state.storage.stat(&key).await {
         Ok(meta) => meta,
         Err(error) => {
             return storage_failure_response("stat", &key, &error);
@@ -734,24 +771,44 @@ async fn download_direct(
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
     {
         if let Some(meta) = cached_meta.as_ref() {
-            if let Some(response) = crate::registry::range::range_response(
-                &state.storage,
-                &[&key],
-                &headers,
-                meta.size,
-                maven_content_type(&path),
-                &[(
-                    header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable".to_string(),
-                )],
-            )
-            .await
-            {
-                if response.status() == StatusCode::PARTIAL_CONTENT {
-                    state.metrics.record_download("maven");
-                    state.metrics.record_cache_hit("maven");
+            let range_lock = repository
+                .tracks_proxy_cache()
+                .then(|| state.publish_lock(&key));
+            let _range_guard = match range_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let range_meta = if repository.tracks_proxy_cache() {
+                match state.storage.stat(&key).await {
+                    Ok(meta) => meta,
+                    Err(error) => return storage_failure_response("stat", &key, &error),
                 }
-                return response;
+            } else {
+                Some(meta.clone())
+            };
+            if let Some(range_meta) = range_meta {
+                if let Some(response) = crate::registry::range::range_response(
+                    &state.storage,
+                    &[&key],
+                    &headers,
+                    range_meta.size,
+                    maven_content_type(&path),
+                    &[(
+                        header::CACHE_CONTROL,
+                        "public, max-age=31536000, immutable".to_string(),
+                    )],
+                )
+                .await
+                {
+                    if response.status() == StatusCode::PARTIAL_CONTENT {
+                        if repository.tracks_proxy_cache() {
+                            state.record_proxy_cache_access_locked(&key).await;
+                        }
+                        state.metrics.record_download("maven");
+                        state.metrics.record_cache_hit("maven");
+                    }
+                    return response;
+                }
             }
         }
     }
@@ -760,6 +817,19 @@ async fn download_direct(
     // Only an explicit miss may fall through to another group member or an upstream.
     // Treating corruption/transient storage failure as absence would let a lower-priority
     // proxy silently replace authoritative hosted bytes.
+    let cache_lock = repository
+        .tracks_proxy_cache()
+        .then(|| state.publish_lock(&key));
+    let cache_guard = match cache_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if repository.tracks_proxy_cache() {
+        cached_meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => return storage_failure_response("stat", &key, &error),
+        };
+    }
     let cached = match state.storage.get(&key).await {
         Ok(data) => Some(data),
         Err(StorageError::NotFound) => None,
@@ -853,6 +923,9 @@ async fn download_direct(
                     return resp;
                 }
             }
+            if repository.tracks_proxy_cache() {
+                state.record_proxy_cache_access_locked(&key).await;
+            }
             let mut response = with_content_type(&path, data.clone()).into_response();
             if !is_mutable_maven_path(&path) {
                 response
@@ -879,6 +952,9 @@ async fn download_direct(
             if let Some(ref data) = cached {
                 state.metrics.record_download("maven");
                 state.metrics.record_cache_hit("maven");
+                if repository.tracks_proxy_cache() {
+                    state.record_proxy_cache_access_locked(&key).await;
+                }
                 return with_content_type(&path, data.clone()).into_response();
             }
             return crate::curation::check_namespace_isolation(
@@ -896,6 +972,9 @@ async fn download_direct(
         if let Some(ref data) = cached {
             state.metrics.record_download("maven");
             state.metrics.record_cache_hit("maven");
+            if repository.tracks_proxy_cache() {
+                state.record_proxy_cache_access_locked(&key).await;
+            }
             return with_content_type(&path, data.clone()).into_response();
         }
         if let Some((ref maven_name, _)) = curation_coords {
@@ -908,6 +987,11 @@ async fn download_direct(
         }
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Upstream I/O must not hold a cache-object lock. Any stale fallback below
+    // reacquires the lock and verifies the same bytes still exist before it is
+    // recorded and served.
+    drop(cache_guard);
 
     let metadata_request = if version_metadata_path(&path).is_some() {
         None
@@ -1076,6 +1160,11 @@ async fn download_direct(
     // upstream 404 must not resurrect a removed mutable version or metadata document.
     if unavailable.is_some() {
         if let Some(ref data) = cached {
+            if repository.tracks_proxy_cache()
+                && !record_still_cached_maven_access(&state, &key, data).await
+            {
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
             tracing::warn!(registry = "maven", path = %path, "Maven upstream failed, serving stale cached artifact");
             // Quarantine still applies to a version artifact served from a stale cache:
             // a held SNAPSHOT must not be released just because the upstream went down
@@ -3203,6 +3292,96 @@ fn with_content_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
+
+    #[tokio::test]
+    async fn named_proxy_cache_hits_queue_access_but_hosted_hits_do_not() {
+        let mut ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.maven.proxies.clear();
+            config.maven.repositories = vec![
+                MavenRepository::Hosted {
+                    name: "hosted".to_string(),
+                    version_policy: MavenVersionPolicy::Mixed,
+                    write_policy: MavenWritePolicy::AllowOnce,
+                },
+                MavenRepository::Proxy {
+                    name: "central".to_string(),
+                    url: "http://127.0.0.1:1".to_string(),
+                    auth: None,
+                    version_policy: MavenVersionPolicy::Mixed,
+                    metadata_ttl: Some(300),
+                    negative_ttl: 0,
+                },
+            ];
+            config.maven.default_repository = Some("central".to_string());
+        });
+        let access = crate::proxy_cache_cleanup::ProxyCacheAccess::start_session(
+            ctx.state.storage.clone(),
+            ctx.state.publish_locks.clone(),
+        )
+        .await
+        .unwrap();
+        ctx.state.proxy_cache_access = Some(access.clone());
+        let path = "com/acme/demo/1.0/demo-1.0.jar";
+        let proxy_key = repository_storage_key("central", path);
+        let hosted_key = repository_storage_key("hosted", path);
+        ctx.state.storage.put(&proxy_key, b"proxy").await.unwrap();
+        ctx.state.storage.put(&hosted_key, b"hosted").await.unwrap();
+
+        let proxy = download_configured(
+            ctx.state.clone(),
+            HeaderMap::new(),
+            "central",
+            path.to_string(),
+        )
+        .await;
+        assert_eq!(proxy.status(), StatusCode::OK);
+        assert!(access.has_pending(&proxy_key).await);
+
+        let hosted = download_configured(
+            ctx.state.clone(),
+            HeaderMap::new(),
+            "hosted",
+            path.to_string(),
+        )
+        .await;
+        assert_eq!(hosted.status(), StatusCode::OK);
+        assert!(!access.has_pending(&hosted_key).await);
+    }
+
+    #[tokio::test]
+    async fn named_proxy_range_open_queues_access_under_payload_lock() {
+        let mut ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.maven.proxies.clear();
+            config.maven.repositories = vec![MavenRepository::Proxy {
+                name: "central".to_string(),
+                url: "http://127.0.0.1:1".to_string(),
+                auth: None,
+                version_policy: MavenVersionPolicy::Mixed,
+                metadata_ttl: Some(300),
+                negative_ttl: 0,
+            }];
+            config.maven.default_repository = Some("central".to_string());
+        });
+        let access = crate::proxy_cache_cleanup::ProxyCacheAccess::start_session(
+            ctx.state.storage.clone(),
+            ctx.state.publish_locks.clone(),
+        )
+        .await
+        .unwrap();
+        ctx.state.proxy_cache_access = Some(access.clone());
+        let path = "com/acme/demo/1.0/demo-1.0.jar";
+        let key = repository_storage_key("central", path);
+        ctx.state.storage.put(&key, b"0123456789").await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+
+        let response =
+            download_configured(ctx.state.clone(), headers, "central", path.to_string()).await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(access.has_pending(&key).await);
+    }
 
     #[test]
     fn test_url_is_maven_central() {

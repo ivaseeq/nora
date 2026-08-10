@@ -12,6 +12,7 @@ mod auth;
 mod circuit_breaker;
 mod curation;
 mod gc;
+mod proxy_cache_cleanup;
 mod rate_limit;
 mod registries;
 pub mod registry;
@@ -34,6 +35,7 @@ pub use self::curation::{
     CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
 };
 pub use self::gc::GcConfig;
+pub use self::proxy_cache_cleanup::ProxyCacheCleanupConfig;
 pub use self::rate_limit::RateLimitConfig;
 pub use self::registries::{EnableSpec, RegistriesSection};
 pub use self::retention::{RetentionConfig, RetentionRule};
@@ -166,6 +168,8 @@ pub struct Config {
     pub gc: GcConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub proxy_cache_cleanup: ProxyCacheCleanupConfig,
     #[serde(default)]
     pub curation: CurationConfig,
     #[serde(default)]
@@ -846,6 +850,32 @@ impl Config {
                 "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
             );
         }
+        if self.proxy_cache_cleanup.enabled {
+            if self.proxy_cache_cleanup.interval_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.interval_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.min_cache_age_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.min_cache_age_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.min_idle_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.min_idle_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.dry_run {
+                warnings.push(
+                    "proxy_cache_cleanup.enabled=true with dry_run=true — cache cleanup will report but never delete payloads; hidden access tracking remains active"
+                        .to_string(),
+                );
+            }
+        }
 
         errors.extend(self.maven.validate_repositories());
         errors.extend(self.npm.validate_repositories());
@@ -1125,6 +1155,7 @@ impl Config {
         self.signing.apply_env_overrides();
         self.gc.apply_env_overrides();
         self.retention.apply_env_overrides();
+        self.proxy_cache_cleanup.apply_env_overrides()?;
 
         // Secrets — SecretsConfig lives in crate::secrets, no apply_env_overrides method
         if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
@@ -2062,6 +2093,32 @@ mod tests {
         let (warnings, errors) = config.validate();
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_proxy_cache_cleanup_requires_nonzero_policy_bounds() {
+        let mut config = Config::default();
+        config.proxy_cache_cleanup.enabled = true;
+        config.proxy_cache_cleanup.interval_secs = 0;
+        config.proxy_cache_cleanup.min_cache_age_secs = 0;
+        config.proxy_cache_cleanup.min_idle_secs = 0;
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 3);
+        assert!(errors
+            .iter()
+            .all(|error| error.contains("proxy_cache_cleanup")));
+    }
+
+    #[test]
+    fn test_validate_proxy_cache_cleanup_dry_run_warns() {
+        let mut config = Config::default();
+        config.proxy_cache_cleanup.enabled = true;
+        config.proxy_cache_cleanup.dry_run = true;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("proxy_cache_cleanup.enabled=true")));
     }
 
     #[test]

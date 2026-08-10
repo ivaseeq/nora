@@ -1669,6 +1669,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 ctx.state.config.circuit_breaker.clone(),
             )),
             proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
+            proxy_cache_access: None,
             digest_store: ctx.state.digest_store.clone(),
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),

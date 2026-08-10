@@ -59,6 +59,7 @@ pub struct FaultInjectBackend {
     write_barriers: HashMap<String, Arc<tokio::sync::Barrier>>,
     delete_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     get_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
+    reader_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     list_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     write_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     successful_writes: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -83,6 +84,7 @@ impl FaultInjectBackend {
             write_barriers: HashMap::new(),
             delete_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             get_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            reader_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             list_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             write_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             successful_writes: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -169,6 +171,10 @@ impl FaultInjectBackend {
 
     pub fn get_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
         Arc::clone(&self.get_attempts)
+    }
+
+    pub fn reader_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
+        Arc::clone(&self.reader_attempts)
     }
 
     pub fn list_attempts(&self) -> Arc<parking_lot::Mutex<Vec<String>>> {
@@ -315,6 +321,7 @@ impl StorageBackend for FaultInjectBackend {
         &self,
         key: &str,
     ) -> crate::storage::Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        self.reader_attempts.lock().push(key.to_string());
         self.inner.get_reader(key).await
     }
 }
@@ -496,6 +503,7 @@ fn build_context(
         secrets: SecretsConfig::default(),
         gc: crate::config::GcConfig::default(),
         retention: crate::config::RetentionConfig::default(),
+        proxy_cache_cleanup: crate::config::ProxyCacheCleanupConfig::default(),
         curation: CurationConfig::default(),
         circuit_breaker: crate::config::CircuitBreakerConfig::default(),
         tls: crate::config::TlsConfig::default(),
@@ -602,6 +610,7 @@ fn build_context(
             cb_config,
         )),
         proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
+        proxy_cache_access: None,
         digest_store: Arc::new(crate::digest_quarantine::DigestStore::empty(&storage_path)),
         signer,
         leak_finders,

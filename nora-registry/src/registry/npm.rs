@@ -2280,6 +2280,7 @@ async fn store_modified_proxy_packument(
         Ok(()) | Err(StorageError::NotFound) => {}
         Err(_) => return Err(ReadError::StorageUnavailable),
     }
+    state.record_proxy_cache_access_locked(key).await;
     Ok(PackumentRead::fresh(value))
 }
 
@@ -2304,6 +2305,8 @@ async fn proxy_packument_raw(
         return Err(ReadError::NotFound);
     }
 
+    let cache_lock = state.publish_lock(&key);
+    let initial_guard = cache_lock.lock().await;
     let cached = optional_storage_get(state, &key).await?;
     let fresh = cached.is_some()
         && state
@@ -2316,14 +2319,16 @@ async fn proxy_packument_raw(
         if let Some(value) =
             parse_consistent_proxy_packument(cached.as_ref().expect("cached when fresh"), package)
         {
+            state.record_proxy_cache_access_locked(&key).await;
             return Ok(PackumentRead::fresh(value));
         }
     }
+    drop(initial_guard);
 
     // A singleton Nora still receives concurrent cold misses. Serialize the
     // refresh for this package so a slower, older upstream response cannot
     // overwrite a newer one.
-    let refresh_lock = state.publish_lock(&format!("npm-proxy:{}:{package}", repository.name));
+    let refresh_lock = state.publish_lock(&key);
     let _refresh_guard = refresh_lock.lock().await;
     let cached = optional_storage_get(state, &key).await?;
     let fresh = cached.is_some()
@@ -2337,6 +2342,7 @@ async fn proxy_packument_raw(
         if let Some(value) =
             parse_consistent_proxy_packument(cached.as_ref().expect("cached when fresh"), package)
         {
+            state.record_proxy_cache_access_locked(&key).await;
             return Ok(PackumentRead::fresh(value));
         }
     }
@@ -2368,6 +2374,7 @@ async fn proxy_packument_raw(
                         .as_deref()
                         .and_then(|data| parse_consistent_proxy_packument(data, package))
                     {
+                        state.record_proxy_cache_access_locked(&key).await;
                         return Ok(PackumentRead { value, stale: true });
                     }
                 }
@@ -2386,6 +2393,7 @@ async fn proxy_packument_raw(
                     .put(&key, data)
                     .await
                     .map_err(|_| ReadError::StorageUnavailable)?;
+                state.record_proxy_cache_access_locked(&key).await;
                 return Ok(PackumentRead::fresh(value));
             }
 
@@ -2457,6 +2465,7 @@ async fn proxy_packument_raw(
                     .as_deref()
                     .and_then(|data| parse_consistent_proxy_packument(data, package))
                 {
+                    state.record_proxy_cache_access_locked(&key).await;
                     return Ok(PackumentRead { value, stale: true });
                 }
             }
@@ -2473,6 +2482,7 @@ async fn proxy_packument_raw(
                     .as_deref()
                     .and_then(|data| parse_consistent_proxy_packument(data, package))
                 {
+                    state.record_proxy_cache_access_locked(&key).await;
                     return Ok(PackumentRead { value, stale: true });
                 }
             }
@@ -2940,9 +2950,12 @@ async fn serve_proxy_tarball(
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let key = proxy_tarball_key(&repository.name, package, filename);
+    let cache_lock = state.publish_lock(&key);
+    let range_guard = cache_lock.lock().await;
     match tarball_range_response(state, &key, headers).await {
         Ok(Some(response)) => {
             if response.status() == StatusCode::PARTIAL_CONTENT {
+                state.record_proxy_cache_access_locked(&key).await;
                 state.metrics.record_cache_hit("npm");
                 state.activity.push(ActivityEntry::new(
                     ActionType::CacheHit,
@@ -2965,12 +2978,15 @@ async fn serve_proxy_tarball(
             return crate::registry::storage_error_response("npm", "stat", &key, &error);
         }
     }
+    drop(range_guard);
+    let cache_guard = cache_lock.lock().await;
     let cached = match optional_storage_get(state, &key).await {
         Ok(cached) => cached,
         Err(error) => return read_error_response(error),
     };
     if let Some(data) = &cached {
         if dist_digest_matches(data, version_data) {
+            state.record_proxy_cache_access_locked(&key).await;
             state.metrics.record_cache_hit("npm");
             state.activity.push(ActivityEntry::new(
                 ActionType::CacheHit,
@@ -2995,6 +3011,7 @@ async fn serve_proxy_tarball(
             );
         }
     }
+    drop(cache_guard);
 
     // Packument refresh has its own package lock, but the immutable tarball is
     // a separate cold miss. Preserve the existing single-flight behavior so a
@@ -3016,10 +3033,12 @@ async fn serve_proxy_tarball(
         {
             Ok(data) if dist_digest_matches(&data, version_data) => {
                 let bytes = Bytes::from(data);
+                let _cache_guard = cache_lock.lock().await;
                 if let Err(error) = put_immutable_storage(&state.storage, &key, &bytes).await {
                     tracing::warn!(%key, %error, "npm proxy tarball immutable cache create failed");
                     return None;
                 }
+                state.record_proxy_cache_access_locked(&key).await;
                 state.repo_index.invalidate("npm");
                 state.metrics.record_cache_miss("npm");
                 state.activity.push(ActivityEntry::new(
@@ -7025,6 +7044,103 @@ async fn alias_post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_packument_and_tarball_cache_hits_queue_access() {
+        let mut ctx = crate::test_helpers::create_test_context_with_config(named_config);
+        let access = crate::proxy_cache_cleanup::ProxyCacheAccess::start_session(
+            ctx.state.storage.clone(),
+            ctx.state.publish_locks.clone(),
+        )
+        .await
+        .unwrap();
+        ctx.state.proxy_cache_access = Some(access.clone());
+        let tarball = npm_tarball("pkg", "1.0.0");
+        let tarball_url = "http://127.0.0.1:1/pkg/-/pkg-1.0.0.tgz";
+        let packument = serde_json::json!({
+            "name": "pkg",
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "shasum": hex::encode(sha1::Sha1::digest(&tarball)),
+                        "tarball": tarball_url
+                    }
+                }
+            },
+            "dist-tags": {"latest": "1.0.0"}
+        });
+        let packument_key = proxy_packument_key("npm-registry", "pkg");
+        let tarball_key = proxy_tarball_key("npm-registry", "pkg", "pkg-1.0.0.tgz");
+        ctx.state
+            .storage
+            .put(&packument_key, &serde_json::to_vec(&packument).unwrap())
+            .await
+            .unwrap();
+        ctx.state.storage.put(&tarball_key, &tarball).await.unwrap();
+        let proxy = test_proxy(&ctx.state, "npm-registry");
+
+        let packument_read = proxy_packument_raw(&ctx.state, &proxy, "pkg").await;
+        assert!(packument_read.is_ok());
+        let response = serve_proxy_tarball(
+            &ctx.state,
+            &proxy,
+            "pkg",
+            "pkg-1.0.0.tgz",
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(access.has_pending(&packument_key).await);
+        assert!(access.has_pending(&tarball_key).await);
+    }
+
+    #[tokio::test]
+    async fn proxy_tarball_range_open_queues_access() {
+        let mut ctx = crate::test_helpers::create_test_context_with_config(named_config);
+        let access = crate::proxy_cache_cleanup::ProxyCacheAccess::start_session(
+            ctx.state.storage.clone(),
+            ctx.state.publish_locks.clone(),
+        )
+        .await
+        .unwrap();
+        ctx.state.proxy_cache_access = Some(access.clone());
+        let tarball = npm_tarball("pkg", "1.0.0");
+        let packument = serde_json::json!({
+            "name": "pkg",
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "dist": {
+                        "shasum": hex::encode(sha1::Sha1::digest(&tarball)),
+                        "tarball": "http://127.0.0.1:1/pkg/-/pkg-1.0.0.tgz"
+                    }
+                }
+            },
+            "dist-tags": {"latest": "1.0.0"}
+        });
+        let packument_key = proxy_packument_key("npm-registry", "pkg");
+        let tarball_key = proxy_tarball_key("npm-registry", "pkg", "pkg-1.0.0.tgz");
+        ctx.state
+            .storage
+            .put(&packument_key, &serde_json::to_vec(&packument).unwrap())
+            .await
+            .unwrap();
+        ctx.state.storage.put(&tarball_key, &tarball).await.unwrap();
+        let proxy = test_proxy(&ctx.state, "npm-registry");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-7"));
+
+        let response =
+            serve_proxy_tarball(&ctx.state, &proxy, "pkg", "pkg-1.0.0.tgz", None, &headers).await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(access.has_pending(&tarball_key).await);
+    }
 
     #[tokio::test]
     async fn concurrent_proxy_tarball_creates_reject_conflicting_bytes() {
