@@ -21,7 +21,7 @@ use crate::npm_layout::{
 use crate::registry::{
     circuit_open_response, method_not_allowed, proxy_fetch_conditional_with_validated_redirects,
     proxy_fetch_with_validated_redirects, proxy_fetch_with_validated_redirects_bounded,
-    proxy_forward_post, read_validators, write_validators, ProxyError, Revalidation, Validators,
+    proxy_forward_post, validators_key, ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -42,6 +42,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use crate::registry::write_validators;
+
 const NPM_AUDIT_BODY_CAP: usize = 8 * 1024 * 1024;
 const NPM_SEARCH_BODY_CAP: usize = 8 * 1024 * 1024;
 const NPM_SEARCH_SCAN_RESULT_CAP: usize = 10_000;
@@ -52,6 +55,8 @@ const TAR_SCAN_CAP: u64 = 64 * 1024 * 1024;
 const MAX_NPM_PROXY_REDIRECTS: usize = 3;
 const NPM_IMPORT_MUTATION_CONCURRENCY: usize = 32;
 const NPM_IMPORT_PACKUMENT_HEADER: &str = "x-nora-import-packument-sha256";
+const NPM_PROXY_VALIDATOR_SCHEMA_V1: u8 = 1;
+const NPM_PROXY_VALIDATOR_SCOPE_DOMAIN: &[u8] = b"nora:npm:proxy-validator-scope:v1\0";
 const LEGACY_HOSTED: &str = "npm-private";
 const LEGACY_PROXY: &str = "npm-registry";
 
@@ -1182,7 +1187,7 @@ struct HostedImportReceipt {
     generation: String,
 }
 
-type WrittenPackumentGeneration = HostedPackumentPointer;
+pub(crate) type WrittenPackumentGeneration = HostedPackumentPointer;
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64
@@ -1690,6 +1695,35 @@ fn valid_hosted_packument(bytes: &[u8], package: &str) -> Option<serde_json::Val
     .then_some(value)
 }
 
+pub(crate) fn validate_hosted_packument_generation(
+    bytes: &[u8],
+    package: &str,
+    pointer: &HostedPackumentPointer,
+) -> Option<serde_json::Value> {
+    if !valid_hosted_packument_pointer(pointer)
+        || hex::encode(sha2::Sha256::digest(bytes)) != pointer.full_sha256
+    {
+        return None;
+    }
+    let value = valid_hosted_packument(bytes, package)?;
+    let versions = value.get("versions")?.as_object()?;
+    if versions.is_empty() {
+        return None;
+    }
+    let dist_tags = value.get("dist-tags")?.as_object()?;
+    if !dist_tags.values().all(|target| {
+        target
+            .as_str()
+            .is_some_and(|version| versions.contains_key(version))
+    }) {
+        return None;
+    }
+    let install_v1 = install_v1_packument(&value)
+        .ok()
+        .and_then(|value| serde_json::to_vec(&value).ok())?;
+    (hex::encode(sha2::Sha256::digest(&install_v1)) == pointer.install_v1_sha256).then_some(value)
+}
+
 fn install_v1_packument(packument: &serde_json::Value) -> Result<serde_json::Value, ReadError> {
     let object = packument.as_object().ok_or(ReadError::Corrupt)?;
     let mut abbreviated = serde_json::Map::new();
@@ -1768,7 +1802,7 @@ async fn put_immutable_storage(
     }
 }
 
-async fn write_hosted_packument_generation_documents(
+pub(crate) async fn write_hosted_packument_generation_documents(
     storage: &Storage,
     repository: &str,
     package: &str,
@@ -2051,6 +2085,204 @@ fn negative_fresh(modified: u64, ttl: i64) -> bool {
     now.saturating_sub(modified) < ttl as u64
 }
 
+fn parse_consistent_proxy_packument(data: &[u8], package: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_slice::<serde_json::Value>(data).ok()?;
+    let object = value.as_object()?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some(package) {
+        return None;
+    }
+    let versions = object
+        .get("versions")
+        .and_then(serde_json::Value::as_object)?;
+    let dist_tags = object
+        .get("dist-tags")
+        .and_then(serde_json::Value::as_object)?;
+    if let Some(latest) = dist_tags.get("latest") {
+        let latest = latest.as_str()?;
+        if !versions.contains_key(latest) {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct NpmProxyValidatorEnvelope {
+    schema: u8,
+    body_fetched_at_unix: u64,
+    scope_sha256: String,
+    body_sha256: String,
+    validators: Validators,
+}
+
+fn npm_proxy_validator_scope_sha256(
+    repository: &ProxyRepository,
+    package: &str,
+    key: &str,
+) -> Option<String> {
+    let upstream = reqwest::Url::parse(&repository.url).ok()?;
+    if !upstream.username().is_empty()
+        || upstream.password().is_some()
+        || upstream.query().is_some()
+        || upstream.fragment().is_some()
+    {
+        return None;
+    }
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(NPM_PROXY_VALIDATOR_SCOPE_DOMAIN);
+    for component in [
+        repository.name.as_bytes(),
+        upstream.as_str().as_bytes(),
+        package.as_bytes(),
+        key.as_bytes(),
+    ] {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component);
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn npm_proxy_body_sha256(body: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(body))
+}
+
+async fn read_npm_proxy_validator_envelope(
+    storage: &Storage,
+    key: &str,
+) -> Option<NpmProxyValidatorEnvelope> {
+    let data = storage.get(&validators_key(key)).await.ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+async fn bounded_proxy_validators(
+    state: &AppState,
+    repository: &ProxyRepository,
+    package: &str,
+    key: &str,
+    cached_body: Option<&[u8]>,
+) -> Validators {
+    if !state.config.npm.revalidate || state.config.npm.validator_max_age_secs == 0 {
+        return Validators::default();
+    }
+    let Some(cached_body) = cached_body else {
+        return Validators::default();
+    };
+    let Some(envelope) = read_npm_proxy_validator_envelope(&state.storage, key).await else {
+        return Validators::default();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expected_scope = npm_proxy_validator_scope_sha256(repository, package, key);
+    let valid = envelope.schema == NPM_PROXY_VALIDATOR_SCHEMA_V1
+        && envelope.validators.is_some()
+        && envelope.body_fetched_at_unix <= now
+        && now - envelope.body_fetched_at_unix < state.config.npm.validator_max_age_secs
+        && Some(envelope.scope_sha256.as_str()) == expected_scope.as_deref()
+        && envelope.body_sha256 == npm_proxy_body_sha256(cached_body);
+    if valid {
+        envelope.validators
+    } else {
+        Validators::default()
+    }
+}
+
+async fn write_npm_proxy_validators(
+    state: &AppState,
+    repository: &ProxyRepository,
+    package: &str,
+    key: &str,
+    body: &[u8],
+    validators: &Validators,
+) {
+    if !validators.is_some() {
+        return;
+    }
+    let Some(scope_sha256) = npm_proxy_validator_scope_sha256(repository, package, key) else {
+        return;
+    };
+    let envelope = NpmProxyValidatorEnvelope {
+        schema: NPM_PROXY_VALIDATOR_SCHEMA_V1,
+        body_fetched_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        scope_sha256,
+        body_sha256: npm_proxy_body_sha256(body),
+        validators: validators.clone(),
+    };
+    if let Ok(data) = serde_json::to_vec(&envelope) {
+        if state
+            .storage
+            .put(&validators_key(key), &data)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                key,
+                backend = state.storage.backend_name(),
+                error_class = "validator_sidecar_write_failed",
+                "failed to write npm validator envelope"
+            );
+        }
+    }
+}
+
+async fn fetch_proxy_packument(
+    state: &AppState,
+    repository: &ProxyRepository,
+    url: &str,
+    validators: &Validators,
+) -> Result<Revalidation, ProxyError> {
+    proxy_fetch_conditional_with_validated_redirects(
+        &state.no_redirect_http_client,
+        url,
+        Duration::from_secs(state.config.npm.proxy_timeout),
+        expose_opt(&repository.auth),
+        validators,
+        &state.circuit_breaker,
+        RegistryType::Npm,
+        MAX_NPM_PROXY_REDIRECTS,
+        |next_url| validated_proxy_url(repository, next_url.as_str()).is_some(),
+    )
+    .await
+}
+
+async fn store_modified_proxy_packument(
+    state: &AppState,
+    repository: &ProxyRepository,
+    key: &str,
+    negative_key: &str,
+    package: &str,
+    body: Vec<u8>,
+    validators: Validators,
+) -> Result<PackumentRead, ReadError> {
+    let value = parse_consistent_proxy_packument(&body, package).ok_or(ReadError::Corrupt)?;
+    // Remove the previous sidecar before replacing the body. If the new
+    // response has no validators (or sidecar persistence fails), the next
+    // stale read must be unconditional instead of reusing validators for a
+    // different body.
+    match state.storage.delete(&validators_key(key)).await {
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(_) => return Err(ReadError::StorageUnavailable),
+    }
+    state
+        .storage
+        .put(key, &body)
+        .await
+        .map_err(|_| ReadError::StorageUnavailable)?;
+    write_npm_proxy_validators(state, repository, package, key, &body, &validators).await;
+    state.repo_index.invalidate("npm");
+    match state.storage.delete(negative_key).await {
+        Ok(()) | Err(StorageError::NotFound) => {}
+        Err(_) => return Err(ReadError::StorageUnavailable),
+    }
+    Ok(PackumentRead::fresh(value))
+}
+
 async fn proxy_packument_raw(
     state: &AppState,
     repository: &ProxyRepository,
@@ -2081,9 +2313,11 @@ async fn proxy_packument_raw(
             .map_err(|_| ReadError::StorageUnavailable)?
             .is_some_and(|meta| negative_fresh(meta.modified, repository.metadata_ttl));
     if fresh {
-        return serde_json::from_slice(cached.as_ref().expect("cached when fresh"))
-            .map(PackumentRead::fresh)
-            .map_err(|_| ReadError::Corrupt);
+        if let Some(value) =
+            parse_consistent_proxy_packument(cached.as_ref().expect("cached when fresh"), package)
+        {
+            return Ok(PackumentRead::fresh(value));
+        }
     }
 
     // A singleton Nora still receives concurrent cold misses. Serialize the
@@ -2100,9 +2334,11 @@ async fn proxy_packument_raw(
             .map_err(|_| ReadError::StorageUnavailable)?
             .is_some_and(|meta| negative_fresh(meta.modified, repository.metadata_ttl));
     if fresh {
-        return serde_json::from_slice(cached.as_ref().expect("cached when fresh"))
-            .map(PackumentRead::fresh)
-            .map_err(|_| ReadError::Corrupt);
+        if let Some(value) =
+            parse_consistent_proxy_packument(cached.as_ref().expect("cached when fresh"), package)
+        {
+            return Ok(PackumentRead::fresh(value));
+        }
     }
 
     let url = format!(
@@ -2110,69 +2346,94 @@ async fn proxy_packument_raw(
         repository.url.trim_end_matches('/'),
         upstream_package_path(package)
     );
-    let validators = if state.config.npm.revalidate {
-        read_validators(&state.storage, &key)
-            .await
-            .unwrap_or_default()
-    } else {
-        Validators::default()
-    };
+    let validators =
+        bounded_proxy_validators(state, repository, package, &key, cached.as_deref()).await;
     let had_validators = validators.is_some();
-    let fetched = proxy_fetch_conditional_with_validated_redirects(
-        &state.no_redirect_http_client,
-        &url,
-        Duration::from_secs(state.config.npm.proxy_timeout),
-        expose_opt(&repository.auth),
-        &validators,
-        &state.circuit_breaker,
-        RegistryType::Npm,
-        MAX_NPM_PROXY_REDIRECTS,
-        |next_url| validated_proxy_url(repository, next_url.as_str()).is_some(),
-    )
-    .await;
+    let fetched = fetch_proxy_packument(state, repository, &url, &validators).await;
 
     match fetched {
         Ok(Revalidation::NotModified) => {
-            let Some(data) = cached else {
-                if had_validators {
-                    crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
-                        .with_label_values(&["npm"])
-                        .inc();
-                }
-                return Err(ReadError::StorageUnavailable);
-            };
             crate::metrics::PROXY_UPSTREAM_304_TOTAL
                 .with_label_values(&["npm"])
                 .inc();
-            crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+            if !had_validators {
+                // A 304 only has meaning for a conditional request. A broken
+                // upstream/CDN must not turn an expired or absent validator
+                // into another fresh-cache cycle.
+                crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                    .with_label_values(&["npm"])
+                    .inc();
+                if state.config.npm.serve_stale {
+                    if let Some(value) = cached
+                        .as_deref()
+                        .and_then(|data| parse_consistent_proxy_packument(data, package))
+                    {
+                        return Ok(PackumentRead { value, stale: true });
+                    }
+                }
+                return Err(ReadError::Unavailable);
+            }
+            if let Some((data, value)) = cached.as_ref().and_then(|data| {
+                parse_consistent_proxy_packument(data, package).map(|value| (data, value))
+            }) {
+                crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
+                    .with_label_values(&["npm"])
+                    .inc_by(data.len() as u64);
+                // Touching the body after 304 is intentional: its mtime is the
+                // freshness marker, while the validator sidecar remains unchanged.
+                state
+                    .storage
+                    .put(&key, data)
+                    .await
+                    .map_err(|_| ReadError::StorageUnavailable)?;
+                return Ok(PackumentRead::fresh(value));
+            }
+
+            // A 304 cannot validate a missing or internally inconsistent
+            // cached body. Retry exactly once without validators so this state
+            // converges instead of being touched and made fresh forever (#867).
+            crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
                 .with_label_values(&["npm"])
-                .inc_by(data.len() as u64);
-            // Touching the body after 304 is intentional: its mtime is the
-            // freshness marker, while the validator sidecar remains unchanged.
-            state
-                .storage
-                .put(&key, &data)
-                .await
-                .map_err(|_| ReadError::StorageUnavailable)?;
-            serde_json::from_slice(&data)
-                .map(PackumentRead::fresh)
-                .map_err(|_| ReadError::Corrupt)
-        }
-        Ok(Revalidation::Modified { body, validators }) => {
-            let value = serde_json::from_slice::<serde_json::Value>(&body)
-                .map_err(|_| ReadError::Corrupt)?;
-            state
-                .storage
-                .put(&key, &body)
-                .await
-                .map_err(|_| ReadError::StorageUnavailable)?;
-            write_validators(&state.storage, &key, &validators).await;
-            state.repo_index.invalidate("npm");
-            match state.storage.delete(&negative_key).await {
+                .inc();
+            match state.storage.delete(&validators_key(&key)).await {
                 Ok(()) | Err(StorageError::NotFound) => {}
                 Err(_) => return Err(ReadError::StorageUnavailable),
             }
-            Ok(PackumentRead::fresh(value))
+            match fetch_proxy_packument(state, repository, &url, &Validators::default()).await {
+                Ok(Revalidation::Modified { body, validators }) => {
+                    store_modified_proxy_packument(
+                        state,
+                        repository,
+                        &key,
+                        &negative_key,
+                        package,
+                        body,
+                        validators,
+                    )
+                    .await
+                }
+                Ok(Revalidation::NotModified) => Err(ReadError::StorageUnavailable),
+                Err(ProxyError::NotFound) => {
+                    if repository.negative_ttl > 0 {
+                        let _ = state.storage.put(&negative_key, b"not-found").await;
+                    }
+                    Err(ReadError::NotFound)
+                }
+                Err(ProxyError::CircuitOpen(name)) => Err(ReadError::CircuitOpen(name)),
+                Err(_) => Err(ReadError::Unavailable),
+            }
+        }
+        Ok(Revalidation::Modified { body, validators }) => {
+            store_modified_proxy_packument(
+                state,
+                repository,
+                &key,
+                &negative_key,
+                package,
+                body,
+                validators,
+            )
+            .await
         }
         Err(ProxyError::NotFound) => {
             if had_validators {
@@ -2192,10 +2453,11 @@ async fn proxy_packument_raw(
                     .inc();
             }
             if state.config.npm.serve_stale {
-                if let Some(data) = cached {
-                    return serde_json::from_slice(&data)
-                        .map(|value| PackumentRead { value, stale: true })
-                        .map_err(|_| ReadError::Corrupt);
+                if let Some(value) = cached
+                    .as_deref()
+                    .and_then(|data| parse_consistent_proxy_packument(data, package))
+                {
+                    return Ok(PackumentRead { value, stale: true });
                 }
             }
             Err(ReadError::CircuitOpen(name))
@@ -2207,10 +2469,11 @@ async fn proxy_packument_raw(
                     .inc();
             }
             if state.config.npm.serve_stale {
-                if let Some(data) = cached {
-                    return serde_json::from_slice(&data)
-                        .map(|value| PackumentRead { value, stale: true })
-                        .map_err(|_| ReadError::Corrupt);
+                if let Some(value) = cached
+                    .as_deref()
+                    .and_then(|data| parse_consistent_proxy_packument(data, package))
+                {
+                    return Ok(PackumentRead { value, stale: true });
                 }
             }
             Err(ReadError::Unavailable)
@@ -3000,7 +3263,7 @@ fn search_query_with_window(query: Option<&str>, from: usize, size: usize) -> St
     url.query().unwrap_or_default().to_string()
 }
 
-fn search_matches(packument: &serde_json::Value, latest: &serde_json::Value, text: &str) -> bool {
+fn search_document_matches(document: &crate::repo_index::NpmSearchDocument, text: &str) -> bool {
     let terms: Vec<String> = text
         .split_whitespace()
         .map(|term| term.to_ascii_lowercase())
@@ -3008,28 +3271,24 @@ fn search_matches(packument: &serde_json::Value, latest: &serde_json::Value, tex
     if terms.is_empty() {
         return true;
     }
-    let mut fields = Vec::new();
-    for field in ["name", "description"] {
-        if let Some(value) = packument
-            .get(field)
-            .or_else(|| latest.get(field))
-            .and_then(|value| value.as_str())
-        {
-            fields.push(value.to_ascii_lowercase());
-        }
+    let mut fields = vec![document.package.to_ascii_lowercase()];
+    if let Some(description) = document
+        .fields
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+    {
+        fields.push(description.to_ascii_lowercase());
     }
-    for source in [packument, latest] {
-        if let Some(keywords) = source.get("keywords") {
-            match keywords {
-                serde_json::Value::Array(values) => fields.extend(
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .map(str::to_ascii_lowercase),
-                ),
-                serde_json::Value::String(value) => fields.push(value.to_ascii_lowercase()),
-                _ => {}
-            }
+    if let Some(keywords) = document.fields.get("keywords") {
+        match keywords {
+            serde_json::Value::Array(values) => fields.extend(
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_ascii_lowercase),
+            ),
+            serde_json::Value::String(value) => fields.push(value.to_ascii_lowercase()),
+            _ => {}
         }
     }
     terms
@@ -3083,79 +3342,25 @@ fn search_query_targets_internal(state: &AppState, query: Option<&str>) -> bool 
     })
 }
 
-async fn hosted_search_object(
-    state: &AppState,
-    repository: &str,
-    package: &str,
+fn hosted_search_object(
+    document: &crate::repo_index::NpmSearchDocument,
     response_base: &str,
     request: &SearchRequest,
-) -> Result<Option<serde_json::Value>, ReadError> {
-    let version_prefix = format!("{}/versions/", package_prefix(repository, package));
-    let version_keys = state
-        .storage
-        .list(&version_prefix)
-        .await
-        .map_err(|_| ReadError::StorageUnavailable)?;
-    if version_keys.len() > NPM_SEARCH_SCAN_RESULT_CAP {
-        return Err(ReadError::SearchScanLimit);
-    }
-    let versions: HashSet<String> = version_keys
-        .iter()
-        .filter_map(|key| {
-            key.strip_prefix(&version_prefix)?
-                .strip_suffix(".json")
-                .filter(|version| !version.is_empty() && !version.contains('/'))
-                .map(str::to_string)
-        })
-        .collect();
-    if versions.is_empty() {
-        return Ok(None);
-    }
-    let tagged_latest =
-        match optional_storage_get(state, &hosted_tag_key(repository, package, "latest")).await? {
-            Some(bytes) => Some(read_string(bytes).ok_or(ReadError::Corrupt)?),
-            None => None,
-        };
-    let latest_version = tagged_latest
-        .filter(|version| versions.contains(version))
-        .or_else(|| {
-            versions
-                .iter()
-                .filter_map(|version| {
-                    semver::Version::parse(version.trim_start_matches('v'))
-                        .ok()
-                        .map(|parsed| (parsed, version.clone()))
-                })
-                .max_by(|left, right| left.0.cmp(&right.0))
-                .map(|(_, version)| version)
-        });
-    let Some(version) = latest_version else {
-        return Ok(None);
-    };
-    let manifest = state
-        .storage
-        .get(&hosted_version_key(repository, package, &version))
-        .await
-        .map_err(storage_read_error)?;
-    let latest =
-        serde_json::from_slice::<serde_json::Value>(&manifest).map_err(|_| ReadError::Corrupt)?;
-    let packument =
-        match optional_storage_get(state, &hosted_package_key(repository, package)).await? {
-            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                .map_err(|_| ReadError::Corrupt)?,
-            None => serde_json::json!({"name": package}),
-        };
-    if !search_matches(&packument, &latest, &request.text) {
-        return Ok(None);
+) -> Option<serde_json::Value> {
+    if !search_document_matches(document, &request.text) {
+        return None;
     }
     let mut package_data = serde_json::Map::new();
     package_data.insert(
         "name".to_string(),
-        serde_json::Value::String(package.to_string()),
+        serde_json::Value::String(document.package.clone()),
     );
-    package_data.insert("version".to_string(), serde_json::Value::String(version));
+    package_data.insert(
+        "version".to_string(),
+        serde_json::Value::String(document.version.clone()),
+    );
     for field in ["description", "keywords", "publisher", "maintainers"] {
-        if let Some(value) = packument.get(field).or_else(|| latest.get(field)) {
+        if let Some(value) = document.fields.get(field) {
             package_data.insert(field.to_string(), value.clone());
         }
     }
@@ -3164,16 +3369,16 @@ async fn hosted_search_object(
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     package_data.insert(
         "links".to_string(),
-        serde_json::json!({"npm": format!("{response_base}/{package}")}),
+        serde_json::json!({"npm": format!("{response_base}/{}", document.package)}),
     );
-    Ok(Some(serde_json::json!({
+    Some(serde_json::json!({
         "package": package_data,
         "score": {
             "final": 1.0,
             "detail": {"quality": 1.0, "popularity": 0.0, "maintenance": 1.0}
         },
         "searchScore": 1.0
-    })))
+    }))
 }
 
 async fn hosted_search_objects(
@@ -3186,30 +3391,26 @@ async fn hosted_search_objects(
     // Protocol search needs a strict index read: stale-on-error is useful for
     // the UI, but would silently turn a hosted member failure into an empty
     // successful protocol result.
-    let index = tokio::time::timeout_at(
+    let projection = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
-        state.repo_index.get_strict("npm", &state.storage),
+        state.repo_index.npm_search_strict(),
     )
     .await
     .map_err(|_| ReadError::SearchScanLimit)?
     .map_err(|_| ReadError::StorageUnavailable)?;
-    let prefix = format!("repositories/{repository}/");
-    let packages: Vec<String> = index
+    let documents: Vec<_> = projection
         .iter()
-        .filter_map(|entry| entry.name.strip_prefix(&prefix).map(str::to_string))
+        .filter(|document| document.repository == repository)
         .collect();
-    if packages.len() > NPM_SEARCH_SCAN_RESULT_CAP {
+    if documents.len() > NPM_SEARCH_SCAN_RESULT_CAP {
         return Err(ReadError::SearchScanLimit);
     }
     let mut objects = Vec::new();
-    for package in packages {
-        let object = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            hosted_search_object(state, repository, &package, response_base, request),
-        )
-        .await
-        .map_err(|_| ReadError::SearchScanLimit)??;
-        if let Some(object) = object {
+    for document in documents {
+        if Instant::now() >= deadline {
+            return Err(ReadError::SearchScanLimit);
+        }
+        if let Some(object) = hosted_search_object(document, response_base, request) {
             objects.push(object);
         }
     }
@@ -7053,6 +7254,42 @@ mod tests {
             },
         ];
         config.npm.default_repository = Some("npm-group".into());
+    }
+
+    fn test_proxy(state: &AppState, name: &str) -> ProxyRepository {
+        let repository = state
+            .config
+            .npm
+            .repository(name)
+            .expect("configured test proxy");
+        configured_proxy(state, repository).expect("proxy repository")
+    }
+
+    async fn write_test_npm_validator_envelope(
+        state: &AppState,
+        repository: &ProxyRepository,
+        package: &str,
+        key: &str,
+        body: &[u8],
+        body_fetched_at_unix: u64,
+        validators: Validators,
+    ) {
+        let envelope = NpmProxyValidatorEnvelope {
+            schema: NPM_PROXY_VALIDATOR_SCHEMA_V1,
+            body_fetched_at_unix,
+            scope_sha256: npm_proxy_validator_scope_sha256(repository, package, key)
+                .expect("valid proxy URL"),
+            body_sha256: npm_proxy_body_sha256(body),
+            validators,
+        };
+        state
+            .storage
+            .put(
+                &validators_key(key),
+                &serde_json::to_vec(&envelope).unwrap(),
+            )
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -11432,15 +11669,21 @@ mod tests {
             }
         });
         let key = proxy_packument_key("npm-registry", "pkg");
-        ctx.state
-            .storage
-            .put(&key, br#"{"name":"pkg","versions":{},"dist-tags":{}}"#)
-            .await
-            .unwrap();
-        write_validators(
-            &ctx.state.storage,
+        let cached = br#"{"name":"pkg","versions":{},"dist-tags":{}}"#;
+        ctx.state.storage.put(&key, cached).await.unwrap();
+        let proxy = test_proxy(&ctx.state, "npm-registry");
+        let body_fetched_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_test_npm_validator_envelope(
+            &ctx.state,
+            &proxy,
+            "pkg",
             &key,
-            &Validators {
+            cached,
+            body_fetched_at_unix,
+            Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
             },
@@ -11469,6 +11712,428 @@ mod tests {
                 > before_bytes
         );
         assert!(response.headers().get("x-nora-stale").is_none());
+        assert_eq!(
+            read_npm_proxy_validator_envelope(&ctx.state.storage, &key)
+                .await
+                .unwrap()
+                .body_fetched_at_unix,
+            body_fetched_at_unix,
+            "a 304 must not extend the bounded validator lifetime"
+        );
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn expired_proxy_validator_forces_unconditional_fetch() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(1)
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_json(serde_json::json!({
+                        "name": "pkg",
+                        "versions": {"2.0.0": {"name": "pkg", "version": "2.0.0"}},
+                        "dist-tags": {"latest": "2.0.0"}
+                    })),
+            )
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let configured_url = upstream.uri();
+        let ctx = create_test_context_with_config(move |config| {
+            named_config(config);
+            config.npm.validator_max_age_secs = 60;
+            if let NpmRepository::Proxy {
+                url, metadata_ttl, ..
+            } = &mut config.npm.repositories[1]
+            {
+                *url = configured_url;
+                *metadata_ttl = Some(0);
+            }
+        });
+        let key = proxy_packument_key("npm-registry", "pkg");
+        let cached = br#"{"name":"pkg","versions":{"1.0.0":{"name":"pkg","version":"1.0.0"}},"dist-tags":{"latest":"1.0.0"}}"#;
+        ctx.state.storage.put(&key, cached).await.unwrap();
+        let proxy = test_proxy(&ctx.state, "npm-registry");
+        write_test_npm_validator_envelope(
+            &ctx.state,
+            &proxy,
+            "pkg",
+            &key,
+            cached,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 61,
+            Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let response = send(&ctx.app, Method::GET, "/repository/npm-registry/pkg", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "2.0.0");
+        let envelope = read_npm_proxy_validator_envelope(&ctx.state.storage, &key)
+            .await
+            .unwrap();
+        assert_eq!(envelope.validators.etag.as_deref(), Some("\"v2\""));
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn future_dated_proxy_validator_is_not_fresh() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(named_config);
+        let key = proxy_packument_key("npm-registry", "pkg");
+        let cached = br#"{"name":"pkg","versions":{},"dist-tags":{}}"#;
+        ctx.state.storage.put(&key, cached).await.unwrap();
+        let repository = test_proxy(&ctx.state, "npm-registry");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_test_npm_validator_envelope(
+            &ctx.state,
+            &repository,
+            "pkg",
+            &key,
+            cached,
+            now + 3_600,
+            Validators {
+                etag: Some("\"future\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let validators =
+            bounded_proxy_validators(&ctx.state, &repository, "pkg", &key, Some(cached)).await;
+
+        assert!(!validators.is_some());
+    }
+
+    #[tokio::test]
+    async fn proxy_validator_envelope_is_bound_to_scope_body_and_schema() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let ctx = create_test_context_with_config(named_config);
+        let key = proxy_packument_key("npm-registry", "pkg");
+        let cached = br#"{"name":"pkg","versions":{},"dist-tags":{}}"#;
+        ctx.state.storage.put(&key, cached).await.unwrap();
+        let repository = test_proxy(&ctx.state, "npm-registry");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        write_test_npm_validator_envelope(
+            &ctx.state,
+            &repository,
+            "pkg",
+            &key,
+            cached,
+            now,
+            Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        assert!(
+            bounded_proxy_validators(&ctx.state, &repository, "pkg", &key, Some(cached))
+                .await
+                .is_some()
+        );
+        assert!(
+            !bounded_proxy_validators(&ctx.state, &repository, "pkg", &key, Some(b"changed"))
+                .await
+                .is_some()
+        );
+        let mut other_upstream = repository.clone();
+        other_upstream.url = "https://registry.example.invalid/base?tenant=other".to_string();
+        assert_eq!(
+            npm_proxy_validator_scope_sha256(&other_upstream, "pkg", &key),
+            None,
+            "credential-bearing URL components must disable validator reuse"
+        );
+        assert!(
+            !bounded_proxy_validators(&ctx.state, &other_upstream, "pkg", &key, Some(cached))
+                .await
+                .is_some()
+        );
+        let mut other_auth = repository.clone();
+        other_auth.auth = Some(crate::secrets::ProtectedString::new(
+            "different-secret".to_string(),
+        ));
+        assert_eq!(
+            npm_proxy_validator_scope_sha256(&repository, "pkg", &key),
+            npm_proxy_validator_scope_sha256(&other_auth, "pkg", &key),
+            "configured Authorization is intentionally excluded from the scope digest"
+        );
+
+        let mut envelope = read_npm_proxy_validator_envelope(&ctx.state.storage, &key)
+            .await
+            .unwrap();
+        envelope.schema = 2;
+        ctx.state
+            .storage
+            .put(
+                &validators_key(&key),
+                &serde_json::to_vec(&envelope).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !bounded_proxy_validators(&ctx.state, &repository, "pkg", &key, Some(cached))
+                .await
+                .is_some()
+        );
+
+        ctx.state
+            .storage
+            .put(
+                &validators_key(&key),
+                br#"{"schema":1,"body_fetched_at_unix":"bad"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !bounded_proxy_validators(&ctx.state, &repository, "pkg", &key, Some(cached))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn unconditional_304_never_refreshes_cached_packument() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(304))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let configured_url = upstream.uri();
+        let ctx = create_test_context_with_config(move |config| {
+            named_config(config);
+            config.npm.validator_max_age_secs = 0;
+            if let NpmRepository::Proxy {
+                url, metadata_ttl, ..
+            } = &mut config.npm.repositories[1]
+            {
+                *url = configured_url;
+                *metadata_ttl = Some(0);
+            }
+        });
+        let key = proxy_packument_key("npm-registry", "pkg");
+        ctx.state
+            .storage
+            .put(
+                &key,
+                br#"{"name":"pkg","versions":{"1.0.0":{"name":"pkg","version":"1.0.0"}},"dist-tags":{"latest":"1.0.0"}}"#,
+            )
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            &key,
+            &Validators {
+                etag: Some("\"ignored\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let response = send(&ctx.app, Method::GET, "/repository/npm-registry/pkg", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-nora-stale")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "1.0.0");
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("if-none-match").is_none());
+    }
+
+    #[tokio::test]
+    async fn inconsistent_cached_packument_recovers_after_304_without_validators() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_json(serde_json::json!({
+                        "name": "pkg",
+                        "versions": {"2.0.0": {"name": "pkg", "version": "2.0.0"}},
+                        "dist-tags": {"latest": "2.0.0"}
+                    })),
+            )
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let configured_url = upstream.uri();
+        let ctx = create_test_context_with_config(move |config| {
+            named_config(config);
+            if let NpmRepository::Proxy {
+                url, metadata_ttl, ..
+            } = &mut config.npm.repositories[1]
+            {
+                *url = configured_url;
+                *metadata_ttl = Some(0);
+            }
+        });
+        let key = proxy_packument_key("npm-registry", "pkg");
+        let cached = br#"{"name":"pkg","versions":{"1.0.0":{"name":"pkg","version":"1.0.0"}},"dist-tags":{"latest":"2.0.0"}}"#;
+        ctx.state.storage.put(&key, cached).await.unwrap();
+        let proxy = test_proxy(&ctx.state, "npm-registry");
+        write_test_npm_validator_envelope(
+            &ctx.state,
+            &proxy,
+            "pkg",
+            &key,
+            cached,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let before_errors = crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+            .with_label_values(&["npm"])
+            .get();
+
+        let response = send(&ctx.app, Method::GET, "/repository/npm-registry/pkg", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "2.0.0");
+        assert!(
+            crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
+                .with_label_values(&["npm"])
+                .get()
+                > before_errors
+        );
+        let stored = ctx.state.storage.get(&key).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&stored).unwrap()["dist-tags"]["latest"],
+            "2.0.0"
+        );
+        upstream.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_cached_packument_ignores_legacy_validator_and_fetches_unconditionally() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .and(header("if-none-match", "\"v1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v2\"")
+                    .set_body_json(serde_json::json!({
+                        "name": "pkg",
+                        "versions": {"2.0.0": {"name": "pkg", "version": "2.0.0"}},
+                        "dist-tags": {"latest": "2.0.0"}
+                    })),
+            )
+            .with_priority(2)
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let configured_url = upstream.uri();
+        let ctx = create_test_context_with_config(move |config| {
+            named_config(config);
+            if let NpmRepository::Proxy {
+                url, metadata_ttl, ..
+            } = &mut config.npm.repositories[1]
+            {
+                *url = configured_url;
+                *metadata_ttl = Some(0);
+            }
+        });
+        let key = proxy_packument_key("npm-registry", "pkg");
+        write_validators(
+            &ctx.state.storage,
+            &key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+
+        let response = send(&ctx.app, Method::GET, "/repository/npm-registry/pkg", "").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "2.0.0");
+        let envelope = read_npm_proxy_validator_envelope(&ctx.state.storage, &key)
+            .await
+            .unwrap();
+        assert_eq!(envelope.validators.etag.as_deref(), Some("\"v2\""));
         upstream.verify().await;
     }
 
@@ -11971,6 +12636,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_search_uses_current_generation_projection_without_storage_io() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::Method;
+        use std::sync::Arc;
+
+        let ctx = create_test_context_with_config(|config| {
+            named_config(config);
+            config.npm.repositories.truncate(1);
+            config.npm.default_repository = Some("npm-private".to_string());
+        });
+        for version in ["1.0.0", "2.0.0"] {
+            assert_eq!(
+                send(
+                    &ctx.app,
+                    Method::PUT,
+                    "/repository/npm-private/pkg",
+                    publish_payload("pkg", version, "latest"),
+                )
+                .await
+                .status(),
+                StatusCode::CREATED
+            );
+        }
+
+        let pointer = read_hosted_packument_pointer(&ctx.state.storage, "npm-private", "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        let full_key =
+            crate::npm_layout::hosted_packument_full_key("npm-private", "pkg", &pointer.generation);
+        let full = ctx.state.storage.get(&full_key).await.unwrap();
+        let mut packument: serde_json::Value = serde_json::from_slice(&full).unwrap();
+        packument["versions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("1.0.0");
+        packument["dist-tags"]["latest"] = serde_json::Value::String("2.0.0".to_string());
+        let full = serde_json::to_vec(&packument).unwrap();
+        let current = write_hosted_packument_generation_documents(
+            &ctx.state.storage,
+            "npm-private",
+            "pkg",
+            &packument,
+            &full,
+        )
+        .await
+        .unwrap();
+        commit_hosted_packument_pointer(&ctx.state.storage, "npm-private", "pkg", &current)
+            .await
+            .unwrap();
+        assert!(ctx
+            .state
+            .storage
+            .stat(&hosted_version_key("npm-private", "pkg", "1.0.0"))
+            .await
+            .unwrap()
+            .is_some());
+        ctx.state.repo_index.invalidate("npm");
+        ctx.state
+            .repo_index
+            .get_strict("npm", &ctx.state.storage)
+            .await
+            .unwrap();
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let get_attempts = backend.get_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let target = named_target(&state, "npm-private").unwrap();
+        let response = handle_search(
+            &state,
+            &target,
+            &public_base(&state, Some("npm-private")),
+            &HeaderMap::new(),
+            Some("text=pkg&size=20"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(response["objects"].as_array().unwrap().len(), 1);
+        assert_eq!(response["objects"][0]["package"]["version"], "2.0.0");
+        assert!(list_attempts.lock().is_empty());
+        assert!(get_attempts.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn group_search_marks_healthy_member_results_approximate_when_proxy_fails() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::Method;
@@ -12021,8 +12775,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_only_group_search_fails_closed_on_member_read_error() {
-        use crate::test_helpers::{create_test_context_with_config, send};
+    async fn hosted_only_group_search_does_not_reread_split_member_state() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::Method;
 
         let ctx = create_test_context_with_config(|config| {
@@ -12087,7 +12841,16 @@ mod tests {
             Some("text=&size=20"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let names: HashSet<_> = response["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|object| object["package"]["name"].as_str())
+            .collect();
+        assert_eq!(names, HashSet::from(["healthy", "broken"]));
     }
 
     #[tokio::test]

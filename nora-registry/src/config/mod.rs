@@ -1221,6 +1221,7 @@ mod tests {
         assert!(n.proxy_auth.is_none());
         assert_eq!(n.proxy_timeout, 30);
         assert_eq!(n.metadata_ttl, 300);
+        assert_eq!(n.validator_max_age_secs, 3_600);
     }
 
     #[test]
@@ -1592,6 +1593,7 @@ mod tests {
         std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
         std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
         std::env::set_var("NORA_NPM_METADATA_TTL", "600");
+        std::env::set_var("NORA_NPM_VALIDATOR_MAX_AGE_SECS", "7200");
         config.apply_env_overrides().unwrap();
         assert_eq!(
             config.npm.proxy,
@@ -1603,10 +1605,12 @@ mod tests {
         );
         assert_eq!(config.npm.proxy_timeout, 60);
         assert_eq!(config.npm.metadata_ttl, 600);
+        assert_eq!(config.npm.validator_max_age_secs, 7200);
         std::env::remove_var("NORA_NPM_PROXY");
         std::env::remove_var("NORA_NPM_PROXY_AUTH");
         std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
         std::env::remove_var("NORA_NPM_METADATA_TTL");
+        std::env::remove_var("NORA_NPM_VALIDATOR_MAX_AGE_SECS");
     }
 
     #[test]

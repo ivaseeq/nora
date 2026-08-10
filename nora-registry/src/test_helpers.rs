@@ -45,6 +45,7 @@ use parking_lot::RwLock;
 pub struct FaultInjectBackend {
     inner: Storage,
     get_failures: HashSet<String>,
+    transient_get_failures: parking_lot::Mutex<HashMap<String, usize>>,
     put_failures: HashSet<String>,
     put_after_failures: HashSet<String>,
     create_failures: HashSet<String>,
@@ -68,6 +69,7 @@ impl FaultInjectBackend {
         Self {
             inner,
             get_failures: HashSet::new(),
+            transient_get_failures: parking_lot::Mutex::new(HashMap::new()),
             put_failures: HashSet::new(),
             put_after_failures: HashSet::new(),
             create_failures: HashSet::new(),
@@ -89,6 +91,11 @@ impl FaultInjectBackend {
 
     pub fn fail_get(mut self, key: impl Into<String>) -> Self {
         self.get_failures.insert(key.into());
+        self
+    }
+
+    pub fn fail_get_times(self, key: impl Into<String>, times: usize) -> Self {
+        self.transient_get_failures.lock().insert(key.into(), times);
         self
     }
 
@@ -223,6 +230,23 @@ impl StorageBackend for FaultInjectBackend {
         self.get_attempts.lock().push(key.to_string());
         if self.get_failures.contains(key) {
             return Err(StorageError::Network("injected get failure".to_string()));
+        }
+        if self
+            .transient_get_failures
+            .lock()
+            .get_mut(key)
+            .is_some_and(|remaining| {
+                if *remaining == 0 {
+                    false
+                } else {
+                    *remaining -= 1;
+                    true
+                }
+            })
+        {
+            return Err(StorageError::Network(
+                "injected transient get failure".to_string(),
+            ));
         }
         self.inner.get(key).await
     }
@@ -397,6 +421,7 @@ fn build_context(
             metadata_ttl: -1,
             serve_stale: true,
             revalidate: true,
+            validator_max_age_secs: 3_600,
             repositories: Vec::new(),
             default_repository: None,
         },

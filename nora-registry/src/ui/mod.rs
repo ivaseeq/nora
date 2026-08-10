@@ -1124,6 +1124,30 @@ mod named_npm_route_tests {
             )
             .await
             .unwrap();
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let packument = serde_json::json!({
+            "name": "@scope/pkg",
+            "versions": {"1.0.0": manifest_value},
+            "dist-tags": {"latest": "1.0.0"}
+        });
+        let full = serde_json::to_vec(&packument).unwrap();
+        let pointer = crate::registry::write_hosted_packument_generation_documents(
+            &context.state.storage,
+            "npm-private",
+            "@scope/pkg",
+            &packument,
+            &full,
+        )
+        .await
+        .unwrap();
+        crate::registry::commit_hosted_packument_pointer(
+            &context.state.storage,
+            "npm-private",
+            "@scope/pkg",
+            &pointer,
+        )
+        .await
+        .unwrap();
         context.state.repo_index.invalidate("npm");
         assert!(
             context

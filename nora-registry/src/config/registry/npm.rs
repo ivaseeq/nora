@@ -25,6 +25,12 @@ pub struct NpmConfig {
     pub serve_stale: bool,
     #[serde(default = "super::super::default_true")]
     pub revalidate: bool,
+    /// Maximum age of an upstream validator envelope before Nora forces one
+    /// unconditional packument fetch. This bounds stale 304 state across
+    /// restarts even when the cached body is repeatedly touched. Zero disables
+    /// conditional revalidation while preserving ordinary cache reads.
+    #[serde(default = "default_validator_max_age_secs")]
+    pub validator_max_age_secs: u64,
 
     #[serde(default)]
     pub repositories: Vec<NpmRepository>,
@@ -78,6 +84,16 @@ fn default_negative_ttl() -> i64 {
     300
 }
 
+fn default_validator_max_age_secs() -> u64 {
+    3_600
+}
+
+fn parse_validator_max_age_secs(value: &str) -> Result<u64, String> {
+    value.parse::<u64>().map_err(|_| {
+        format!("NORA_NPM_VALIDATOR_MAX_AGE_SECS={value:?} must be an unsigned integer")
+    })
+}
+
 /// Default npm upstream. This remains the source for the compatibility `/npm`
 /// alias; named proxies carry their own URL.
 fn default_npm_proxy() -> Option<String> {
@@ -94,6 +110,7 @@ impl Default for NpmConfig {
             metadata_ttl: 300,
             serve_stale: true,
             revalidate: true,
+            validator_max_age_secs: default_validator_max_age_secs(),
             repositories: Vec::new(),
             default_repository: None,
         }
@@ -127,9 +144,16 @@ impl NpmConfig {
 
             match repo {
                 NpmRepository::Proxy { url, .. } => match reqwest::Url::parse(url) {
-                    Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+                    Ok(parsed)
+                        if matches!(parsed.scheme(), "http" | "https")
+                            && parsed.username().is_empty()
+                            && parsed.password().is_none()
+                            && parsed.query().is_none()
+                            && parsed.fragment().is_none() =>
+                    {
+                    }
                     _ => errors.push(format!(
-                        "npm proxy repository {name:?} has an invalid HTTP(S) URL"
+                        "npm proxy repository {name:?} must use an HTTP(S) URL without userinfo, query or fragment"
                     )),
                 },
                 NpmRepository::Group { members, .. } if members.is_empty() => errors.push(format!(
@@ -227,6 +251,9 @@ impl NpmConfig {
         if let Ok(val) = env::var("NORA_NPM_REVALIDATE") {
             self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
+        if let Ok(val) = env::var("NORA_NPM_VALIDATOR_MAX_AGE_SECS") {
+            self.validator_max_age_secs = parse_validator_max_age_secs(&val)?;
+        }
         if let Ok(val) = env::var("NORA_NPM_REPOSITORIES_JSON") {
             self.repositories = serde_json::from_str(&val)
                 .map_err(|error| format!("NORA_NPM_REPOSITORIES_JSON is invalid: {error}"))?;
@@ -271,6 +298,46 @@ mod tests {
             ..NpmConfig::default()
         };
         assert!(config.validate_repositories().is_empty());
+    }
+
+    #[test]
+    fn proxy_repository_url_accepts_base_paths_but_rejects_credential_bearing_components() {
+        let validate = |url: &str| {
+            NpmConfig {
+                repositories: vec![NpmRepository::Proxy {
+                    name: "proxy".into(),
+                    url: url.into(),
+                    auth: None,
+                    metadata_ttl: None,
+                    negative_ttl: 300,
+                }],
+                default_repository: Some("proxy".into()),
+                ..NpmConfig::default()
+            }
+            .validate_repositories()
+        };
+
+        assert!(validate("https://registry.example.invalid/npm/").is_empty());
+        for url in [
+            "https://user:password@registry.example.invalid/npm/",
+            "https://registry.example.invalid/npm/?tenant=private",
+            "https://registry.example.invalid/npm/#private",
+        ] {
+            assert!(
+                validate(url)
+                    .iter()
+                    .any(|error| error.contains("without userinfo, query or fragment")),
+                "unsafe proxy URL must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_max_age_parser_rejects_non_numeric_values() {
+        assert_eq!(parse_validator_max_age_secs("7200").unwrap(), 7_200);
+        assert!(parse_validator_max_age_secs("forever")
+            .unwrap_err()
+            .contains("NORA_NPM_VALIDATOR_MAX_AGE_SECS"));
     }
 
     #[test]

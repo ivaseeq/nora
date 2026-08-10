@@ -71,6 +71,7 @@ rand = "0.8"
 semver = "1"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
 rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
 proptest = "1"

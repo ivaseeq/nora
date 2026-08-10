@@ -41,11 +41,14 @@ pub use npm::routes as npm_routes;
 // keys as strings (review R7, contract `import-key-format-equals-handler-key-format`).
 pub(crate) use maven::storage_key as maven_storage_key;
 pub(crate) use maven::update_hosted_metadata_after_retention;
+#[cfg(test)]
+pub(crate) use npm::write_hosted_packument_generation_documents;
 pub(crate) use npm::{
     commit_hosted_packument_pointer, create_hosted_maintenance_marker,
     prepare_hosted_packument_after_retention, read_hosted_active_transactions,
     read_hosted_maintenance_marker, read_hosted_packument_pointer,
-    resume_hosted_maintenance_operation, validate_hosted_packument_pointer,
+    resume_hosted_maintenance_operation, validate_hosted_packument_generation,
+    validate_hosted_packument_pointer,
 };
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
