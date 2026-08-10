@@ -594,6 +594,7 @@ fn build_context(
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        maven_revalidation_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
         oidc: None,

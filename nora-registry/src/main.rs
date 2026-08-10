@@ -252,6 +252,10 @@ pub struct AppState {
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
     pub(crate) maven_negative_cache: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Successful byte-identical Maven proxy validations. This process-local,
+    /// bounded cache renews positive metadata TTLs without touching S3 bytes.
+    pub(crate) maven_revalidation_cache:
+        Arc<parking_lot::Mutex<HashMap<String, (std::time::Instant, [u8; 32])>>>,
     /// Hot-reloadable curation config (swapped atomically on SIGHUP).
     pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
@@ -1690,6 +1694,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        maven_revalidation_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
         oidc: oidc_validator.map(Arc::new),

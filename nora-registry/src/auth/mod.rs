@@ -1654,6 +1654,9 @@ Jd74nq6dNCjpWG4drIsyhqX+
             maven_negative_cache: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            maven_revalidation_cache: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             reloadable: Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
                 curation_engine: crate::curation::CurationEngine::new(
                     crate::config::CurationConfig::default(),

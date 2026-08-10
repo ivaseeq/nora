@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 const MAVEN_NEGATIVE_CACHE_MAX_ENTRIES: usize = 10_000;
+const MAVEN_REVALIDATION_CACHE_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug)]
 struct MavenPolicyBlock;
@@ -362,6 +363,54 @@ fn insert_negative_cache_entry(
         }
     }
     cache.insert(key, now);
+}
+
+fn revalidation_cache_fresh(
+    cache: &mut HashMap<String, (Instant, [u8; 32])>,
+    key: &str,
+    expected_fingerprint: [u8; 32],
+    metadata_ttl: i64,
+) -> bool {
+    if metadata_ttl <= 0 {
+        cache.remove(key);
+        return false;
+    }
+    let now = Instant::now();
+    match cache.get(key).copied() {
+        Some((validated, stored_fingerprint))
+            if now.duration_since(validated).as_secs() < metadata_ttl as u64
+                && stored_fingerprint == expected_fingerprint =>
+        {
+            true
+        }
+        Some(_) => {
+            cache.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn revalidation_fingerprint(data: &[u8]) -> [u8; 32] {
+    sha2::Sha256::digest(data).into()
+}
+
+fn record_revalidation(
+    cache: &mut HashMap<String, (Instant, [u8; 32])>,
+    key: String,
+    fingerprint: [u8; 32],
+    max_entries: usize,
+) {
+    if !cache.contains_key(&key) && cache.len() >= max_entries {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (validated, _))| *validated)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (Instant::now(), fingerprint));
 }
 
 /// Whether a Maven path points at a MUTABLE resource that must be revalidated when proxied:
@@ -742,13 +791,23 @@ async fn download_direct(
     let cache_fresh = match &cached {
         None => false,
         Some(_) if !is_mutable_maven_path(&path) => true,
-        Some(_) => {
+        Some(data) => {
             let modified = cached_meta.as_ref().map(|m| m.modified);
             crate::cache_ttl::mutable_ref_fresh(
                 repository.is_proxy(),
                 repository.metadata_ttl,
                 modified,
-            )
+            ) || {
+                // Metadata bodies are unbounded; hash before taking the process-wide cache
+                // mutex so unrelated repository reads cannot be stalled by the digest work.
+                let fingerprint = revalidation_fingerprint(data);
+                revalidation_cache_fresh(
+                    &mut state.maven_revalidation_cache.lock(),
+                    &key,
+                    fingerprint,
+                    repository.metadata_ttl,
+                )
+            }
         }
     };
 
@@ -907,12 +966,11 @@ async fn download_direct(
                     {
                         let metadata = match merge_and_cache_proxy_metadata(
                             &state,
-                            &repository.storage_prefix(),
+                            &repository,
                             group_path,
                             artifact_id,
                             document_path,
                             &data,
-                            repository.version_policy,
                         )
                         .await
                         {
@@ -2538,13 +2596,13 @@ fn combine_metadata_sections(
 
 async fn merge_and_cache_proxy_metadata(
     state: &AppState,
-    storage_prefix: &str,
+    repository: &DirectRepository,
     group_path: &str,
     artifact_id: &str,
     document_path: &str,
     upstream: &[u8],
-    version_policy: MavenVersionPolicy,
 ) -> crate::storage::Result<Bytes> {
+    let storage_prefix = repository.storage_prefix();
     let key = format!("{storage_prefix}{document_path}");
 
     // Serialize the read -> merge -> write -> checksums cycle with the upload-side
@@ -2570,14 +2628,14 @@ async fn merge_and_cache_proxy_metadata(
         .filter_map(|metadata| metadata.last_updated)
         .max();
     let stored_versions =
-        stored_artifact_versions(state, storage_prefix, group_path, artifact_id).await?;
+        stored_artifact_versions(state, &storage_prefix, group_path, artifact_id).await?;
     let artifact = merge_artifact_metadata(
         &group_path.replace('/', "."),
         artifact_id,
         Some(upstream),
         &stored_versions,
         last_updated.as_deref(),
-        version_policy,
+        repository.version_policy,
     );
     let plugin_documents: Vec<Bytes> = [Some(Bytes::copy_from_slice(upstream)), cached.clone()]
         .into_iter()
@@ -2587,10 +2645,27 @@ async fn merge_and_cache_proxy_metadata(
     let data = combine_metadata_sections(artifact, plugins.as_deref())
         .map_or_else(|| Bytes::copy_from_slice(upstream), Bytes::from);
 
-    if let Err(error) = state.storage.put(&key, &data).await {
-        tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
-    } else if let Err(error) = compute_and_store_checksums(&state.storage, &key, &data).await {
-        tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata checksums");
+    if cached.as_deref() == Some(data.as_ref()) {
+        if repository.metadata_ttl > 0 {
+            // Keep hashing outside the cache mutex; the bounded map mutation below is the only
+            // work that needs serialization.
+            let fingerprint = revalidation_fingerprint(&data);
+            record_revalidation(
+                &mut state.maven_revalidation_cache.lock(),
+                key,
+                fingerprint,
+                MAVEN_REVALIDATION_CACHE_MAX_ENTRIES,
+            );
+        } else {
+            state.maven_revalidation_cache.lock().remove(&key);
+        }
+    } else {
+        state.maven_revalidation_cache.lock().remove(&key);
+        if let Err(error) = state.storage.put(&key, &data).await {
+            tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
+        } else if let Err(error) = compute_and_store_checksums(&state.storage, &key, &data).await {
+            tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata checksums");
+        }
     }
 
     Ok(data)
@@ -3284,6 +3359,65 @@ mod tests {
     }
 
     #[test]
+    fn test_revalidation_cache_is_bounded_identity_bound_and_disabled_at_zero_ttl() {
+        let now = Instant::now();
+        let old_fingerprint = sha2::Sha256::digest(b"old").into();
+        let current_fingerprint = sha2::Sha256::digest(b"current").into();
+        let mut cache = HashMap::from([
+            (
+                "old".to_string(),
+                (now - Duration::from_secs(10), old_fingerprint),
+            ),
+            ("current".to_string(), (now, current_fingerprint)),
+        ]);
+
+        record_revalidation(
+            &mut cache,
+            "new".to_string(),
+            revalidation_fingerprint(b"new"),
+            2,
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key("old"));
+        assert!(revalidation_cache_fresh(
+            &mut cache,
+            "current",
+            revalidation_fingerprint(b"current"),
+            300
+        ));
+        assert!(!revalidation_cache_fresh(
+            &mut cache,
+            "current",
+            revalidation_fingerprint(b"changed"),
+            300
+        ));
+        assert!(!cache.contains_key("current"));
+        assert!(!revalidation_cache_fresh(
+            &mut cache,
+            "new",
+            revalidation_fingerprint(b"new"),
+            0
+        ));
+        assert!(!cache.contains_key("new"));
+
+        let mut expired_cache = HashMap::from([(
+            "expired-match".to_string(),
+            (
+                Instant::now() - Duration::from_secs(301),
+                revalidation_fingerprint(b"same"),
+            ),
+        )]);
+        assert!(!revalidation_cache_fresh(
+            &mut expired_cache,
+            "expired-match",
+            revalidation_fingerprint(b"same"),
+            300
+        ));
+        assert!(!expired_cache.contains_key("expired-match"));
+    }
+
+    #[test]
     fn test_all_metadata_checksum_cache_headers_revalidate() {
         for suffix in ["md5", "sha1", "sha256", "sha512"] {
             let (_, headers, _) = with_content_type(
@@ -3774,7 +3908,8 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use super::{
-        checksum_hex, compute_and_store_checksums, parse_artifact_metadata, repository_storage_key,
+        checksum_hex, compute_and_store_checksums, merge_and_cache_proxy_metadata,
+        parse_artifact_metadata, repository_storage_key, DirectRepository,
     };
     use crate::config::{MavenRepository, MavenVersionPolicy, MavenWritePolicy};
     use crate::storage::{
@@ -5249,6 +5384,256 @@ mod integration_tests {
             writes.lock().is_empty(),
             "metadata derived from an incomplete cached-version set must not be written"
         );
+    }
+
+    fn proxy_metadata_xml(versions: &[&str], last_updated: &str) -> String {
+        let latest = versions.last().expect("at least one version");
+        let version_elements = versions
+            .iter()
+            .map(|version| format!("      <version>{version}</version>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            r#"<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>cached</artifactId>
+  <versioning>
+    <latest>{latest}</latest>
+    <release>{latest}</release>
+    <versions>
+{version_elements}
+    </versions>
+    <lastUpdated>{last_updated}</lastUpdated>
+  </versioning>
+</metadata>"#
+        )
+    }
+
+    fn direct_proxy_repository(metadata_ttl: i64) -> DirectRepository {
+        DirectRepository {
+            name: Some("proxy".to_string()),
+            proxies: Vec::new(),
+            metadata_ttl,
+            negative_ttl: 0,
+            version_policy: MavenVersionPolicy::Release,
+            write_policy: MavenWritePolicy::Deny,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_identical_proxy_metadata_revalidation_skips_all_writes() {
+        use crate::storage::Storage;
+        use crate::test_helpers::{create_test_context, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context();
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let upstream = proxy_metadata_xml(&["1.0"], "20260810070000");
+        let repository = direct_proxy_repository(0);
+        let key = "maven/repositories/proxy/com/example/cached/maven-metadata.xml";
+
+        let first = merge_and_cache_proxy_metadata(
+            &state,
+            &repository,
+            "com/example",
+            "cached",
+            "com/example/cached/maven-metadata.xml",
+            upstream.as_bytes(),
+        )
+        .await
+        .expect("first metadata merge");
+
+        assert_eq!(
+            writes.lock().as_slice(),
+            [
+                format!("put:{key}"),
+                format!("put:{key}.md5"),
+                format!("put:{key}.sha1"),
+                format!("put:{key}.sha256"),
+                format!("put:{key}.sha512"),
+            ]
+        );
+        writes.lock().clear();
+
+        let second = merge_and_cache_proxy_metadata(
+            &state,
+            &repository,
+            "com/example",
+            "cached",
+            "com/example/cached/maven-metadata.xml",
+            upstream.as_bytes(),
+        )
+        .await
+        .expect("identical metadata revalidation");
+
+        assert_eq!(second, first);
+        assert!(
+            writes.lock().is_empty(),
+            "byte-identical metadata must not rewrite the document or sidecars"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_changed_proxy_metadata_revalidation_rewrites_document_and_all_sidecars() {
+        use crate::storage::Storage;
+        use crate::test_helpers::{create_test_context, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context();
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let repository = direct_proxy_repository(0);
+        let key = "maven/repositories/proxy/com/example/cached/maven-metadata.xml";
+        let initial = proxy_metadata_xml(&["1.0"], "20260810070000");
+        merge_and_cache_proxy_metadata(
+            &state,
+            &repository,
+            "com/example",
+            "cached",
+            "com/example/cached/maven-metadata.xml",
+            initial.as_bytes(),
+        )
+        .await
+        .expect("initial metadata merge");
+        writes.lock().clear();
+
+        let changed = proxy_metadata_xml(&["1.0", "2.0"], "20260810070100");
+        let merged = merge_and_cache_proxy_metadata(
+            &state,
+            &repository,
+            "com/example",
+            "cached",
+            "com/example/cached/maven-metadata.xml",
+            changed.as_bytes(),
+        )
+        .await
+        .expect("changed metadata revalidation");
+
+        assert_eq!(
+            writes.lock().as_slice(),
+            [
+                format!("put:{key}"),
+                format!("put:{key}.md5"),
+                format!("put:{key}.sha1"),
+                format!("put:{key}.sha256"),
+                format!("put:{key}.sha512"),
+            ]
+        );
+        assert_eq!(state.storage.get(key).await.unwrap(), merged);
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            assert_eq!(
+                state.storage.get(&format!("{key}.{suffix}")).await.unwrap(),
+                Bytes::from(checksum_hex(suffix, &merged).unwrap())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_metadata_cached_read_failure_is_fail_closed_without_writes() {
+        use crate::storage::Storage;
+        use crate::test_helpers::{create_test_context, FaultInjectBackend};
+        use std::sync::Arc;
+
+        let ctx = create_test_context();
+        let key = "maven/repositories/proxy/com/example/cached/maven-metadata.xml";
+        let original = proxy_metadata_xml(&["1.0"], "20260810070000");
+        ctx.state
+            .storage
+            .put(key, original.as_bytes())
+            .await
+            .unwrap();
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone()).fail_get_times(key, 1);
+        let writes = backend.write_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let repository = direct_proxy_repository(0);
+
+        let result = merge_and_cache_proxy_metadata(
+            &state,
+            &repository,
+            "com/example",
+            "cached",
+            "com/example/cached/maven-metadata.xml",
+            original.as_bytes(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StorageError::Network(_))));
+        assert!(
+            writes.lock().is_empty(),
+            "an unavailable cached read must not be treated as absence"
+        );
+        assert_eq!(ctx.state.storage.get(key).await.unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn test_identical_proxy_metadata_revalidation_renews_positive_ttl_without_writes() {
+        use crate::test_helpers::FaultInjectBackend;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let metadata_path = "/com/example/cached/maven-metadata.xml";
+        let upstream_metadata = proxy_metadata_xml(&["1.0"], "20260810070000");
+        Mock::given(method("GET"))
+            .and(path(metadata_path))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(upstream_metadata, "application/xml"),
+            )
+            .mount(&upstream)
+            .await;
+        let upstream_url = upstream.uri();
+        let ctx = create_test_context_with_config(move |config| {
+            config.maven.repositories = vec![MavenRepository::Proxy {
+                name: "central".to_string(),
+                url: upstream_url,
+                auth: None,
+                version_policy: MavenVersionPolicy::Release,
+                metadata_ttl: Some(1),
+                negative_ttl: 0,
+            }];
+            config.maven.default_repository = Some("central".to_string());
+        });
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone());
+        let writes = backend.write_attempts();
+        let mut state = ctx.state.clone();
+        state.storage = Storage::from_backend(Arc::new(backend));
+        let app = super::routes().with_state(state.clone());
+        let request_path = "/maven2/com/example/cached/maven-metadata.xml";
+        let key = "maven/repositories/central/com/example/cached/maven-metadata.xml";
+
+        let first = send(&app, Method::GET, request_path, "").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_bytes(first).await;
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert_eq!(writes.lock().len(), 5);
+        writes.lock().clear();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        let revalidated = send(&app, Method::GET, request_path, "").await;
+        assert_eq!(revalidated.status(), StatusCode::OK);
+        assert_eq!(body_bytes(revalidated).await, first_body);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+        assert!(
+            writes.lock().is_empty(),
+            "successful byte-identical revalidation must not touch the S3 bundle"
+        );
+        assert!(state.maven_revalidation_cache.lock().contains_key(key));
+
+        let fresh = send(&app, Method::GET, request_path, "").await;
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(body_bytes(fresh).await, first_body);
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            2,
+            "a successful validation must start a new positive TTL window"
+        );
+        assert!(writes.lock().is_empty());
     }
 
     #[tokio::test]
