@@ -116,13 +116,7 @@ impl LocalStorage {
                                 .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
-                            results.push((
-                                key,
-                                FileMeta {
-                                    size: metadata.len(),
-                                    modified,
-                                },
-                            ));
+                            results.push((key, FileMeta::local(metadata.len(), modified)));
                         }
                     }
                 } else if metadata.is_dir() {
@@ -319,10 +313,7 @@ impl StorageBackend for LocalStorage {
                 StorageError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             })?
             .as_secs();
-        Ok(Some(FileMeta {
-            size: metadata.len(),
-            modified,
-        }))
+        Ok(Some(FileMeta::local(metadata.len(), modified)))
     }
 
     async fn health_check(&self) -> bool {

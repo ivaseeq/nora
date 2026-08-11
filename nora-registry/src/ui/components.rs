@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::i18n::{get_translations, Lang, Translations};
+use super::static_assets::{favicon_asset_version, htmx_asset_version, tailwind_asset_version};
 
 /// Application version from Cargo.toml
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,8 +64,9 @@ pub fn layout_dark_filtered(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Nora</title>
-    <link rel="stylesheet" href="/ui/static/tailwind.css">
-    <script src="/ui/static/htmx.min.js"></script>
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/favicon.svg?v={favicon_version}">
+    <link rel="stylesheet" href="/ui/static/tailwind.css?v={tailwind_version}">
+    <script src="/ui/static/htmx.min.js?v={htmx_version}"></script>
     <style>
         [x-cloak] {{ display: none !important; }}
         .sidebar-open {{ overflow: hidden; }}
@@ -73,39 +75,195 @@ pub fn layout_dark_filtered(
 <body class="bg-[#0f172a] min-h-screen">
     <div class="flex h-screen overflow-hidden">
         <!-- Mobile sidebar overlay -->
-        <div id="sidebar-overlay" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden" onclick="toggleSidebar()"></div>
+        <button id="sidebar-overlay" type="button" tabindex="-1" aria-label="{close_navigation}" aria-controls="sidebar" aria-hidden="true" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden" onclick="closeSidebar()"></button>
 
         <!-- Sidebar -->
         {}
 
         <!-- Main content -->
-        <div class="flex-1 flex flex-col overflow-hidden min-w-0">
+        <div id="app-content" class="flex-1 flex flex-col overflow-hidden min-w-0">
+            <a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded focus:bg-blue-600 focus:px-4 focus:py-2 focus:text-white focus:outline-none focus:ring-2 focus:ring-blue-300">{skip_to_content}</a>
             <!-- Header -->
             {}
 
             <!-- Content -->
-            <main class="flex-1 overflow-y-auto p-4 md:p-6">
+            <main id="main-content" tabindex="-1" class="flex-1 overflow-y-auto p-4 md:p-6">
                 {}
             </main>
         </div>
     </div>
 
     <script>
-        function toggleSidebar() {{
+        const sidebarBreakpoint = window.matchMedia('(min-width: 768px)');
+        let sidebarReturnFocus = null;
+
+        function setSidebarControlsExpanded(expanded) {{
+            document.querySelectorAll('[data-sidebar-control]').forEach((control) => {{
+                control.setAttribute('aria-expanded', String(expanded));
+            }});
+        }}
+
+        function openSidebar(trigger) {{
+            if (sidebarBreakpoint.matches) return;
+
             const sidebar = document.getElementById('sidebar');
             const overlay = document.getElementById('sidebar-overlay');
-            const isOpen = !sidebar.classList.contains('-translate-x-full');
+            const appContent = document.getElementById('app-content');
 
-            if (isOpen) {{
-                sidebar.classList.add('-translate-x-full');
-                overlay.classList.add('hidden');
-                document.body.classList.remove('sidebar-open');
-            }} else {{
-                sidebar.classList.remove('-translate-x-full');
-                overlay.classList.remove('hidden');
-                document.body.classList.add('sidebar-open');
-            }}
+            sidebarReturnFocus = trigger || document.activeElement;
+            sidebar.removeAttribute('inert');
+            sidebar.classList.remove('-translate-x-full');
+            sidebar.removeAttribute('aria-hidden');
+            sidebar.setAttribute('role', 'dialog');
+            sidebar.setAttribute('aria-modal', 'true');
+            overlay.classList.remove('hidden');
+            overlay.setAttribute('aria-hidden', 'false');
+            const closeControl = sidebar.querySelector('[data-sidebar-close]');
+            if (closeControl) closeControl.focus();
+            appContent.setAttribute('inert', '');
+            appContent.setAttribute('aria-hidden', 'true');
+            document.body.classList.add('sidebar-open');
+            setSidebarControlsExpanded(true);
         }}
+
+        function closeSidebar(restoreFocus = true) {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const appContent = document.getElementById('app-content');
+            const focusTarget = sidebarReturnFocus;
+
+            appContent.removeAttribute('inert');
+            appContent.removeAttribute('aria-hidden');
+            if (restoreFocus && focusTarget && focusTarget.isConnected) focusTarget.focus();
+
+            sidebar.classList.add('-translate-x-full');
+            sidebar.removeAttribute('role');
+            sidebar.removeAttribute('aria-modal');
+            if (!sidebarBreakpoint.matches) {{
+                sidebar.setAttribute('inert', '');
+                sidebar.setAttribute('aria-hidden', 'true');
+            }}
+            overlay.classList.add('hidden');
+            overlay.setAttribute('aria-hidden', 'true');
+            document.body.classList.remove('sidebar-open');
+            setSidebarControlsExpanded(false);
+            sidebarReturnFocus = null;
+        }}
+
+        function syncSidebarForViewport() {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const appContent = document.getElementById('app-content');
+            const wasModalOpen = sidebar.getAttribute('aria-modal') === 'true';
+
+            overlay.classList.add('hidden');
+            overlay.setAttribute('aria-hidden', 'true');
+            appContent.removeAttribute('inert');
+            appContent.removeAttribute('aria-hidden');
+            document.body.classList.remove('sidebar-open');
+            setSidebarControlsExpanded(false);
+            sidebar.removeAttribute('role');
+            sidebar.removeAttribute('aria-modal');
+
+            if (sidebarBreakpoint.matches) {{
+                sidebar.removeAttribute('inert');
+                sidebar.removeAttribute('aria-hidden');
+                if (wasModalOpen) {{
+                    const desktopTarget = sidebar.querySelector('a[aria-current="page"]') || sidebar.querySelector('a[href]');
+                    if (desktopTarget) desktopTarget.focus();
+                }}
+            }} else {{
+                if (sidebar.contains(document.activeElement)) {{
+                    const openControl = appContent.querySelector('[data-sidebar-control]');
+                    if (openControl) openControl.focus();
+                }}
+                sidebar.classList.add('-translate-x-full');
+                sidebar.setAttribute('inert', '');
+                sidebar.setAttribute('aria-hidden', 'true');
+            }}
+            sidebarReturnFocus = null;
+        }}
+
+        document.addEventListener('keydown', (event) => {{
+            const sidebar = document.getElementById('sidebar');
+            const isOpen = !sidebarBreakpoint.matches && !sidebar.classList.contains('-translate-x-full');
+            if (event.key === 'Escape' && isOpen) {{
+                event.preventDefault();
+                closeSidebar();
+                return;
+            }}
+            if (event.key === 'Tab' && isOpen) {{
+                const controls = Array.from(sidebar.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+                    .filter((control) => control.getClientRects().length > 0);
+                if (controls.length === 0) return;
+                const first = controls[0];
+                const last = controls[controls.length - 1];
+                if (event.shiftKey && (document.activeElement === first || !sidebar.contains(document.activeElement))) {{
+                    event.preventDefault();
+                    last.focus();
+                }} else if (!event.shiftKey && document.activeElement === last) {{
+                    event.preventDefault();
+                    first.focus();
+                }}
+            }}
+        }});
+
+        function setRepositoryResultsBusy(event, busy) {{
+            const trigger = event.detail && event.detail.elt;
+            if (!trigger || !(trigger.id === 'repository-search' || trigger.getAttribute('hx-target') === '#repo-results')) return;
+            const results = document.getElementById('repo-results');
+            if (results) results.setAttribute('aria-busy', String(busy));
+        }}
+        document.body.addEventListener('htmx:beforeRequest', (event) => setRepositoryResultsBusy(event, true));
+        document.body.addEventListener('htmx:afterRequest', (event) => setRepositoryResultsBusy(event, false));
+        document.body.addEventListener('htmx:responseError', (event) => setRepositoryResultsBusy(event, false));
+        function announceRepositoryResults(results) {{
+            if (!results || results.id !== 'repo-results') return;
+            const status = document.getElementById('repo-search-announcement');
+            const next = results.getAttribute('data-search-announcement') || '';
+            if (status && next && status.textContent !== next) status.textContent = next;
+        }}
+        document.body.addEventListener('htmx:afterSwap', (event) => {{
+            announceRepositoryResults(document.getElementById('repo-results'));
+        }});
+        document.body.addEventListener('htmx:responseError', (event) => {{
+            const trigger = event.detail && event.detail.elt;
+            const xhr = event.detail && event.detail.xhr;
+            if (!trigger || !xhr || !(trigger.id === 'repository-search' || trigger.getAttribute('hx-target') === '#repo-results')) return;
+            const contentType = xhr.getResponseHeader('content-type') || '';
+            if (!contentType.includes('text/html')) return;
+            const template = document.createElement('template');
+            template.innerHTML = xhr.responseText;
+            const replacement = template.content.firstElementChild;
+            const current = document.getElementById('repo-results');
+            if (!replacement || replacement.id !== 'repo-results' || !current) return;
+            current.replaceWith(replacement);
+            announceRepositoryResults(replacement);
+        }});
+
+        function setIndexLoadingBusy(event, busy) {{
+            const trigger = event.detail && event.detail.elt;
+            if (!trigger || trigger.id !== 'index-loading-content') return;
+            const status = document.getElementById('index-loading-status');
+            if (status) status.setAttribute('aria-busy', String(busy));
+        }}
+        document.body.addEventListener('htmx:beforeRequest', (event) => setIndexLoadingBusy(event, true));
+        document.body.addEventListener('htmx:afterRequest', (event) => setIndexLoadingBusy(event, false));
+        document.body.addEventListener('htmx:responseError', (event) => setIndexLoadingBusy(event, false));
+        document.body.addEventListener('htmx:afterSwap', (event) => {{
+            const target = document.getElementById('index-loading-content');
+            if (!target || target.id !== 'index-loading-content') return;
+            const announcement = document.getElementById('index-loading-announcement');
+            const next = target.getAttribute('data-index-announcement') || '';
+            if (announcement && next && announcement.textContent !== next) announcement.textContent = next;
+        }});
+
+        if (sidebarBreakpoint.addEventListener) {{
+            sidebarBreakpoint.addEventListener('change', syncSidebarForViewport);
+        }} else {{
+            sidebarBreakpoint.addListener(syncSidebarForViewport);
+        }}
+        syncSidebarForViewport();
 
         function setLang(lang) {{
             document.cookie = 'nora_lang=' + lang + ';path=/;max-age=31536000';
@@ -120,7 +278,12 @@ pub fn layout_dark_filtered(
         sidebar_dark_with_registries(active_page, t, auth_enabled, enabled_registries),
         header_dark(lang),
         content,
-        extra_scripts
+        extra_scripts,
+        close_navigation = t.close_navigation_menu,
+        skip_to_content = t.skip_to_content,
+        favicon_version = favicon_asset_version(),
+        tailwind_version = tailwind_asset_version(),
+        htmx_version = htmx_asset_version(),
     )
 }
 
@@ -303,6 +466,11 @@ pub fn sidebar_dark_with_registries(
         } else {
             "text-slate-300 hover:bg-slate-700 hover:text-white"
         };
+        let aria_current = if is_active {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
 
         let (fill_attr, stroke_attr) = if is_stroke {
             ("none", r#" stroke="currentColor""#)
@@ -312,14 +480,14 @@ pub fn sidebar_dark_with_registries(
 
         format!(
             r##"
-            <a href="{}" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+            <a href="{}"{} class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
                 <svg class="w-5 h-5 mr-3" fill="{}"{} viewBox="0 0 24 24">
                     {}
                 </svg>
                 {}
             </a>
         "##,
-            href, active_class, fill_attr, stroke_attr, icon_path, label
+            href, aria_current, active_class, fill_attr, stroke_attr, icon_path, label
         )
     };
 
@@ -362,10 +530,15 @@ pub fn sidebar_dark_with_registries(
         } else {
             "text-slate-300 hover:bg-slate-700 hover:text-white"
         };
+        let tokens_current = if active == "tokens" {
+            r#" aria-current="page""#
+        } else {
+            ""
+        };
         format!(
             r##"
                 <div class="border-t border-slate-700 mt-6 pt-4">
-                    <a href="/ui/tokens" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+                    <a href="/ui/tokens"{} class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
                         <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
                         </svg>
@@ -373,7 +546,7 @@ pub fn sidebar_dark_with_registries(
                     </a>
                 </div>
             "##,
-            tokens_active, t.nav_tokens
+            tokens_current, tokens_active, t.nav_tokens
         )
     } else {
         String::new()
@@ -381,18 +554,18 @@ pub fn sidebar_dark_with_registries(
 
     format!(
         r#"
-        <div id="sidebar" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
+        <div id="sidebar" aria-label="{primary_navigation}" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
             <div class="h-16 flex items-center justify-between px-6 border-b border-slate-700">
                 <div class="flex items-center">
                     <span class="text-xl font-bold tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
                 </div>
-                <button onclick="toggleSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
+                <button type="button" data-sidebar-control data-sidebar-close aria-label="{close_navigation}" aria-controls="sidebar" aria-expanded="false" onclick="closeSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
                     </svg>
                 </button>
             </div>
-            <nav class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
+            <nav aria-label="{primary_navigation}" class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
                 {}
                 {}
                 {}
@@ -404,12 +577,18 @@ pub fn sidebar_dark_with_registries(
             </div>
         </div>
     "#,
-        dashboard_html, registries_section, admin_section, VERSION
+        dashboard_html,
+        registries_section,
+        admin_section,
+        VERSION,
+        close_navigation = t.close_navigation_menu,
+        primary_navigation = t.primary_navigation,
     )
 }
 
 /// Dark theme header with language switcher
 fn header_dark(lang: Lang) -> String {
+    let t = get_translations(lang);
     let (en_class, ru_class, zh_class) = match lang {
         Lang::En => (
             "text-white font-semibold",
@@ -430,32 +609,29 @@ fn header_dark(lang: Lang) -> String {
 
     format!(
         r##"
-        <header class="h-16 bg-[#1e293b] border-b border-slate-700 flex items-center justify-between px-4 md:px-6">
-            <div class="flex items-center">
-                <button onclick="toggleSidebar()" class="md:hidden p-2 -ml-2 mr-2 rounded-lg hover:bg-slate-700">
+        <header class="h-16 bg-[#1e293b] border-b border-slate-700 flex items-center justify-between px-3 md:px-6">
+            <div class="flex items-center flex-shrink-0">
+                <button type="button" data-sidebar-control aria-label="{open_navigation}" aria-controls="sidebar" aria-expanded="false" onclick="openSidebar(this)" class="md:hidden p-2 -ml-2 mr-2 rounded-lg hover:bg-slate-700">
                     <svg class="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
                     </svg>
                 </button>
-                <div class="md:hidden flex items-center">
-                    <span class="font-bold text-slate-200 tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
-                </div>
             </div>
-            <div class="flex items-center space-x-2 md:space-x-4">
+            <div class="flex items-center gap-1 md:gap-4 min-w-0">
                 <!-- Language switcher -->
-                <div class="flex items-center border border-slate-600 rounded-lg overflow-hidden text-sm">
-                    <button onclick="setLang('en')" class="px-3 py-1.5 {} transition-colors">EN</button>
-                    <span class="text-slate-600">|</span>
-                    <button onclick="setLang('ru')" class="px-3 py-1.5 {} transition-colors">RU</button>
-                    <span class="text-slate-600">|</span>
-                    <button onclick="setLang('zh')" class="px-3 py-1.5 {} transition-colors">中文</button>
+                <div role="group" aria-label="{language_selector}" class="flex items-center border border-slate-600 rounded-lg overflow-hidden text-sm">
+                    <button type="button" lang="en" aria-pressed="{}" onclick="setLang('en')" class="px-2 md:px-3 py-1.5 {} transition-colors">EN</button>
+                    <span aria-hidden="true" class="text-slate-600">|</span>
+                    <button type="button" lang="ru" aria-pressed="{}" onclick="setLang('ru')" class="px-2 md:px-3 py-1.5 {} transition-colors">RU</button>
+                    <span aria-hidden="true" class="text-slate-600">|</span>
+                    <button type="button" lang="zh" aria-pressed="{}" onclick="setLang('zh')" class="px-2 md:px-3 py-1.5 {} transition-colors">中文</button>
                 </div>
-                <a href="https://github.com/getnora-io/nora" target="_blank" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg">
+                <a href="https://github.com/getnora-io/nora" target="_blank" rel="noopener noreferrer" aria-label="{github_link}" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg">
                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                         <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
                     </svg>
                 </a>
-                <a href="/api-docs" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg" title="API Docs">
+                <a href="/api-docs" aria-label="{api_documentation}" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg" title="{api_documentation}">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                     </svg>
@@ -463,7 +639,16 @@ fn header_dark(lang: Lang) -> String {
             </div>
         </header>
     "##,
-        en_class, ru_class, zh_class
+        lang == Lang::En,
+        en_class,
+        lang == Lang::Ru,
+        ru_class,
+        lang == Lang::Zh,
+        zh_class,
+        open_navigation = t.open_navigation_menu,
+        language_selector = t.language_selector,
+        github_link = t.github_link,
+        api_documentation = t.api_documentation,
     )
 }
 
@@ -484,21 +669,21 @@ pub fn render_global_stats(
     format!(
         r##"
         <div class="grid grid-cols-2 md:grid-cols-4 gap-2 md:gap-4 mb-6">
-            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help min-w-0" title="{}">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
-                <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+                <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200 min-w-0 break-all leading-tight">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help min-w-0" title="{}">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
-                <div id="stat-uploads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+                <div id="stat-uploads" class="text-base md:text-2xl font-bold text-slate-200 min-w-0 break-all leading-tight">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 min-w-0">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
-                <div id="stat-artifacts" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+                <div id="stat-artifacts" class="text-base md:text-2xl font-bold text-slate-200 min-w-0 break-all leading-tight">{}</div>
             </div>
-            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help min-w-0" title="{}">
                 <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
-                <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200">{:.1}%</div>
+                <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200 min-w-0 break-all leading-tight">{:.1}%</div>
             </div>
         </div>
         "##,
@@ -549,19 +734,19 @@ pub fn render_registry_card(
             <div class="text-xs md:text-sm font-semibold text-slate-200 mb-1 md:mb-2 leading-tight">{}</div>
             <div class="grid grid-cols-2 gap-1 text-xs">
                 <div>
-                    <span class="text-slate-500">{}</span>
+                    <span class="text-slate-400">{}</span>
                     <div class="text-slate-300 font-medium">{}</div>
                 </div>
                 <div>
-                    <span class="text-slate-500">{}</span>
+                    <span class="text-slate-400">{}</span>
                     <div class="text-slate-300 font-medium">{}</div>
                 </div>
                 <div>
-                    <span class="text-slate-500">{}</span>
+                    <span class="text-slate-400">{}</span>
                     <div class="text-slate-300 font-medium">{}</div>
                 </div>
                 <div>
-                    <span class="text-slate-500">{}</span>
+                    <span class="text-slate-400">{}</span>
                     <div class="text-slate-300 font-medium">{}</div>
                 </div>
             </div>
@@ -603,9 +788,9 @@ pub fn render_mount_points_table(
             format!(
                 r##"
                 <tr class="border-b border-slate-700">
-                    <td class="px-4 py-3 text-slate-300">{}</td>
-                    <td class="px-4 py-3 font-mono text-blue-400">{}</td>
-                    <td class="px-4 py-3 text-slate-400">{}</td>
+                    <td class="px-4 py-3 text-slate-300 break-all">{}</td>
+                    <td class="px-4 py-3 font-mono text-blue-400 break-all">{}</td>
+                    <td class="px-4 py-3 text-slate-400 break-all">{}</td>
                 </tr>
                 "##,
                 html_escape(registry),
@@ -617,17 +802,22 @@ pub fn render_mount_points_table(
 
     format!(
         r##"
-        <div class="bg-[#1e293b] rounded-lg border border-slate-700 overflow-hidden">
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 min-w-0">
             <div class="px-4 py-3 border-b border-slate-700">
-                <h3 class="text-slate-200 font-semibold">{}</h3>
+                <h3 id="mount-points-heading" class="text-slate-200 font-semibold">{}</h3>
             </div>
-            <div class="overflow-auto max-h-80">
-                <table class="w-full">
-                    <thead class="sticky top-0 bg-slate-800">
-                        <tr class="text-left text-xs text-slate-500 uppercase border-b border-slate-700">
-                            <th class="px-4 py-2">{}</th>
-                            <th class="px-4 py-2">{}</th>
-                            <th class="px-4 py-2">{}</th>
+            <div role="region" aria-labelledby="mount-points-heading" tabindex="0" class="overflow-x-auto">
+                <table class="w-full" style="min-width: 40rem; table-layout: fixed;">
+                    <colgroup>
+                        <col style="width: 20%;">
+                        <col style="width: 35%;">
+                        <col style="width: 45%;">
+                    </colgroup>
+                    <thead class="bg-slate-800">
+                        <tr class="text-left text-xs text-slate-400 uppercase border-b border-slate-700">
+                            <th scope="col" class="px-4 py-2">{}</th>
+                            <th scope="col" class="px-4 py-2">{}</th>
+                            <th scope="col" class="px-4 py-2">{}</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -660,11 +850,11 @@ pub fn render_activity_row(
     format!(
         r##"
         <tr class="border-b border-slate-700/50 text-sm">
-            <td class="px-4 py-2 text-slate-500">{}</td>
+            <td class="px-4 py-2 text-slate-400">{}</td>
             <td class="px-4 py-2 font-medium {}"><span class="px-2 py-0.5 bg-slate-700 rounded">{}</span></td>
             <td class="px-4 py-2 text-slate-300 font-mono text-xs">{}</td>
             <td class="px-4 py-2 text-slate-400">{}</td>
-            <td class="px-4 py-2 text-slate-500">{}</td>
+            <td class="px-4 py-2 text-slate-400">{}</td>
         </tr>
         "##,
         html_escape(timestamp),
@@ -682,13 +872,13 @@ pub fn render_activity_log(rows: &str, t: &Translations) -> String {
         r##"
         <div class="bg-[#1e293b] rounded-lg border border-slate-700 overflow-hidden">
             <div class="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
-                <h3 class="text-slate-200 font-semibold">{}</h3>
-                <span class="text-xs text-slate-500">{}</span>
+                <h3 id="recent-activity-heading" class="text-slate-200 font-semibold">{}</h3>
+                <span class="text-xs text-slate-400">{}</span>
             </div>
-            <div class="overflow-auto max-h-80">
+            <div role="region" aria-labelledby="recent-activity-heading" tabindex="0" class="overflow-auto max-h-80">
                 <table class="w-full" id="activity-log">
                     <thead class="sticky top-0 bg-slate-800">
-                        <tr class="text-left text-xs text-slate-500 uppercase border-b border-slate-700">
+                        <tr class="text-left text-xs text-slate-400 uppercase border-b border-slate-700">
                             <th class="px-4 py-2">{}</th>
                             <th class="px-4 py-2">{}</th>
                             <th class="px-4 py-2">{}</th>
@@ -791,9 +981,10 @@ pub fn html_escape(s: &str) -> String {
 
 /// Validate that a URL is safe to use in an `href` attribute.
 ///
-/// Returns the trimmed URL if the scheme is `http` or `https` (case-insensitive),
-/// `None` otherwise. Strips leading ASCII control characters and whitespace
-/// to prevent bypass via `\x00javascript:` or `\tjavascript:` patterns.
+/// Returns the trimmed URL if the scheme is `http` or `https` (case-insensitive)
+/// and it has a non-empty, syntactically safe authority; `None` otherwise.
+/// Strips leading ASCII control characters and whitespace to prevent bypass via
+/// `\x00javascript:` or `\tjavascript:` patterns.
 ///
 /// # Security
 /// This prevents `javascript:`, `data:`, `vbscript:`, `blob:`, `file:` and
@@ -807,9 +998,30 @@ pub fn sanitize_href(url: &str) -> Option<&str> {
 
     // Check for https:// (8 bytes) or http:// (7 bytes) prefix, case-insensitive.
     // All prefix chars are ASCII so byte comparison is safe and avoids char boundary issues.
-    let is_safe = (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"))
-        || (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"));
-    let result = if is_safe { Some(trimmed) } else { None };
+    let scheme_len = if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        Some(8)
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        Some(7)
+    } else {
+        None
+    };
+
+    let result = scheme_len.and_then(|scheme_len| {
+        let remainder = &trimmed[scheme_len..];
+        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+        let authority = &remainder[..authority_end];
+
+        // A scheme prefix without an authority (`http://`, `http:///path`) is
+        // not a usable absolute URL. Whitespace/control characters and a
+        // backslash are not valid in a URI authority and can be interpreted
+        // inconsistently by browsers, so fail closed instead of linking it.
+        let authority_is_valid = !authority.is_empty()
+            && !authority
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '\\');
+
+        authority_is_valid.then_some(trimmed)
+    });
 
     // --- POSTCONDITION ---
     debug_assert!(
@@ -1063,6 +1275,104 @@ mod tests {
         let html = render_global_stats(1, 2, 3, 4.0, Lang::En);
         assert!(!html.contains("stat-storage"));
         assert!(html.contains("stat-artifacts"));
+        assert_eq!(html.matches("min-w-0 break-all leading-tight").count(), 4);
+    }
+
+    #[test]
+    fn layout_exposes_accessible_mobile_sidebar_controls() {
+        let enabled = HashSet::new();
+        let html = layout_dark_filtered(
+            "Test",
+            "<p>content</p>",
+            Some("dashboard"),
+            "",
+            Lang::En,
+            false,
+            Some(&enabled),
+        );
+
+        assert!(html.contains("data-sidebar-control"));
+        assert!(html.contains("data-sidebar-close"));
+        assert!(html.contains("aria-label=\"Open navigation menu\""));
+        assert!(html.contains("aria-label=\"Close navigation menu\""));
+        assert!(html.contains("href=\"#main-content\""));
+        assert!(html.contains("id=\"main-content\" tabindex=\"-1\""));
+        assert!(html.contains("href=\"/ui/\" aria-current=\"page\""));
+        assert!(html.contains("aria-controls=\"sidebar\" aria-expanded=\"false\""));
+        assert!(html.contains("appContent.setAttribute('inert', '')"));
+        assert!(html.contains("appContent.setAttribute('aria-hidden', 'true')"));
+        assert!(html.contains("sidebar.setAttribute('inert', '')"));
+        assert!(html.contains("sidebar.removeAttribute('inert')"));
+        assert!(html.contains("event.key === 'Escape'"));
+        assert!(html.contains("event.key === 'Tab'"));
+        assert!(html.contains("document.activeElement === last"));
+        assert!(html.contains("sidebar.setAttribute('aria-modal', 'true')"));
+        assert!(html.contains("sidebar.removeAttribute('aria-modal')"));
+        assert!(html.contains("const wasModalOpen"));
+        assert!(html.contains("a[aria-current=\"page\"]"));
+        assert!(html.contains("if (closeControl) closeControl.focus()"));
+        assert!(html.contains("if (restoreFocus && focusTarget && focusTarget.isConnected)"));
+    }
+
+    #[test]
+    fn header_exposes_language_and_icon_link_names() {
+        let html = header_dark(Lang::Ru);
+
+        assert!(html.contains("role=\"group\" aria-label=\"Язык\""));
+        assert!(html.contains("lang=\"en\" aria-pressed=\"false\""));
+        assert!(html.contains("lang=\"ru\" aria-pressed=\"true\""));
+        assert!(html.contains("lang=\"zh\" aria-pressed=\"false\""));
+        assert!(html.contains("aria-label=\"NORA на GitHub\""));
+        assert!(html.contains("aria-label=\"Документация API\""));
+    }
+
+    #[test]
+    fn layout_declares_versioned_svg_favicon() {
+        let enabled = HashSet::new();
+        let html = layout_dark_filtered("Test", "", None, "", Lang::En, false, Some(&enabled));
+        let expected = format!(
+            "<link rel=\"icon\" type=\"image/svg+xml\" sizes=\"any\" href=\"/favicon.svg?v={}\">",
+            favicon_asset_version()
+        );
+
+        assert!(html.contains(&expected));
+        assert!(html.contains(&format!(
+            "href=\"/ui/static/tailwind.css?v={}\"",
+            tailwind_asset_version()
+        )));
+        assert!(html.contains(&format!(
+            "src=\"/ui/static/htmx.min.js?v={}\"",
+            htmx_asset_version()
+        )));
+    }
+
+    #[test]
+    fn mount_points_use_one_named_horizontal_scroll_region() {
+        let t = get_translations(Lang::En);
+        let html = render_mount_points_table(
+            &[(
+                "Maven".to_string(),
+                "/repository/maven-releases/with/a/very/long/path".to_string(),
+                vec!["https://upstream.example/with/a/very/long/path".to_string()],
+            )],
+            t,
+        );
+
+        assert!(html.contains("role=\"region\" aria-labelledby=\"mount-points-heading\""));
+        assert!(html.contains("class=\"overflow-x-auto\""));
+        assert!(!html.contains("overflow-auto max-h-80"));
+        assert_eq!(html.matches("break-all").count(), 3);
+        assert_eq!(html.matches("scope=\"col\"").count(), 3);
+    }
+
+    #[test]
+    fn recent_activity_uses_a_named_scroll_region() {
+        let html = render_activity_log("", get_translations(Lang::En));
+
+        assert!(html.contains("id=\"recent-activity-heading\""));
+        assert!(html.contains(
+            "role=\"region\" aria-labelledby=\"recent-activity-heading\" tabindex=\"0\""
+        ));
     }
 
     #[test]
@@ -1209,8 +1519,30 @@ mod tests {
         assert_eq!(sanitize_href(""), None);
         assert_eq!(sanitize_href("http"), None);
         assert_eq!(sanitize_href("http:/"), None);
-        // "http://" (7 bytes) passes — it's a valid http scheme prefix, not dangerous
-        assert_eq!(sanitize_href("http://"), Some("http://"));
+        assert_eq!(sanitize_href("http://"), None);
+        assert_eq!(sanitize_href("https://"), None);
+        assert_eq!(sanitize_href("http:///"), None);
+        assert_eq!(sanitize_href("https:///path"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_invalid_authority() {
+        assert_eq!(sanitize_href("http:// example.com"), None);
+        assert_eq!(sanitize_href("http://example .com/path"), None);
+        assert_eq!(sanitize_href("http://\texample.com"), None);
+        assert_eq!(sanitize_href("http://example.com\\attacker.example"), None);
+    }
+
+    #[test]
+    fn sanitize_href_preserves_valid_authority_and_path() {
+        assert_eq!(
+            sanitize_href("https://example.com/path?q=value#fragment"),
+            Some("https://example.com/path?q=value#fragment")
+        );
+        assert_eq!(
+            sanitize_href("http://localhost:8080/health"),
+            Some("http://localhost:8080/health")
+        );
     }
 
     #[test]
@@ -1239,8 +1571,11 @@ mod tests {
         }
 
         #[test]
-        fn sanitize_href_preserves_valid_http(suffix in "[a-zA-Z0-9./-]{1,100}") {
-            let url = format!("https://{}", suffix);
+        fn sanitize_href_preserves_valid_http(
+            host in "[a-zA-Z0-9][a-zA-Z0-9-]{0,30}",
+            path in "[a-zA-Z0-9./-]{0,60}"
+        ) {
+            let url = format!("https://{}.example/{}", host, path);
             prop_assert_eq!(sanitize_href(&url), Some(url.as_str()));
         }
 

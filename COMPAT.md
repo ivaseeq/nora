@@ -414,6 +414,8 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
 | 405 Method Not Allowed + Allow | Full | RFC 9110 §15.5.6, multi-method routes return Allow header |
 | Prometheus metrics | Full | `/metrics` endpoint |
 | Health check | Full | `/health` |
+| Storage readiness | Full | `/ready`; cached storage reachability only |
+| Maven/npm index readiness | Full | `/ready/index`; a current-proof clean, compatible, fully caught-up persistent generation is ready immediately; legacy, dirty or unclean state waits for startup reconciliation |
 | Swagger/OpenAPI | Full | `/api-docs` |
 | S3 backend | Full | AWS S3, Ceph RGW and compatible object stores. Named Maven/npm still require one NORA writer; see note below. |
 | GCS backend | Full | Native Google Cloud Storage (`storage.mode = "gcs"`): Workload Identity / service-account JSON / ambient credentials; endpoint override for emulators and Private Google Access. The same single-writer requirement applies. Hash-pinning (at-rest integrity verification) is unavailable on ALL object-store backends, not only S3. |
@@ -429,3 +431,11 @@ Helm charts are stored as OCI artifacts via the Docker registry endpoints. `helm
   one immutable key from replacement, but mutable Maven/npm metadata spans
   multiple keys and is coordinated by an in-process lock. Exact-key CAS is not
   a distributed transaction and does not make a multi-replica deployment safe.
+- **The persistent Maven/npm redb database is derived state.** S3 remains the
+  authority for artifacts and protocol metadata. Losing the database or its PVC
+  causes browse/search warm-up and a full reconciliation, never artifact loss.
+  A warm database supplies bounded range pagination and a last-good UI snapshot
+  while reconciliation runs only when its S3/topology identity still matches;
+  an incompatible generation is hidden until rebuilt. This path is S3-only and
+  does not replace S3 validation on artifact GET/HEAD/Range or make a shared-PVC
+  multi-replica deployment supported.

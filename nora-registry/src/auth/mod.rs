@@ -121,7 +121,10 @@ fn is_web_surface(path: &str) -> bool {
     if path.starts_with("/ui/tokens") || path.starts_with("/api/ui/tokens") {
         return false;
     }
-    path.starts_with("/ui") || path.starts_with("/api/ui") || path.starts_with("/api-docs")
+    path.starts_with("/ui")
+        || path.starts_with("/api/ui")
+        || path.starts_with("/api-docs")
+        || matches!(path, "/favicon.ico" | "/favicon.svg")
 }
 
 /// Check if a path belongs to the Docker/OCI registry (`/v2`, `/v2/…`).
@@ -617,7 +620,14 @@ mod tests {
         ] {
             assert!(!is_public_path(p), "{p}");
         }
-        for p in ["/ui", "/ui/rpm", "/api/ui/stats", "/api-docs"] {
+        for p in [
+            "/ui",
+            "/ui/rpm",
+            "/api/ui/stats",
+            "/api-docs",
+            "/favicon.ico",
+            "/favicon.svg",
+        ] {
             assert!(is_web_surface(p), "{p}");
         }
         // Token pages are part of the always-gated set, not the web surface.
@@ -1674,6 +1684,13 @@ Jd74nq6dNCjpWG4drIsyhqX+
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            background_mutations: tokio_util::task::TaskTracker::new(),
+            background_mutation_aborts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            startup_reconcile_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            background_mutation_permits: Arc::new(tokio::sync::Semaphore::new(
+                crate::BACKGROUND_MUTATION_CONCURRENCY,
+            )),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         // Rebuild router with new state

@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "ar"
@@ -2486,8 +2486,10 @@ dependencies = [
  "proptest",
  "quick-xml",
  "rand 0.8.6",
+ "redb",
  "reqwest 0.12.28",
  "rpm",
+ "rustix",
  "ruzstd",
  "semver",
  "serde",
@@ -3360,6 +3362,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "redb"
+version = "4.1.0"
+source = "git+https://github.com/cberner/redb?rev=c419f099fd55a7905d0f5370c1508070bf7ac14c#c419f099fd55a7905d0f5370c1508070bf7ac14c"
+dependencies = [
+ "libc",
+ "log",
 ]
 
 [[package]]
@@ -4400,6 +4411,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

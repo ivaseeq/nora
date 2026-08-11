@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
@@ -12,7 +12,15 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{FileMeta, Result, StorageBackend, StorageError};
+use super::{FileMeta, Result, StorageBackend, StorageError, StorageListStream};
+
+struct AbortOnDropJoinHandle(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDropJoinHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Downloads stream store -> server -> client under backpressure, so a slow
 /// download client paces the store read. object_store's request timeout covers
@@ -61,7 +69,7 @@ fn streaming_retry_config(options: ObjectStoreOptions) -> object_store::RetryCon
 /// `object_store` crate. Everything past construction goes through the
 /// [`ObjectStore`] trait, so both providers share one implementation.
 pub struct ObjectStorage {
-    store: Box<dyn ObjectStore>,
+    store: std::sync::Arc<dyn ObjectStore>,
     /// "s3" or "gcs" — surfaced in /health.
     name: &'static str,
     /// Outcome of the last background refresh, served by `health_check()`.
@@ -146,7 +154,7 @@ impl ObjectStorage {
         let store = builder.build().expect("Failed to build S3 client");
 
         Self {
-            store: Box::new(store),
+            store: std::sync::Arc::new(store),
             name: "s3",
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
@@ -213,7 +221,7 @@ impl ObjectStorage {
         let store = builder.build().expect("Failed to build GCS client");
 
         Self {
-            store: Box::new(store),
+            store: std::sync::Arc::new(store),
             name: "gcs",
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
@@ -353,36 +361,51 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
-        let encoded = encode_object_key(prefix);
-        let prefix_path = Path::from(encoded);
-        let list_prefix = if prefix.is_empty() {
-            None
-        } else {
-            Some(&prefix_path)
-        };
-
-        let objects: Vec<_> = self
-            .store
-            .list(list_prefix)
+        self.list_with_meta_stream(prefix)
+            .await?
             .try_collect()
             .await
-            .map_err(|e| StorageError::Network(e.to_string()))?;
+    }
 
-        // The LIST response already carries size/last_modified — reuse it
-        // instead of issuing a HEAD per key (#738).
-        Ok(objects
-            .into_iter()
-            .map(|meta| {
-                let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
-                (
-                    decode_object_key(meta.location.as_ref()),
-                    FileMeta {
-                        size: meta.size,
-                        modified,
-                    },
-                )
-            })
-            .collect())
+    async fn list_with_meta_stream(&self, prefix: &str) -> Result<StorageListStream> {
+        let encoded = encode_object_key(prefix);
+        let prefix_path = Path::from(encoded);
+        let has_prefix = !prefix.is_empty();
+        let store = std::sync::Arc::clone(&self.store);
+        // A bounded channel detaches object_store's borrowed listing stream
+        // from this trait method without materialising all ObjectMeta values.
+        // Backpressure reaches the provider stream when the redb consumer is
+        // slower than LIST pagination.
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let producer = tokio::spawn(async move {
+            let list_prefix = has_prefix.then_some(&prefix_path);
+            let mut objects = store.list(list_prefix);
+            while let Some(result) = objects.next().await {
+                let mapped = result
+                    .map(|meta| {
+                        let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
+                        (
+                            decode_object_key(meta.location.as_ref()),
+                            FileMeta {
+                                size: meta.size,
+                                modified,
+                                etag: meta.e_tag,
+                                version_id: meta.version,
+                            },
+                        )
+                    })
+                    .map_err(|error| StorageError::Network(error.to_string()));
+                let terminal = mapped.is_err();
+                if tx.send(mapped).await.is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        let producer = AbortOnDropJoinHandle(producer);
+        Ok(Box::pin(futures::stream::unfold(
+            (rx, producer),
+            |(mut rx, producer)| async move { rx.recv().await.map(|item| (item, (rx, producer))) },
+        )))
     }
 
     async fn stat(&self, key: &str) -> Result<Option<FileMeta>> {
@@ -408,6 +431,8 @@ impl StorageBackend for ObjectStorage {
         Ok(Some(FileMeta {
             size: meta.size,
             modified,
+            etag: meta.e_tag,
+            version_id: meta.version,
         }))
     }
 
@@ -562,6 +587,35 @@ impl StorageBackend for ObjectStorage {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn dropping_list_stream_guard_aborts_detached_producer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let task_flag = std::sync::Arc::clone(&dropped);
+        let handle = tokio::spawn(async move {
+            let _flag = DropFlag(task_flag);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        drop(AbortOnDropJoinHandle(handle));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting the stream producer must drop its future");
+    }
+
     #[test]
     fn test_backend_name() {
         let storage = ObjectStorage::new(
@@ -620,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn reachability_refresh_marks_a_live_store_ready() {
         let storage = ObjectStorage {
-            store: Box::new(object_store::memory::InMemory::new()),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             name: "s3",
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
@@ -681,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn scoped_key_lists_and_gets_through_path_encoding() {
         let storage = ObjectStorage {
-            store: Box::new(object_store::memory::InMemory::new()),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             name: "s3",
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
@@ -720,7 +774,7 @@ mod tests {
     async fn concurrent_put_if_absent_has_exactly_one_winner() {
         const CONTENDERS: usize = 16;
         let storage = std::sync::Arc::new(ObjectStorage {
-            store: Box::new(object_store::memory::InMemory::new()),
+            store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             name: "s3",
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),

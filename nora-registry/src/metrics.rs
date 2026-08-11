@@ -323,6 +323,161 @@ pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create STORAGE_BYTES metric at startup")
 });
 
+/// Persistent Maven/npm derived-index state (0=warming, 1=ready, 2=degraded).
+pub static INDEX_STATE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_state",
+        "Persistent Maven/npm derived-index state (0=warming, 1=ready, 2=degraded)"
+    )
+    .expect("failed to create INDEX_STATE metric at startup")
+});
+
+/// Monotonic published redb generation.
+pub static INDEX_GENERATION: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_generation",
+        "Published persistent Maven/npm derived-index generation"
+    )
+    .expect("failed to create INDEX_GENERATION metric at startup")
+});
+
+/// Durable accepted changes not yet included by the active slot watermark.
+pub static INDEX_PENDING_CHANGES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_pending_changes",
+        "Accepted persistent-index changes not yet covered by the active generation"
+    )
+    .expect("failed to create INDEX_PENDING_CHANGES metric at startup")
+});
+
+/// Current redb file size. This is derived metadata only, never artifact bytes.
+pub static INDEX_DATABASE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_database_bytes",
+        "Persistent derived-index database file size in bytes"
+    )
+    .expect("failed to create INDEX_DATABASE_BYTES metric at startup")
+});
+
+/// Existing derived DBs preserved after the isolated preflight exceeded its
+/// startup budget and NORA fell back to a fresh S3-backed reseed.
+pub static INDEX_PREFLIGHT_TIMEOUT_RESEED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_index_preflight_timeout_reseed_total",
+        "Persistent derived-index reseeds after a child preflight timeout"
+    )
+    .expect("failed to create INDEX_PREFLIGHT_TIMEOUT_RESEED_TOTAL metric at startup")
+});
+
+/// Reconciliation outcomes, using bounded non-sensitive error classes.
+pub static INDEX_RECONCILE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_reconcile_total",
+        "Persistent derived-index reconciliation outcomes",
+        &["result", "error_class"]
+    )
+    .expect("failed to create INDEX_RECONCILE_TOTAL metric at startup")
+});
+
+/// End-to-end duration of each full persistent-index reconciliation attempt.
+pub static INDEX_RECONCILE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_reconcile_duration_seconds",
+        "Persistent derived-index full reconciliation duration",
+        &["result"],
+        vec![0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0]
+    )
+    .expect("failed to create INDEX_RECONCILE_DURATION_SECONDS metric at startup")
+});
+
+/// Major full-reconcile stage duration. Stage names are fixed and separate S3
+/// inventory work from npm authority projection work.
+pub static INDEX_RECONCILE_STAGE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_reconcile_stage_duration_seconds",
+        "Persistent-index full reconciliation stage duration",
+        &["stage", "result"],
+        vec![0.01, 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0]
+    )
+    .expect("failed to create INDEX_RECONCILE_STAGE_DURATION_SECONDS metric at startup")
+});
+
+/// Durable redb writer commands by bounded command class and outcome. Labels
+/// are a fixed enum and never contain repository, package, path or credential
+/// material.
+pub static INDEX_REDB_COMMAND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_redb_commands_total",
+        "Persistent-index redb writer commands",
+        &["command", "result"]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_TOTAL metric at startup")
+});
+
+/// Time spent inside one synchronous Immediate+2PC redb writer command.
+pub static INDEX_REDB_COMMAND_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_duration_seconds",
+        "Persistent-index redb writer command duration",
+        &["command", "result"],
+        vec![
+            0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            60.0,
+        ]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_DURATION_SECONDS metric at startup")
+});
+
+/// Number of rows admitted to one redb writer command.
+pub static INDEX_REDB_COMMAND_ROWS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_rows",
+        "Rows admitted to one persistent-index redb writer command",
+        &["command"],
+        vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_ROWS metric at startup")
+});
+
+/// Exact key plus serialized envelope bytes admitted to one bounded batch.
+pub static INDEX_REDB_COMMAND_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_bytes",
+        "Encoded key and envelope bytes admitted to one persistent-index redb writer command",
+        &["command"],
+        vec![
+            1024.0,
+            16_384.0,
+            65_536.0,
+            262_144.0,
+            1_048_576.0,
+            4_194_304.0,
+            8_388_608.0,
+        ]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_BYTES metric at startup")
+});
+
+/// npm package authority decisions made by a full S2. This is intentionally
+/// aggregate-only: package and repository names never become metric labels.
+pub static INDEX_NPM_RECONCILE_PACKAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_npm_reconcile_packages_total",
+        "npm packages processed by persistent-index reconciliation",
+        &["outcome"]
+    )
+    .expect("failed to create INDEX_NPM_RECONCILE_PACKAGES_TOTAL metric at startup")
+});
+
+/// Unix timestamp of the last successful full persistent-index reconciliation.
+pub static INDEX_LAST_SUCCESS_TIMESTAMP: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_last_success_timestamp_seconds",
+        "Unix timestamp of the last successful full persistent-index reconciliation"
+    )
+    .expect("failed to create INDEX_LAST_SUCCESS_TIMESTAMP metric at startup")
+});
+
 /// Process uptime in seconds (gauge)
 pub static UPTIME_SECONDS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!("nora_uptime_seconds", "Process uptime in seconds")
@@ -337,6 +492,19 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         &["registry", "operation"]
     )
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
+});
+
+/// Optional proxy-cache materializations rejected before spawning because the
+/// bounded background writer pool is saturated. The upstream response has
+/// already been produced, so rejecting this derived cache write protects
+/// process memory without failing the client request.
+pub static BACKGROUND_CACHE_DROPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_background_cache_dropped_total",
+        "Optional proxy-cache writes dropped because the background writer pool is saturated",
+        &["registry"]
+    )
+    .expect("failed to create BACKGROUND_CACHE_DROPPED_TOTAL metric at startup")
 });
 
 /// Corrupt metadata detected during publish.

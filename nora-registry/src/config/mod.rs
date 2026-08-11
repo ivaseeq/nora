@@ -12,6 +12,7 @@ mod auth;
 mod circuit_breaker;
 mod curation;
 mod gc;
+mod index;
 mod proxy_cache_cleanup;
 mod rate_limit;
 mod registries;
@@ -35,6 +36,7 @@ pub use self::curation::{
     CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
 };
 pub use self::gc::GcConfig;
+pub use self::index::IndexConfig;
 pub use self::proxy_cache_cleanup::ProxyCacheCleanupConfig;
 pub use self::rate_limit::RateLimitConfig;
 pub use self::registries::{EnableSpec, RegistriesSection};
@@ -128,6 +130,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub index: IndexConfig,
     #[serde(default)]
     pub maven: MavenConfig,
     #[serde(default)]
@@ -763,6 +767,12 @@ impl Config {
                 errors.push("storage.health_probe_timeout_secs must be greater than 0".to_string());
             }
         }
+        if self.index.path.trim().is_empty() {
+            errors.push("index.path must not be empty".to_string());
+        }
+        if self.index.reconcile_interval_secs < 60 {
+            errors.push("index.reconcile_interval_secs must be at least 60".to_string());
+        }
 
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
@@ -1129,6 +1139,7 @@ impl Config {
 
         // Storage (fail-closed: unknown NORA_STORAGE_MODE is fatal)
         self.storage.apply_env_overrides()?;
+        self.index.apply_env_overrides();
 
         // Auth
         self.auth.apply_env_overrides();

@@ -9,24 +9,96 @@
 //! - One worker rebuilds active registries sequentially, bounding storage scan concurrency
 //! - Protocol callers may wait for the generation visible when their request began
 
+mod persistent_builder;
+mod redb_store;
+
+pub(crate) use persistent_builder::{PersistentIndexPhase, PersistentIndexProgress};
+pub(crate) use redb_store::{
+    preflight_database, ChangeEvent, ChildPreflight, PersistentIndex, StoreError, StoredNpmPackage,
+    StoredNpmVersion, MAX_QUERY_EXAMINED,
+};
+
+use crate::config::Config;
 use crate::registry_type::RegistryType;
-use crate::storage::{FileMeta, Storage};
+use crate::storage::{
+    FileMeta, Storage, StorageMutation, StorageMutationObserver, StorageMutationOutcome,
+};
 use crate::ui::components::format_timestamp;
 use crate::validation::ends_with_ci;
-use parking_lot::RwLock;
+use arc_swap::ArcSwapOption;
+use parking_lot::{Mutex, RwLock};
 use rand::Rng as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify, Semaphore};
 use tokio::time::Instant;
 use tracing::info;
 use utoipa::ToSchema;
 
 const INDEX_RETRY_BASE_SECS: u64 = 30;
 const INDEX_RETRY_MAX_SECS: u64 = 300;
+const SEMANTIC_CHANGE_CONCURRENCY: usize = 8;
+// Version 2 establishes the process-clean proof required for immediate warm
+// Ready. Version 1 binaries could persist `clean_shutdown=true` despite an
+// in-memory reconciliation gap, so every legacy PVC must perform one
+// authoritative S2 before its projection can be reused.
+const PERSISTENT_TOPOLOGY_SCHEMA: u64 = 2;
+
+fn index_error_class(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::AlreadyOpen => "already_open",
+        StoreError::Schema(_) => "schema",
+        StoreError::WriterUnavailable => "writer_unavailable",
+        StoreError::Superseded => "superseded",
+        StoreError::TransactionTooLarge => "transaction_too_large",
+        StoreError::DiskAdmission(_) => "disk_admission",
+        StoreError::Serialization(_) => "serialization",
+        StoreError::Database(_) => "database",
+        StoreError::Io(_) => "io",
+        StoreError::PreflightUnavailable(_) => "preflight_unavailable",
+    }
+}
+
+fn reconcile_error_class(error: &persistent_builder::ReconcileError) -> &'static str {
+    match error {
+        persistent_builder::ReconcileError::Store(error) => index_error_class(error),
+        persistent_builder::ReconcileError::Storage(_) => "storage",
+        persistent_builder::ReconcileError::Serialization(_) => "serialization",
+        persistent_builder::ReconcileError::NpmAuthority { reason, .. } => reason,
+    }
+}
+
+fn persistent_config_digest(config: &Config) -> Result<String, StoreError> {
+    persistent_config_digest_with_schema(config, PERSISTENT_TOPOLOGY_SCHEMA)
+}
+
+fn persistent_config_digest_with_schema(
+    config: &Config,
+    topology_schema: u64,
+) -> Result<String, StoreError> {
+    // Credentials are skipped by the config serializers. The digest binds a
+    // reusable DB to its storage identity and Maven/npm topology without ever
+    // storing or logging the source document.
+    let topology = serde_json::json!({
+        "schema": topology_schema,
+        "storage": {
+            "mode": &config.storage.mode,
+            "local_path": &config.storage.path,
+            "s3_endpoint": &config.storage.s3_url,
+            "bucket": &config.storage.bucket,
+            "region": &config.storage.s3_region,
+            "virtual_hosted": config.storage.s3_virtual_hosted,
+        },
+        "maven": &config.maven,
+        "npm": &config.npm,
+    });
+    let bytes = serde_json::to_vec(&topology)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
 
 fn index_retry_ceiling_secs(attempt: u32) -> u64 {
     INDEX_RETRY_BASE_SECS
@@ -41,7 +113,7 @@ fn index_retry_delay(attempt: u32) -> Duration {
 }
 
 /// Repository info for UI display
-#[derive(Debug, Clone, Serialize, ToSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct RepoInfo {
     pub name: String,
     pub versions: usize,
@@ -66,10 +138,82 @@ pub struct IndexedObject {
     pub meta: FileMeta,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalIndexedObject {
+    pub(crate) path: String,
+    pub(crate) meta: FileMeta,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistentRepoPage {
+    pub(crate) items: Vec<RepoInfo>,
+    pub(crate) next_after: Option<Vec<u8>>,
+    pub(crate) generation: u64,
+    pub(crate) config_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistentMavenPage {
+    pub(crate) items: Vec<RepoInfo>,
+    pub(crate) next_after: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) config_digest: String,
+    pub(crate) has_direct_files: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistentMavenFilePage {
+    pub(crate) items: Vec<(String, FileMeta)>,
+    pub(crate) next_after: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) config_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistentObjectRevision {
+    pub(crate) db_uuid: String,
+    pub(crate) active_slot: Option<redb_store::Slot>,
+    pub(crate) generation: u64,
+    pub(crate) watermark: u64,
+    pub(crate) config_digest: String,
+}
+
+impl PersistentObjectRevision {
+    fn from_meta(meta: &redb_store::MetaState) -> Self {
+        Self {
+            db_uuid: meta.db_uuid.clone(),
+            active_slot: meta.active_slot,
+            generation: meta.generation,
+            watermark: meta.active_watermark(),
+            config_digest: meta.config_digest.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistentObjectPage {
+    pub(crate) items: Vec<IndexedObject>,
+    pub(crate) next_after: Option<Vec<u8>>,
+    pub(crate) revision: PersistentObjectRevision,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepoQuery {
+    pub(crate) registry: String,
+    pub(crate) after: Option<Vec<u8>>,
+    pub(crate) filter: Option<String>,
+    pub(crate) limit: usize,
+    pub(crate) max_examined: usize,
+    pub(crate) deadline: Duration,
+    pub(crate) name_prefix: Option<String>,
+    pub(crate) before_name: Option<String>,
+    pub(crate) allowed_repositories: Option<Vec<String>>,
+}
+
 /// Minimal hosted npm search document derived from the same validated full
 /// generation as the repository row. Request handlers filter and render this
 /// projection in memory; split version/tag objects are never a search oracle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct NpmSearchDocument {
     pub(crate) repository: String,
     pub(crate) package: String,
@@ -368,6 +512,653 @@ pub struct RepoIndex {
     /// debounce operator-triggered reindex so a tight `reindex + read` loop
     /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
     last_reindex: AtomicU64,
+    persistent: Option<Arc<PersistentRuntime>>,
+}
+
+struct PersistentRuntime {
+    /// Replaceable derived-index handle. S3 remains available while this is
+    /// `None`; index-backed UI is 503 and mutations are fail-closed until the
+    /// background recovery loop reopens/reseeds and reconciles it.
+    index: ArcSwapOption<PersistentIndex>,
+    index_path: std::path::PathBuf,
+    storage: Storage,
+    config_digest: String,
+    reconcile_interval: Duration,
+    maven_enabled: bool,
+    maven_named: bool,
+    npm_enabled: bool,
+    requested_sequence: AtomicU64,
+    published_sequence: AtomicU64,
+    request_epoch: AtomicU64,
+    resolved_epoch: AtomicU64,
+    /// Highest request epoch that only a complete authoritative S3 reconcile
+    /// may resolve. Zero means no such recovery is pending. Unlike a boolean,
+    /// the monotonic epoch cannot be cleared by an older async completion.
+    reconcile_required_through: AtomicU64,
+    status: AtomicU8,
+    notify: Notify,
+    /// Serializes mutation admission, writer-handle replacement, and
+    /// readiness publication. S3 preparation remains concurrent; only the
+    /// small O(1) fence state is protected by this non-async lock.
+    fence: Mutex<PersistentFenceState>,
+    fence_notify: Notify,
+    fence_cancel: tokio_util::sync::CancellationToken,
+    fence_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fence_started: AtomicBool,
+    #[cfg(test)]
+    physical_admission_barrier: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    publication_barrier: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+    #[cfg(test)]
+    semantic_registration_barrier:
+        Mutex<Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>>,
+    #[cfg(test)]
+    reconcile_retry_scheduled: Notify,
+    #[cfg(test)]
+    reconcile_retry_delay_millis: AtomicU64,
+    #[cfg(test)]
+    background_waiting: Notify,
+    #[cfg(test)]
+    shutdown_waiting: Notify,
+    semantic_tasks: tokio_util::task::TaskTracker,
+    semantic_abort_handles: Mutex<Vec<tokio::task::AbortHandle>>,
+    semantic_permits: Arc<Semaphore>,
+    background_started: AtomicBool,
+    initial_reconciled: AtomicBool,
+    projection_usable: AtomicBool,
+    progress: persistent_builder::ReconcileProgress,
+    maven_artifacts: AtomicU64,
+    maven_bytes: AtomicU64,
+    npm_versions: AtomicU64,
+    npm_bytes: AtomicU64,
+}
+
+struct PhysicalReceipt {
+    ticket: u64,
+    index: Arc<PersistentIndex>,
+    receive: oneshot::Receiver<Result<u64, StoreError>>,
+}
+
+#[derive(Default)]
+struct PersistentFenceState {
+    /// Number of semantic repairs that were admitted but have not completed
+    /// (including aborted tasks whose drop guard has not run yet).
+    semantic_inflight: u64,
+    /// Monotonic in-memory ticket for physical writer admissions. The newest
+    /// FIFO writer receipt fences every older receipt, so only one receiver is
+    /// retained regardless of mutation volume.
+    physical_admitted: u64,
+    physical_acked: u64,
+    latest_physical_receipt: Option<PhysicalReceipt>,
+}
+
+fn persistent_reconcile_retry_delay(_runtime: &PersistentRuntime, attempt: u32) -> Duration {
+    #[cfg(test)]
+    {
+        let millis = _runtime
+            .reconcile_retry_delay_millis
+            .load(Ordering::Acquire);
+        if millis != 0 {
+            return Duration::from_millis(millis);
+        }
+    }
+    index_retry_delay(attempt)
+}
+
+#[cfg(test)]
+fn wait_test_fence_barrier(
+    barrier: &Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+) {
+    if let Some((captured, release)) = barrier.lock().clone() {
+        captured.wait();
+        release.wait();
+    }
+}
+
+#[cfg(test)]
+fn wait_test_fence_barrier_in_place(
+    barrier: &Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
+) {
+    if let Some((captured, release)) = barrier.lock().clone() {
+        // This hook deliberately holds the short publication fence while the
+        // test swaps writers. Tell Tokio that the synchronous barrier blocks
+        // so it can replace this worker under a parallel test load.
+        tokio::task::block_in_place(|| {
+            captured.wait();
+            release.wait();
+        });
+    }
+}
+
+fn publish_persistent_meta_locked(
+    runtime: &PersistentRuntime,
+    meta: &redb_store::MetaState,
+    _fence: &PersistentFenceState,
+) {
+    runtime
+        .maven_artifacts
+        .store(meta.totals.maven_artifacts, Ordering::Release);
+    runtime
+        .maven_bytes
+        .store(meta.totals.maven_bytes, Ordering::Release);
+    runtime
+        .npm_versions
+        .store(meta.totals.npm_versions, Ordering::Release);
+    runtime
+        .npm_bytes
+        .store(meta.totals.npm_bytes, Ordering::Release);
+    crate::metrics::INDEX_GENERATION.set(i64::try_from(meta.generation).unwrap_or(i64::MAX));
+    crate::metrics::INDEX_PENDING_CHANGES.set(
+        i64::try_from(
+            meta.accepted_change_seq
+                .saturating_sub(meta.active_watermark()),
+        )
+        .unwrap_or(i64::MAX),
+    );
+}
+
+fn publish_index_database_bytes(runtime: &PersistentRuntime) {
+    // Keep potentially slow PVC metadata I/O outside the fence critical
+    // section. This gauge is observational and need not be transactionally
+    // coupled to generation publication.
+    let database_bytes = std::fs::metadata(&runtime.index_path).map_or(0, |meta| meta.len());
+    crate::metrics::INDEX_DATABASE_BYTES.set(i64::try_from(database_bytes).unwrap_or(i64::MAX));
+}
+
+fn current_persistent_index(
+    runtime: &PersistentRuntime,
+) -> Result<Arc<PersistentIndex>, StoreError> {
+    runtime
+        .index
+        .load_full()
+        .filter(|index| index.writer_healthy())
+        .ok_or(StoreError::WriterUnavailable)
+}
+
+fn is_current_persistent_index(
+    runtime: &PersistentRuntime,
+    candidate: &Arc<PersistentIndex>,
+) -> bool {
+    runtime
+        .index
+        .load_full()
+        .is_some_and(|current| Arc::ptr_eq(&current, candidate))
+}
+
+fn is_current_persistent_index_locked(
+    runtime: &PersistentRuntime,
+    candidate: &Arc<PersistentIndex>,
+    _fence: &PersistentFenceState,
+) -> bool {
+    is_current_persistent_index(runtime, candidate)
+}
+
+fn current_request_epoch_locked(runtime: &PersistentRuntime, _fence: &PersistentFenceState) -> u64 {
+    runtime.request_epoch.load(Ordering::Acquire).max(1)
+}
+
+fn require_full_reconcile_locked(runtime: &PersistentRuntime, fence: &PersistentFenceState) {
+    let epoch = current_request_epoch_locked(runtime, fence);
+    runtime
+        .reconcile_required_through
+        .fetch_max(epoch, Ordering::AcqRel);
+    runtime.notify.notify_one();
+}
+
+#[cfg(test)]
+fn require_full_reconcile(runtime: &PersistentRuntime) {
+    let fence = runtime.fence.lock();
+    require_full_reconcile_locked(runtime, &fence);
+}
+
+fn full_reconcile_required_locked(
+    runtime: &PersistentRuntime,
+    _fence: &PersistentFenceState,
+) -> bool {
+    runtime.reconcile_required_through.load(Ordering::Acquire) != 0
+}
+
+fn full_reconcile_required(runtime: &PersistentRuntime) -> bool {
+    let fence = runtime.fence.lock();
+    full_reconcile_required_locked(runtime, &fence)
+}
+
+/// Clear only requirements that existed before the completed authoritative
+/// scan. A concurrent/newer failure retains its larger epoch and therefore
+/// cannot be erased by this older completion.
+fn resolve_full_reconcile_through_locked(
+    runtime: &PersistentRuntime,
+    observed_epoch: u64,
+    _fence: &PersistentFenceState,
+) -> bool {
+    loop {
+        let required = runtime.reconcile_required_through.load(Ordering::Acquire);
+        if required == 0 {
+            return true;
+        }
+        if required > observed_epoch {
+            return false;
+        }
+        if runtime
+            .reconcile_required_through
+            .compare_exchange(required, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn persistent_projection_index(
+    runtime: &PersistentRuntime,
+) -> Result<Arc<PersistentIndex>, StoreError> {
+    if !runtime.projection_usable.load(Ordering::Acquire) {
+        return Err(StoreError::WriterUnavailable);
+    }
+    current_persistent_index(runtime)
+}
+
+async fn recover_persistent_index(
+    runtime: &PersistentRuntime,
+) -> Result<Arc<PersistentIndex>, StoreError> {
+    if let Ok(index) = current_persistent_index(runtime) {
+        return Ok(index);
+    }
+
+    runtime.progress.reset(PersistentIndexPhase::Recovering);
+
+    let old = {
+        let mut fence = runtime.fence.lock();
+        runtime.projection_usable.store(false, Ordering::Release);
+        store_persistent_status_locked(runtime, IndexStatus::Degraded, &fence);
+        fence.latest_physical_receipt = None;
+        fence.physical_admitted = 0;
+        fence.physical_acked = 0;
+        runtime.index.swap(None)
+    };
+    if let Some(old) = old {
+        old.shutdown().await;
+        drop(old);
+    }
+
+    let index = PersistentIndex::open_after_child_preflight(
+        &runtime.index_path,
+        runtime.config_digest.clone(),
+    )
+    .await?;
+    let meta = index.meta().await?;
+    let compatible = meta.active_slot.is_some()
+        && meta.config_digest == runtime.config_digest
+        && (!runtime.maven_enabled || meta.completeness.maven)
+        && (!runtime.npm_enabled || meta.completeness.npm);
+    {
+        let fence = runtime.fence.lock();
+        runtime
+            .requested_sequence
+            .store(meta.accepted_change_seq, Ordering::Release);
+        runtime.published_sequence.store(
+            if compatible {
+                meta.active_watermark()
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
+        runtime.resolved_epoch.store(0, Ordering::Release);
+        runtime.initial_reconciled.store(false, Ordering::Release);
+        require_full_reconcile_locked(runtime, &fence);
+        publish_persistent_meta_locked(runtime, &meta, &fence);
+        runtime.index.store(Some(Arc::clone(&index)));
+        runtime
+            .projection_usable
+            .store(compatible, Ordering::Release);
+        store_persistent_status_locked(runtime, IndexStatus::Warming, &fence);
+    }
+    publish_index_database_bytes(runtime);
+    runtime.fence_notify.notify_one();
+    Ok(index)
+}
+
+fn publish_pending_change_count_locked(runtime: &PersistentRuntime, _fence: &PersistentFenceState) {
+    let sequence_pending = runtime
+        .requested_sequence
+        .load(Ordering::Acquire)
+        .saturating_sub(runtime.published_sequence.load(Ordering::Acquire));
+    let epoch_pending = runtime
+        .request_epoch
+        .load(Ordering::Acquire)
+        .saturating_sub(runtime.resolved_epoch.load(Ordering::Acquire));
+    crate::metrics::INDEX_PENDING_CHANGES
+        .set(i64::try_from(sequence_pending.max(epoch_pending)).unwrap_or(i64::MAX));
+}
+
+fn store_persistent_status_locked(
+    runtime: &PersistentRuntime,
+    status: IndexStatus,
+    _fence: &PersistentFenceState,
+) {
+    let value = match status {
+        IndexStatus::Warming => 0,
+        IndexStatus::Ready => 1,
+        IndexStatus::Degraded => 2,
+    };
+    runtime.status.store(value, Ordering::Release);
+    crate::metrics::INDEX_STATE.set(i64::from(value));
+}
+
+struct SemanticInflightGuard {
+    runtime: Arc<PersistentRuntime>,
+    armed: bool,
+}
+
+impl SemanticInflightGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SemanticInflightGuard {
+    fn drop(&mut self) {
+        let mut fence = self.runtime.fence.lock();
+        fence.semantic_inflight = fence.semantic_inflight.saturating_sub(1);
+        if self.armed {
+            // A cancelled or unwound typed repair may have stopped before its
+            // durable registration or publication. Never infer completion
+            // from the inflight count alone: force authoritative anti-entropy.
+            store_persistent_status_locked(&self.runtime, IndexStatus::Degraded, &fence);
+            require_full_reconcile_locked(&self.runtime, &fence);
+        }
+        publish_pending_change_count_locked(&self.runtime, &fence);
+        drop(fence);
+        if self.armed {
+            tracing::warn!(
+                "semantic derived-index repair ended abnormally; authoritative reconciliation required"
+            );
+            self.runtime.notify.notify_one();
+        }
+        self.runtime.fence_notify.notify_one();
+    }
+}
+
+fn spawn_semantic_task(
+    runtime: &Arc<PersistentRuntime>,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let handle = runtime.semantic_tasks.spawn(task);
+    let abort = handle.abort_handle();
+    drop(handle);
+    let mut handles = runtime.semantic_abort_handles.lock();
+    handles.retain(|handle| !handle.is_finished());
+    handles.push(abort);
+}
+
+fn ensure_persistent_fence(runtime: &Arc<PersistentRuntime>) {
+    if runtime
+        .fence_started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        runtime.fence_notify.notify_one();
+        return;
+    }
+    let task_runtime = Arc::clone(runtime);
+    let handle = tokio::spawn(async move {
+        run_persistent_fence(task_runtime).await;
+    });
+    *runtime.fence_task.lock() = Some(handle);
+    runtime.fence_notify.notify_one();
+}
+
+async fn settle_persistent_fence(runtime: &Arc<PersistentRuntime>) {
+    let candidate = {
+        let fence = runtime.fence.lock();
+        if fence.semantic_inflight != 0
+            || fence.physical_acked < fence.physical_admitted
+            || fence.latest_physical_receipt.is_some()
+            || !runtime.initial_reconciled.load(Ordering::Acquire)
+            || !runtime.projection_usable.load(Ordering::Acquire)
+            || full_reconcile_required_locked(runtime, &fence)
+        {
+            return;
+        }
+        let Ok(index) = current_persistent_index(runtime) else {
+            store_persistent_status_locked(runtime, IndexStatus::Degraded, &fence);
+            require_full_reconcile_locked(runtime, &fence);
+            return;
+        };
+        (
+            index,
+            current_request_epoch_locked(runtime, &fence),
+            fence.physical_admitted,
+        )
+    };
+
+    let (index, observed_epoch, observed_physical) = candidate;
+    let meta = match index.meta().await {
+        Ok(meta) => meta,
+        Err(error) => {
+            let fence = runtime.fence.lock();
+            if is_current_persistent_index_locked(runtime, &index, &fence) {
+                store_persistent_status_locked(runtime, IndexStatus::Degraded, &fence);
+                require_full_reconcile_locked(runtime, &fence);
+            }
+            tracing::warn!(
+                error_class = %index_error_class(&error),
+                "derived-index fence could not read the writer watermark"
+            );
+            return;
+        }
+    };
+
+    {
+        let fence = runtime.fence.lock();
+        if !is_current_persistent_index_locked(runtime, &index, &fence)
+            || fence.semantic_inflight != 0
+            || fence.physical_acked < fence.physical_admitted
+            || fence.latest_physical_receipt.is_some()
+            || fence.physical_admitted != observed_physical
+            || current_request_epoch_locked(runtime, &fence) != observed_epoch
+            || full_reconcile_required_locked(runtime, &fence)
+        {
+            return;
+        }
+        runtime
+            .requested_sequence
+            .fetch_max(meta.accepted_change_seq, Ordering::AcqRel);
+        let active_watermark = meta.active_watermark();
+        let caught_up = !meta.global_dirty
+            && meta.accepted_change_seq <= active_watermark
+            && runtime.requested_sequence.load(Ordering::Acquire) <= active_watermark;
+        if caught_up {
+            runtime
+                .published_sequence
+                .fetch_max(active_watermark, Ordering::AcqRel);
+            runtime
+                .resolved_epoch
+                .fetch_max(observed_epoch, Ordering::AcqRel);
+            publish_persistent_meta_locked(runtime, &meta, &fence);
+            publish_pending_change_count_locked(runtime, &fence);
+            store_persistent_status_locked(runtime, IndexStatus::Ready, &fence);
+        } else {
+            publish_pending_change_count_locked(runtime, &fence);
+            store_persistent_status_locked(runtime, IndexStatus::Warming, &fence);
+        }
+    }
+    publish_index_database_bytes(runtime);
+}
+
+async fn run_persistent_fence(runtime: Arc<PersistentRuntime>) {
+    loop {
+        if runtime.fence_cancel.is_cancelled() {
+            return;
+        }
+
+        loop {
+            let receipt = {
+                let mut fence = runtime.fence.lock();
+                fence.latest_physical_receipt.take()
+            };
+            let Some(receipt) = receipt else {
+                break;
+            };
+
+            // CANCEL-SAFETY: dropping the receipt receiver does not cancel the
+            // already-admitted FIFO writer command. This branch is used only
+            // during shutdown; the next startup reconcile repairs any gap.
+            let result = tokio::select! {
+                _ = runtime.fence_cancel.cancelled() => return,
+                result = receipt.receive => result,
+            };
+            let mut fence = runtime.fence.lock();
+            if !is_current_persistent_index_locked(runtime.as_ref(), &receipt.index, &fence) {
+                continue;
+            }
+            fence.physical_acked = fence.physical_acked.max(receipt.ticket);
+            match result {
+                Ok(Ok(sequence)) => {
+                    runtime
+                        .requested_sequence
+                        .fetch_max(sequence, Ordering::AcqRel);
+                }
+                Ok(Err(error)) => {
+                    store_persistent_status_locked(runtime.as_ref(), IndexStatus::Degraded, &fence);
+                    require_full_reconcile_locked(runtime.as_ref(), &fence);
+                    tracing::warn!(
+                        error_class = %index_error_class(&error),
+                        "physical derived-index invalidation failed in the writer"
+                    );
+                }
+                Err(_) => {
+                    store_persistent_status_locked(runtime.as_ref(), IndexStatus::Degraded, &fence);
+                    require_full_reconcile_locked(runtime.as_ref(), &fence);
+                    tracing::warn!(
+                        "physical derived-index invalidation receipt closed before acknowledgement"
+                    );
+                }
+            }
+            publish_pending_change_count_locked(runtime.as_ref(), &fence);
+        }
+
+        settle_persistent_fence(&runtime).await;
+        // `notify_one` drives new coordinator work. Shutdown waiters need a
+        // non-stored progress edge after the coordinator has acknowledged a
+        // receipt and republished readiness; otherwise both sides can sleep on
+        // the same Notify until the entire shutdown deadline expires.
+        runtime.fence_notify.notify_waiters();
+
+        // CANCEL-SAFETY: cancellation exits permanently. A coalesced Notify
+        // permit may be consumed only on the branch that immediately loops
+        // and drains the newest receipt/state.
+        tokio::select! {
+            _ = runtime.fence_cancel.cancelled() => return,
+            _ = runtime.fence_notify.notified() => {},
+        }
+    }
+}
+
+async fn process_persistent_change(
+    runtime: Arc<PersistentRuntime>,
+    event_epoch: u64,
+    event: ChangeEvent,
+) {
+    let index = match current_persistent_index(&runtime) {
+        Ok(index) => index,
+        Err(error) => {
+            let fence = runtime.fence.lock();
+            store_persistent_status_locked(&runtime, IndexStatus::Degraded, &fence);
+            require_full_reconcile_locked(&runtime, &fence);
+            tracing::warn!(
+                error_class = %index_error_class(&error),
+                "derived-index mutation deferred until writer recovery"
+            );
+            return;
+        }
+    };
+    #[cfg(test)]
+    let registration_barrier = { runtime.semantic_registration_barrier.lock().clone() };
+    #[cfg(test)]
+    if let Some((captured, release)) = registration_barrier {
+        captured.wait().await;
+        release.wait().await;
+    }
+    match index.register_change(event.clone()).await {
+        Ok(sequence) => {
+            {
+                let fence = runtime.fence.lock();
+                if !is_current_persistent_index_locked(&runtime, &index, &fence) {
+                    require_full_reconcile_locked(&runtime, &fence);
+                    tracing::debug!(
+                        event_epoch,
+                        "discarded derived-index registration completed by a superseded writer"
+                    );
+                    return;
+                }
+                #[cfg(test)]
+                wait_test_fence_barrier_in_place(&runtime.publication_barrier);
+                runtime
+                    .requested_sequence
+                    .fetch_max(sequence, Ordering::AcqRel);
+                publish_pending_change_count_locked(&runtime, &fence);
+            }
+            if runtime.initial_reconciled.load(Ordering::Acquire)
+                && !matches!(
+                    event,
+                    ChangeEvent::GlobalDirty | ChangeEvent::PhysicalDirty { .. }
+                )
+            {
+                match persistent_builder::apply_change(
+                    Arc::clone(&index),
+                    runtime.storage.clone(),
+                    sequence,
+                    event,
+                )
+                .await
+                {
+                    Ok(meta) => {
+                        {
+                            let fence = runtime.fence.lock();
+                            if !is_current_persistent_index_locked(&runtime, &index, &fence) {
+                                require_full_reconcile_locked(&runtime, &fence);
+                                tracing::debug!(
+                                    event_epoch,
+                                    "discarded incremental repair completed by a superseded writer"
+                                );
+                                return;
+                            }
+                            publish_persistent_meta_locked(&runtime, &meta, &fence);
+                            runtime
+                                .published_sequence
+                                .fetch_max(meta.active_watermark(), Ordering::AcqRel);
+                            publish_pending_change_count_locked(&runtime, &fence);
+                        }
+                        publish_index_database_bytes(&runtime);
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = %reconcile_error_class(&error),
+                            "incremental index repair deferred to full reconciliation"
+                        );
+                    }
+                }
+            }
+            let fence = runtime.fence.lock();
+            require_full_reconcile_locked(&runtime, &fence);
+        }
+        Err(error) => {
+            let fence = runtime.fence.lock();
+            if !is_current_persistent_index_locked(&runtime, &index, &fence) {
+                require_full_reconcile_locked(&runtime, &fence);
+                return;
+            }
+            store_persistent_status_locked(&runtime, IndexStatus::Degraded, &fence);
+            require_full_reconcile_locked(&runtime, &fence);
+            tracing::error!(
+                error_class = %index_error_class(&error),
+                "failed to persist derived-index invalidation"
+            );
+        }
+    }
 }
 
 impl RepoIndex {
@@ -382,7 +1173,692 @@ impl RepoIndex {
             notify: Arc::new(Notify::new()),
             background_started: AtomicBool::new(false),
             last_reindex: AtomicU64::new(0),
+            persistent: None,
         }
+    }
+
+    pub async fn open_persistent(
+        config: &Config,
+        enabled: &HashSet<RegistryType>,
+        storage: Storage,
+    ) -> Result<Arc<Self>, StoreError> {
+        if config.storage.mode != crate::config::StorageMode::S3 {
+            return Ok(Arc::new(Self::new()));
+        }
+        if !enabled.contains(&RegistryType::Maven) && !enabled.contains(&RegistryType::Npm) {
+            return Ok(Arc::new(Self::new()));
+        }
+        let digest = persistent_config_digest(config)?;
+        let persistent = match PersistentIndex::open_after_child_preflight(
+            &config.index.path,
+            digest.clone(),
+        )
+        .await
+        {
+            Ok(index) => Some(index),
+            Err(StoreError::AlreadyOpen) => return Err(StoreError::AlreadyOpen),
+            Err(error) => {
+                tracing::error!(
+                    error_class = %index_error_class(&error),
+                    "persistent index unavailable at startup; protocol listener will start while recovery retries"
+                );
+                None
+            }
+        };
+        let meta = match &persistent {
+            Some(index) => Some(index.meta().await?),
+            None => None,
+        };
+        Self::from_persistent(config, enabled, storage, persistent, meta, digest).await
+    }
+
+    async fn from_persistent(
+        config: &Config,
+        enabled: &HashSet<RegistryType>,
+        storage: Storage,
+        persistent: Option<Arc<PersistentIndex>>,
+        meta: Option<redb_store::MetaState>,
+        digest: String,
+    ) -> Result<Arc<Self>, StoreError> {
+        let maven_enabled = enabled.contains(&RegistryType::Maven);
+        let npm_enabled = enabled.contains(&RegistryType::Npm);
+        let persisted_is_usable = meta.as_ref().is_some_and(|meta| {
+            meta.active_slot.is_some()
+                && meta.config_digest == digest
+                && (!maven_enabled || meta.completeness.maven)
+                && (!npm_enabled || meta.completeness.npm)
+        });
+        let persisted_is_clean = persisted_is_usable
+            && persistent
+                .as_ref()
+                .is_some_and(|index| index.startup_clean())
+            && meta.as_ref().is_some_and(|meta| {
+                !meta.global_dirty && meta.accepted_change_seq == meta.active_watermark()
+            });
+        let accepted_change_seq = meta.as_ref().map_or(0, |meta| meta.accepted_change_seq);
+        let active_watermark = meta
+            .as_ref()
+            .map_or(0, redb_store::MetaState::active_watermark);
+        let totals = meta
+            .as_ref()
+            .map_or_else(redb_store::RegistryTotals::default, |meta| meta.totals);
+        let index_available = persistent.is_some();
+
+        let mut index = Self::new();
+        index.persistent = Some(Arc::new(PersistentRuntime {
+            index: ArcSwapOption::from(persistent),
+            index_path: std::path::PathBuf::from(&config.index.path),
+            storage,
+            config_digest: digest,
+            reconcile_interval: Duration::from_secs(config.index.reconcile_interval_secs),
+            maven_enabled,
+            maven_named: !config.maven.repositories.is_empty(),
+            npm_enabled,
+            requested_sequence: AtomicU64::new(accepted_change_seq),
+            published_sequence: AtomicU64::new(if persisted_is_usable {
+                active_watermark
+            } else {
+                0
+            }),
+            request_epoch: AtomicU64::new(1),
+            resolved_epoch: AtomicU64::new(u64::from(persisted_is_clean)),
+            // A child-preflighted clean database is already the durable result
+            // of every acknowledged local mutation through its watermark. It
+            // can publish immediately; periodic anti-entropy still checks for
+            // out-of-band S3 changes. Every weaker startup state reconciles
+            // fail-closed before publishing Ready.
+            reconcile_required_through: AtomicU64::new(u64::from(
+                (maven_enabled || npm_enabled) && !persisted_is_clean,
+            )),
+            status: AtomicU8::new(0),
+            notify: Notify::new(),
+            fence: Mutex::new(PersistentFenceState::default()),
+            fence_notify: Notify::new(),
+            fence_cancel: tokio_util::sync::CancellationToken::new(),
+            fence_task: Mutex::new(None),
+            fence_started: AtomicBool::new(false),
+            #[cfg(test)]
+            physical_admission_barrier: Mutex::new(None),
+            #[cfg(test)]
+            publication_barrier: Mutex::new(None),
+            #[cfg(test)]
+            semantic_registration_barrier: Mutex::new(None),
+            #[cfg(test)]
+            reconcile_retry_scheduled: Notify::new(),
+            #[cfg(test)]
+            reconcile_retry_delay_millis: AtomicU64::new(0),
+            #[cfg(test)]
+            background_waiting: Notify::new(),
+            #[cfg(test)]
+            shutdown_waiting: Notify::new(),
+            semantic_tasks: tokio_util::task::TaskTracker::new(),
+            semantic_abort_handles: Mutex::new(Vec::new()),
+            semantic_permits: Arc::new(Semaphore::new(SEMANTIC_CHANGE_CONCURRENCY)),
+            background_started: AtomicBool::new(false),
+            initial_reconciled: AtomicBool::new(persisted_is_clean),
+            projection_usable: AtomicBool::new(persisted_is_usable),
+            progress: persistent_builder::ReconcileProgress::new(if persisted_is_clean {
+                PersistentIndexPhase::Idle
+            } else if index_available {
+                PersistentIndexPhase::Preparing
+            } else {
+                PersistentIndexPhase::Recovering
+            }),
+            maven_artifacts: AtomicU64::new(totals.maven_artifacts),
+            maven_bytes: AtomicU64::new(totals.maven_bytes),
+            npm_versions: AtomicU64::new(totals.npm_versions),
+            npm_bytes: AtomicU64::new(totals.npm_bytes),
+        }));
+        if let Some(runtime) = &index.persistent {
+            let fence = runtime.fence.lock();
+            if let Some(meta) = &meta {
+                publish_persistent_meta_locked(runtime, meta, &fence);
+            }
+            store_persistent_status_locked(
+                runtime,
+                if persisted_is_clean {
+                    IndexStatus::Ready
+                } else if index_available {
+                    IndexStatus::Warming
+                } else {
+                    IndexStatus::Degraded
+                },
+                &fence,
+            );
+            if persisted_is_clean {
+                tracing::info!(
+                    generation = meta.as_ref().map_or(0, |meta| meta.generation),
+                    accepted_change_seq,
+                    "published clean persistent Maven/npm generation without startup S3 reconcile"
+                );
+            }
+        }
+        let index = Arc::new(index);
+        if let Some(runtime) = &index.persistent {
+            ensure_persistent_fence(runtime);
+        }
+        Ok(index)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_persistent_for_test(
+        config: &Config,
+        enabled: &HashSet<RegistryType>,
+        storage: Storage,
+    ) -> Result<Arc<Self>, StoreError> {
+        if !enabled.contains(&RegistryType::Maven) && !enabled.contains(&RegistryType::Npm) {
+            return Ok(Arc::new(Self::new()));
+        }
+        let digest = persistent_config_digest(config)?;
+        let persistent = PersistentIndex::open(&config.index.path, digest.clone())?;
+        let meta = persistent.meta().await?;
+        Self::from_persistent(
+            config,
+            enabled,
+            storage,
+            Some(persistent),
+            Some(meta),
+            digest,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reconcile_persistent_for_test(&self) -> Result<(), StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = current_persistent_index(runtime)?;
+        let meta = persistent_builder::reconcile_with_progress(
+            index,
+            runtime.storage.clone(),
+            runtime.config_digest.clone(),
+            runtime.maven_enabled,
+            runtime.npm_enabled,
+            &runtime.progress,
+        )
+        .await
+        .map_err(|error| match error {
+            persistent_builder::ReconcileError::Store(error) => error,
+            other => StoreError::Database(other.to_string()),
+        })?;
+        {
+            let fence = runtime.fence.lock();
+            publish_persistent_meta_locked(runtime, &meta, &fence);
+            runtime
+                .requested_sequence
+                .store(meta.accepted_change_seq, Ordering::Release);
+            runtime
+                .published_sequence
+                .store(meta.active_watermark(), Ordering::Release);
+            let observed_epoch = current_request_epoch_locked(runtime, &fence);
+            runtime
+                .resolved_epoch
+                .store(observed_epoch, Ordering::Release);
+            runtime
+                .reconcile_required_through
+                .store(0, Ordering::Release);
+            runtime.initial_reconciled.store(true, Ordering::Release);
+            runtime.projection_usable.store(true, Ordering::Release);
+            store_persistent_status_locked(runtime, IndexStatus::Ready, &fence);
+            runtime.progress.set_phase(PersistentIndexPhase::Idle);
+        }
+        publish_index_database_bytes(runtime);
+        runtime.fence_notify.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn persistent_meta_for_test(
+        &self,
+    ) -> Result<redb_store::MetaState, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        current_persistent_index(runtime)?.meta().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stop_persistent_writer_for_test(&self) -> Result<(), StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = current_persistent_index(runtime)?;
+        index.shutdown().await;
+        Ok(())
+    }
+
+    pub fn persistent_status(&self) -> Option<IndexStatus> {
+        let persistent = self.persistent.as_ref()?;
+        let _fence = persistent.fence.lock();
+        if current_persistent_index(persistent).is_err() {
+            return Some(IndexStatus::Degraded);
+        }
+        Some(IndexStatus::from_u8(
+            persistent.status.load(Ordering::Acquire),
+        ))
+    }
+
+    /// Whether the persistent Maven/npm projection can currently serve UI
+    /// queries. This is intentionally weaker than protocol readiness: an
+    /// unclean or reconciling index may still expose its last-good generation.
+    pub fn persistent_projection_available(&self) -> bool {
+        let Some(persistent) = &self.persistent else {
+            return true;
+        };
+        let _fence = persistent.fence.lock();
+        persistent.projection_usable.load(Ordering::Acquire)
+            && current_persistent_index(persistent).is_ok()
+    }
+
+    pub(crate) fn persistent_index_progress(&self) -> PersistentIndexProgress {
+        self.persistent.as_ref().map_or(
+            PersistentIndexProgress {
+                phase: PersistentIndexPhase::Idle,
+                maven_objects: 0,
+                npm_objects: 0,
+                npm_packages: 0,
+            },
+            |runtime| runtime.progress.snapshot(),
+        )
+    }
+
+    pub(crate) fn has_persistent(&self) -> bool {
+        self.persistent.is_some()
+    }
+
+    pub fn persistent_writer_healthy(&self) -> bool {
+        self.persistent
+            .as_ref()
+            .is_none_or(|runtime| current_persistent_index(runtime).is_ok())
+    }
+
+    pub fn persistent_protocol_ready(&self) -> bool {
+        let Some(runtime) = &self.persistent else {
+            return true;
+        };
+        if !runtime.maven_enabled && !runtime.npm_enabled {
+            return true;
+        }
+        let fence = runtime.fence.lock();
+        current_persistent_index(runtime).is_ok()
+            && runtime.status.load(Ordering::Acquire) == 1
+            && !full_reconcile_required_locked(runtime, &fence)
+            && fence.semantic_inflight == 0
+            && fence.physical_acked >= fence.physical_admitted
+            && fence.latest_physical_receipt.is_none()
+            && runtime.resolved_epoch.load(Ordering::Acquire)
+                >= runtime.request_epoch.load(Ordering::Acquire)
+            && runtime.published_sequence.load(Ordering::Acquire)
+                >= runtime.requested_sequence.load(Ordering::Acquire)
+    }
+
+    pub async fn shutdown_persistent(&self) {
+        self.shutdown_persistent_until(Instant::now() + Duration::from_secs(30), true)
+            .await;
+    }
+
+    pub(crate) async fn shutdown_persistent_until(&self, deadline: Instant, allow_clean: bool) {
+        if let Some(runtime) = &self.persistent {
+            runtime.semantic_tasks.close();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(remaining, runtime.semantic_tasks.wait())
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    active = runtime.semantic_tasks.len(),
+                    "persistent-index semantic tasks did not drain before writer shutdown"
+                );
+                let handles = std::mem::take(&mut *runtime.semantic_abort_handles.lock());
+                for handle in handles {
+                    handle.abort();
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let _ = tokio::time::timeout(remaining, runtime.semantic_tasks.wait()).await;
+            }
+            // Resolve a quiescent all-acked state synchronously. Relying only
+            // on a previously queued Notify can otherwise consume the entire
+            // shutdown deadline after the background S2 task has already
+            // stopped and no future event can wake the coordinator.
+            settle_persistent_fence(runtime).await;
+            let runtime_caught_up = loop {
+                if self.persistent_protocol_ready() {
+                    break true;
+                }
+                let may_settle = {
+                    let fence = runtime.fence.lock();
+                    current_persistent_index(runtime).is_ok()
+                        && runtime.initial_reconciled.load(Ordering::Acquire)
+                        && runtime.projection_usable.load(Ordering::Acquire)
+                        && !full_reconcile_required_locked(runtime, &fence)
+                        && fence.semantic_inflight == 0
+                        && (fence.physical_acked < fence.physical_admitted
+                            || fence.latest_physical_receipt.is_some())
+                };
+                if !may_settle || Instant::now() >= deadline {
+                    break false;
+                }
+                let notified = runtime.fence_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.persistent_protocol_ready() {
+                    break true;
+                }
+                #[cfg(test)]
+                runtime.shutdown_waiting.notify_waiters();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if tokio::time::timeout(remaining, &mut notified)
+                    .await
+                    .is_err()
+                {
+                    break false;
+                }
+            };
+            let mark_clean = if allow_clean && runtime_caught_up {
+                match current_persistent_index(runtime) {
+                    Ok(index) => index.meta().await.is_ok_and(|meta| {
+                        !meta.global_dirty && meta.accepted_change_seq == meta.active_watermark()
+                    }),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if !mark_clean {
+                tracing::warn!(
+                    allow_clean,
+                    "persistent index cannot prove a clean process and durable caught-up fence; preserving an unclean startup requirement"
+                );
+            }
+            runtime.fence_cancel.cancel();
+            let fence_task = runtime.fence_task.lock().take();
+            if let Some(mut handle) = fence_task {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if tokio::time::timeout(remaining, &mut handle).await.is_err() {
+                    handle.abort();
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let _ = tokio::time::timeout(remaining, handle).await;
+                }
+            }
+            let index = {
+                let mut fence = runtime.fence.lock();
+                fence.latest_physical_receipt = None;
+                runtime.index.swap(None)
+            };
+            if let Some(index) = index {
+                if mark_clean {
+                    index.shutdown_until(deadline).await;
+                } else {
+                    index.shutdown_unclean_until(deadline).await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn persistent_repo_page(
+        &self,
+        mut query: RepoQuery,
+    ) -> Result<PersistentRepoPage, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        query.max_examined = MAX_QUERY_EXAMINED;
+        query.deadline = Duration::from_millis(250);
+        let (items, next_after, generation) = index.query_repos(query).await?;
+        Ok(PersistentRepoPage {
+            items,
+            next_after,
+            generation,
+            config_digest: runtime.config_digest.clone(),
+        })
+    }
+
+    pub(crate) async fn persistent_maven_children(
+        &self,
+        prefixes: Vec<String>,
+        logical_path: String,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<PersistentMavenPage, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let (items, next_after, generation, has_direct_files) = index
+            .maven_children_page(prefixes, logical_path, after, limit)
+            .await?;
+        Ok(PersistentMavenPage {
+            items,
+            next_after,
+            generation,
+            config_digest: runtime.config_digest.clone(),
+            has_direct_files,
+        })
+    }
+
+    pub(crate) async fn persistent_maven_files(
+        &self,
+        prefixes: Vec<String>,
+        logical_path: String,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<PersistentMavenFilePage, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let (items, next_after, generation) = index
+            .maven_files_page(prefixes, logical_path, after, limit)
+            .await?;
+        Ok(PersistentMavenFilePage {
+            items,
+            next_after,
+            generation,
+            config_digest: runtime.config_digest.clone(),
+        })
+    }
+
+    /// Read at most `max_examined` Maven objects from one or more physical
+    /// prefixes. Prefix order implements Nexus-compatible first-member-wins
+    /// for groups. Every redb transaction is page-scoped and ends before the
+    /// next await.
+    pub(crate) async fn persistent_logical_objects(
+        &self,
+        prefixes: &[String],
+        max_examined: usize,
+    ) -> Result<(Vec<LogicalIndexedObject>, u64, bool), StoreError> {
+        if max_examined == 0 || max_examined > MAX_QUERY_EXAMINED {
+            return Err(StoreError::TransactionTooLarge);
+        }
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let before = index.meta().await?;
+        let Some(slot) = before.active_slot else {
+            return Ok((Vec::new(), before.generation, false));
+        };
+        let mut selected = BTreeMap::<String, FileMeta>::new();
+        let mut examined = 0usize;
+        let mut truncated = false;
+        for prefix in prefixes {
+            let mut after = None;
+            loop {
+                let remaining = max_examined.saturating_sub(examined);
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let page_limit = remaining.min(redb_store::MAX_TX_ROWS);
+                let (rows, next) = index
+                    .scan_objects(slot, prefix.as_bytes().to_vec(), after, page_limit)
+                    .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                examined = examined.saturating_add(rows.len());
+                for (key, meta) in rows {
+                    if let Some(path) = key.strip_prefix(prefix) {
+                        selected.entry(path.to_string()).or_insert(meta);
+                    }
+                }
+                if examined >= max_examined {
+                    truncated = next.is_some();
+                    break;
+                }
+                let Some(next) = next else { break };
+                after = Some(next);
+            }
+            if truncated {
+                break;
+            }
+        }
+        let after = index.meta().await?;
+        if after.generation != before.generation || after.active_slot != before.active_slot {
+            return Err(StoreError::Superseded);
+        }
+        Ok((
+            selected
+                .into_iter()
+                .map(|(path, meta)| LogicalIndexedObject { path, meta })
+                .collect(),
+            before.generation,
+            truncated,
+        ))
+    }
+
+    /// Read one bounded page from the raw S3-derived inventory. Long-running
+    /// maintenance consumers compare `revision` between pages and stop if an
+    /// incremental repair or full generation flip changed their source set.
+    pub(crate) async fn persistent_object_page(
+        &self,
+        prefix: &str,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<PersistentObjectPage, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let before = index.meta().await?;
+        let Some(slot) = before.active_slot else {
+            return Ok(PersistentObjectPage {
+                items: Vec::new(),
+                next_after: None,
+                revision: PersistentObjectRevision::from_meta(&before),
+            });
+        };
+        let (rows, next_after) = index
+            .scan_objects(slot, prefix.as_bytes().to_vec(), after, limit)
+            .await?;
+        let after_meta = index.meta().await?;
+        if after_meta.active_slot != before.active_slot
+            || after_meta.generation != before.generation
+            || after_meta.active_watermark() != before.active_watermark()
+        {
+            return Err(StoreError::Superseded);
+        }
+        Ok(PersistentObjectPage {
+            items: rows
+                .into_iter()
+                .map(|(key, meta)| IndexedObject { key, meta })
+                .collect(),
+            next_after,
+            revision: PersistentObjectRevision::from_meta(&before),
+        })
+    }
+
+    pub(crate) async fn persistent_object_revision(
+        &self,
+    ) -> Result<PersistentObjectRevision, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let meta = persistent_projection_index(runtime)?.meta().await?;
+        Ok(PersistentObjectRevision::from_meta(&meta))
+    }
+
+    pub(crate) async fn persistent_npm_package(
+        &self,
+        repository: &str,
+        package: &str,
+        after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<
+        (
+            Option<StoredNpmPackage>,
+            Vec<StoredNpmVersion>,
+            Option<Vec<u8>>,
+            u64,
+            String,
+        ),
+        StoreError,
+    > {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let (package_row, versions, next_after, generation) = index
+            .npm_package_page(repository, package, after, limit)
+            .await?;
+        Ok((
+            package_row,
+            versions,
+            next_after,
+            generation,
+            runtime.config_digest.clone(),
+        ))
+    }
+
+    fn request_persistent_change(&self, event: ChangeEvent) {
+        let Some(runtime) = self.persistent.clone() else {
+            return;
+        };
+        let permit = tokio::runtime::Handle::try_current().ok().and_then(|_| {
+            Arc::clone(&runtime.semantic_permits)
+                .try_acquire_owned()
+                .ok()
+        });
+        let event_epoch = {
+            let mut fence = runtime.fence.lock();
+            let event_epoch = runtime.request_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            store_persistent_status_locked(&runtime, IndexStatus::Warming, &fence);
+            if permit.is_some() {
+                fence.semantic_inflight = fence.semantic_inflight.saturating_add(1);
+            } else {
+                // Bound memory by collapsing overload/no-runtime into the one
+                // monotonic authoritative-reconcile fence.
+                require_full_reconcile_locked(&runtime, &fence);
+            }
+            publish_pending_change_count_locked(&runtime, &fence);
+            event_epoch
+        };
+        runtime.fence_notify.notify_one();
+        let Some(permit) = permit else {
+            return;
+        };
+        let task_runtime = Arc::clone(&runtime);
+        let mut inflight = SemanticInflightGuard {
+            runtime: Arc::clone(&task_runtime),
+            armed: true,
+        };
+        spawn_semantic_task(&runtime, async move {
+            let _permit = permit;
+            process_persistent_change(task_runtime, event_epoch, event).await;
+            inflight.disarm();
+        });
     }
 
     fn activate(&self, registry: RegistryType) {
@@ -402,6 +1878,11 @@ impl RepoIndex {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         for registry in registries {
+            if self.persistent.is_some()
+                && matches!(registry, RegistryType::Maven | RegistryType::Npm)
+            {
+                continue;
+            }
             self.activate(registry);
         }
         if self
@@ -525,6 +2006,259 @@ impl RepoIndex {
         }))
     }
 
+    /// Start the Maven/npm persistent reconciliation worker. A successful run
+    /// publishes one complete S2 generation; failures retain the previous
+    /// slot and retry with bounded backoff. The periodic delay starts after a
+    /// completed run, so a slow scan never creates catch-up storms.
+    pub fn start_persistent_background(
+        self: &Arc<Self>,
+        storage: Storage,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let runtime = self.persistent.clone()?;
+        if !runtime.maven_enabled && !runtime.npm_enabled {
+            return None;
+        }
+        if runtime
+            .background_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            runtime.notify.notify_one();
+            return None;
+        }
+
+        Some(tokio::spawn(async move {
+            let mut next_periodic = if runtime.initial_reconciled.load(Ordering::Acquire) {
+                Instant::now() + runtime.reconcile_interval
+            } else {
+                Instant::now()
+            };
+            let mut retry_attempt = 0u32;
+            let mut retry_not_before = None::<Instant>;
+            loop {
+                if cancel.is_cancelled() {
+                    return;
+                }
+                if let Some(deadline) = retry_not_before {
+                    if deadline > Instant::now() {
+                        // A Notify only records/coalesces more work. It must not
+                        // bypass a recovery/reconcile failure backoff and turn
+                        // request traffic into a LIST/reopen storm.
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep_until(deadline) => {},
+                        }
+                    }
+                    retry_not_before = None;
+                }
+                let forced = full_reconcile_required(&runtime);
+                if forced || Instant::now() >= next_periodic {
+                    let index = match recover_persistent_index(&runtime).await {
+                        Ok(index) => index,
+                        Err(error) => {
+                            runtime
+                                .progress
+                                .set_phase(PersistentIndexPhase::RetryWaiting);
+                            {
+                                let fence = runtime.fence.lock();
+                                require_full_reconcile_locked(&runtime, &fence);
+                                store_persistent_status_locked(
+                                    &runtime,
+                                    IndexStatus::Degraded,
+                                    &fence,
+                                );
+                            }
+                            let delay = persistent_reconcile_retry_delay(&runtime, retry_attempt);
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            next_periodic = Instant::now() + delay;
+                            retry_not_before = Some(next_periodic);
+                            tracing::error!(
+                                error_class = %index_error_class(&error),
+                                retry_after_secs = delay.as_secs(),
+                                "persistent index recovery failed; protocol S3 reads remain available"
+                            );
+                            continue;
+                        }
+                    };
+                    let observed_epoch = {
+                        let fence = runtime.fence.lock();
+                        current_request_epoch_locked(&runtime, &fence)
+                    };
+                    let had_generation = index
+                        .meta()
+                        .await
+                        .is_ok_and(|meta| meta.active_slot.is_some());
+                    if !had_generation {
+                        let fence = runtime.fence.lock();
+                        store_persistent_status_locked(&runtime, IndexStatus::Warming, &fence);
+                    }
+                    let reconcile_started = std::time::Instant::now();
+                    match persistent_builder::reconcile_with_progress(
+                        Arc::clone(&index),
+                        storage.clone(),
+                        runtime.config_digest.clone(),
+                        runtime.maven_enabled,
+                        runtime.npm_enabled,
+                        &runtime.progress,
+                    )
+                    .await
+                    {
+                        Ok(meta) => {
+                            let unchanged = {
+                                let fence = runtime.fence.lock();
+                                if !is_current_persistent_index_locked(&runtime, &index, &fence) {
+                                    runtime
+                                        .progress
+                                        .set_phase(PersistentIndexPhase::RetryWaiting);
+                                    require_full_reconcile_locked(&runtime, &fence);
+                                    store_persistent_status_locked(
+                                        &runtime,
+                                        IndexStatus::Warming,
+                                        &fence,
+                                    );
+                                    continue;
+                                }
+                                publish_persistent_meta_locked(&runtime, &meta, &fence);
+                                let active_watermark = meta.active_watermark();
+                                runtime
+                                    .requested_sequence
+                                    .fetch_max(meta.accepted_change_seq, Ordering::AcqRel);
+                                runtime
+                                    .published_sequence
+                                    .store(active_watermark, Ordering::Release);
+                                let scan_caught_up = observed_epoch
+                                    == current_request_epoch_locked(&runtime, &fence)
+                                    && fence.semantic_inflight == 0
+                                    && fence.physical_acked >= fence.physical_admitted
+                                    && fence.latest_physical_receipt.is_none()
+                                    && runtime.requested_sequence.load(Ordering::Acquire)
+                                        <= active_watermark
+                                    && !meta.global_dirty;
+                                let requirement_resolved = scan_caught_up
+                                    && resolve_full_reconcile_through_locked(
+                                        &runtime,
+                                        observed_epoch,
+                                        &fence,
+                                    );
+                                let unchanged = requirement_resolved
+                                    && observed_epoch
+                                        == current_request_epoch_locked(&runtime, &fence)
+                                    && !full_reconcile_required_locked(&runtime, &fence);
+                                runtime.initial_reconciled.store(true, Ordering::Release);
+                                runtime.projection_usable.store(true, Ordering::Release);
+                                runtime.progress.set_phase(PersistentIndexPhase::Idle);
+                                publish_pending_change_count_locked(&runtime, &fence);
+                                // The fence coordinator owns the final ordered
+                                // meta barrier and is the only runtime path
+                                // that publishes Ready.
+                                store_persistent_status_locked(
+                                    &runtime,
+                                    IndexStatus::Warming,
+                                    &fence,
+                                );
+                                unchanged
+                            };
+                            publish_index_database_bytes(&runtime);
+                            runtime.fence_notify.notify_one();
+                            crate::metrics::INDEX_RECONCILE_TOTAL
+                                .with_label_values(&["success", "none"])
+                                .inc();
+                            crate::metrics::INDEX_RECONCILE_DURATION_SECONDS
+                                .with_label_values(&["success"])
+                                .observe(reconcile_started.elapsed().as_secs_f64());
+                            crate::metrics::INDEX_LAST_SUCCESS_TIMESTAMP.set(
+                                i64::try_from(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                )
+                                .unwrap_or(i64::MAX),
+                            );
+                            retry_attempt = 0;
+                            retry_not_before = None;
+                            next_periodic = Instant::now() + runtime.reconcile_interval;
+                            info!(
+                                generation = meta.generation,
+                                accepted_change_seq = meta.accepted_change_seq,
+                                pending_change = !unchanged,
+                                "persistent Maven/npm index generation published"
+                            );
+                            if !unchanged {
+                                continue;
+                            }
+                        }
+                        Err(persistent_builder::ReconcileError::Store(StoreError::Superseded)) => {
+                            let full_required = {
+                                let fence = runtime.fence.lock();
+                                store_persistent_status_locked(
+                                    &runtime,
+                                    IndexStatus::Warming,
+                                    &fence,
+                                );
+                                full_reconcile_required_locked(&runtime, &fence)
+                            };
+                            runtime.fence_notify.notify_one();
+                            tracing::debug!(
+                                "persistent shadow generation superseded; waiting for the mutation fence to settle"
+                            );
+                            if full_required {
+                                next_periodic = Instant::now() + Duration::from_secs(1);
+                                retry_not_before = Some(next_periodic);
+                            } else {
+                                next_periodic = Instant::now() + runtime.reconcile_interval;
+                            }
+                            crate::metrics::INDEX_RECONCILE_TOTAL
+                                .with_label_values(&["superseded", "superseded"])
+                                .inc();
+                            crate::metrics::INDEX_RECONCILE_DURATION_SECONDS
+                                .with_label_values(&["superseded"])
+                                .observe(reconcile_started.elapsed().as_secs_f64());
+                        }
+                        Err(error) => {
+                            {
+                                let fence = runtime.fence.lock();
+                                require_full_reconcile_locked(&runtime, &fence);
+                                store_persistent_status_locked(
+                                    &runtime,
+                                    IndexStatus::Degraded,
+                                    &fence,
+                                );
+                            }
+                            let delay = persistent_reconcile_retry_delay(&runtime, retry_attempt);
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            next_periodic = Instant::now() + delay;
+                            retry_not_before = Some(next_periodic);
+                            #[cfg(test)]
+                            runtime.reconcile_retry_scheduled.notify_one();
+                            tracing::warn!(
+                                error_class = %reconcile_error_class(&error),
+                                retry_after_secs = delay.as_secs(),
+                                "persistent index reconcile failed; last-good generation retained"
+                            );
+                            let error_class = reconcile_error_class(&error);
+                            crate::metrics::INDEX_RECONCILE_TOTAL
+                                .with_label_values(&["error", error_class])
+                                .inc();
+                            crate::metrics::INDEX_RECONCILE_DURATION_SECONDS
+                                .with_label_values(&["error"])
+                                .observe(reconcile_started.elapsed().as_secs_f64());
+                        }
+                    }
+                }
+
+                #[cfg(test)]
+                runtime.background_waiting.notify_one();
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = runtime.notify.notified() => {},
+                    _ = tokio::time::sleep_until(next_periodic) => {},
+                }
+            }
+        }))
+    }
+
     async fn rebuild_one(&self, registry: RegistryType, storage: &Storage) -> RebuildOutcome {
         let Some(index) = self.indexes.get(&registry) else {
             return RebuildOutcome::Failed { generation: 0 };
@@ -577,7 +2311,9 @@ impl RepoIndex {
     /// Invalidate a specific registry index
     pub fn invalidate(&self, registry: &str) {
         if let Some(rt) = RegistryType::from_str_opt(registry) {
-            if let Some(idx) = self.indexes.get(&rt) {
+            if self.persistent.is_some() && matches!(rt, RegistryType::Maven | RegistryType::Npm) {
+                self.request_persistent_change(ChangeEvent::GlobalDirty);
+            } else if let Some(idx) = self.indexes.get(&rt) {
                 idx.invalidate();
                 self.activate(rt);
                 self.notify.notify_one();
@@ -585,14 +2321,90 @@ impl RepoIndex {
         }
     }
 
+    fn invalidate_memory_snapshot(&self, registry: RegistryType) {
+        if self.persistent.is_some() && matches!(registry, RegistryType::Maven | RegistryType::Npm)
+        {
+            return;
+        }
+        if let Some(index) = self.indexes.get(&registry) {
+            index.invalidate();
+            self.activate(registry);
+            self.notify.notify_one();
+        }
+    }
+
+    pub fn invalidate_maven_path(&self, repository: &str, path: &str) {
+        self.invalidate_memory_snapshot(RegistryType::Maven);
+        self.request_persistent_change(ChangeEvent::MavenPathChanged {
+            repository: repository.to_string(),
+            path: path.to_string(),
+        });
+    }
+
+    /// Publish the narrowest semantic invalidation available for a completed
+    /// proxy-cache write. Maven storage keys encode both the repository and
+    /// logical path, so a single cached artifact/metadata bundle does not need
+    /// to force a full S3 reconciliation. Other formats retain their existing
+    /// registry-wide behavior.
+    pub fn invalidate_cached_path(&self, registry: &str, key: &str) {
+        if registry == "maven" {
+            let named_layout = self
+                .persistent
+                .as_ref()
+                .is_some_and(|runtime| runtime.maven_named);
+            if named_layout {
+                if let Some(named) = key.strip_prefix("maven/repositories/") {
+                    if let Some((repository, path)) = named.split_once('/') {
+                        self.invalidate_maven_path(repository, path);
+                        return;
+                    }
+                }
+            } else if let Some(path) = key.strip_prefix("maven/") {
+                self.invalidate_maven_path("", path);
+                return;
+            }
+        }
+        self.invalidate(registry);
+    }
+
+    pub fn invalidate_maven_ga(&self, repository: &str, ga_path: &str) {
+        self.invalidate_memory_snapshot(RegistryType::Maven);
+        self.request_persistent_change(ChangeEvent::MavenGaChanged {
+            repository: repository.to_string(),
+            ga_path: ga_path.to_string(),
+        });
+    }
+
+    pub fn invalidate_npm_hosted(&self, repository: &str, package: &str) {
+        self.invalidate_memory_snapshot(RegistryType::Npm);
+        self.request_persistent_change(ChangeEvent::NpmHostedChanged {
+            repository: repository.to_string(),
+            package: package.to_string(),
+        });
+    }
+
+    pub fn invalidate_npm_proxy(&self, repository: &str, package: &str) {
+        self.invalidate_memory_snapshot(RegistryType::Npm);
+        self.request_persistent_change(ChangeEvent::NpmProxyChanged {
+            repository: repository.to_string(),
+            package: package.to_string(),
+        });
+    }
+
     /// Invalidate every registry index so each rebuilds from storage on next read.
     /// Backs the admin reindex endpoint for the "rescan all paths" case.
     pub fn invalidate_all(&self) {
         for (registry, idx) in &self.indexes {
+            if self.persistent.is_some()
+                && matches!(registry, RegistryType::Maven | RegistryType::Npm)
+            {
+                continue;
+            }
             idx.invalidate();
             self.activate(*registry);
         }
         self.notify.notify_one();
+        self.request_persistent_change(ChangeEvent::GlobalDirty);
     }
 
     /// Debounce gate for operator-triggered reindex. Returns `Ok(())` and records
@@ -619,6 +2431,10 @@ impl RepoIndex {
             Some(rt) => rt,
             None => return Arc::new(Vec::new()),
         };
+        if self.persistent.is_some() && matches!(reg_type, RegistryType::Maven | RegistryType::Npm)
+        {
+            return Arc::new(Vec::new());
+        }
         let index = match self.indexes.get(&reg_type) {
             Some(idx) => idx,
             None => return Arc::new(Vec::new()),
@@ -638,6 +2454,50 @@ impl RepoIndex {
         _storage: &Storage,
     ) -> Result<Arc<Vec<RepoInfo>>, ()> {
         let reg_type = RegistryType::from_str_opt(registry).ok_or(())?;
+        if matches!(reg_type, RegistryType::Maven | RegistryType::Npm) {
+            if let Some(runtime) = &self.persistent {
+                if !self.persistent_protocol_ready() {
+                    return Err(());
+                }
+                let index = persistent_projection_index(runtime).map_err(|_| ())?;
+                let mut rows = Vec::new();
+                let mut after = None;
+                let mut generation = None;
+                loop {
+                    let remaining = MAX_QUERY_EXAMINED.saturating_sub(rows.len());
+                    if remaining == 0 {
+                        return Err(());
+                    }
+                    let (mut page, next, observed_generation) = index
+                        .query_repos(RepoQuery {
+                            registry: registry.to_string(),
+                            after,
+                            filter: None,
+                            limit: remaining.min(100),
+                            max_examined: remaining,
+                            deadline: Duration::from_millis(250),
+                            name_prefix: None,
+                            before_name: None,
+                            allowed_repositories: None,
+                        })
+                        .await
+                        .map_err(|_| ())?;
+                    if generation.is_some_and(|value| value != observed_generation) {
+                        return Err(());
+                    }
+                    generation = Some(observed_generation);
+                    rows.append(&mut page);
+                    let Some(next) = next else { break };
+                    after = Some(next);
+                }
+                if generation != index.meta().await.ok().map(|meta| meta.generation)
+                    || !self.persistent_protocol_ready()
+                {
+                    return Err(());
+                }
+                return Ok(Arc::new(rows));
+            }
+        }
         let index = self.indexes.get(&reg_type).ok_or(())?;
         self.activate(reg_type);
         self.notify.notify_one();
@@ -658,6 +2518,24 @@ impl RepoIndex {
     /// generation required when the request began. The snapshot is entirely
     /// in memory and shares the atomic publication boundary with RepoInfo.
     pub(crate) async fn npm_search_strict(&self) -> Result<Arc<Vec<NpmSearchDocument>>, ()> {
+        if let Some(runtime) = &self.persistent {
+            if !self.persistent_protocol_ready() {
+                return Err(());
+            }
+            let index = persistent_projection_index(runtime).map_err(|_| ())?;
+            let (documents, generation, truncated) = index
+                .list_npm_search_documents(MAX_QUERY_EXAMINED)
+                .await
+                .map_err(|_| ())?;
+            if truncated
+                || generation == 0
+                || generation != index.meta().await.map_err(|_| ())?.generation
+                || !self.persistent_protocol_ready()
+            {
+                return Err(());
+            }
+            return Ok(Arc::new(documents));
+        }
         let registry = RegistryType::Npm;
         let index = self.indexes.get(&registry).ok_or(())?;
         self.activate(registry);
@@ -677,6 +2555,10 @@ impl RepoIndex {
 
     pub fn status(&self, registry: &str) -> Option<IndexStatus> {
         let registry = RegistryType::from_str_opt(registry)?;
+        if self.persistent.is_some() && matches!(registry, RegistryType::Maven | RegistryType::Npm)
+        {
+            return self.persistent_status();
+        }
         self.indexes.get(&registry).map(RegistryIndex::status)
     }
 
@@ -712,19 +2594,41 @@ impl RepoIndex {
 
     /// Get counts for stats (no rebuild, just current state)
     pub fn counts(&self) -> HashMap<RegistryType, usize> {
-        self.indexes
+        let mut counts = self
+            .indexes
             .iter()
             .map(|(rt, idx)| (*rt, idx.count()))
-            .collect()
+            .collect::<HashMap<_, _>>();
+        if let Some(runtime) = &self.persistent {
+            counts.insert(
+                RegistryType::Maven,
+                usize::try_from(runtime.maven_artifacts.load(Ordering::Acquire))
+                    .unwrap_or(usize::MAX),
+            );
+            counts.insert(
+                RegistryType::Npm,
+                usize::try_from(runtime.npm_versions.load(Ordering::Acquire)).unwrap_or(usize::MAX),
+            );
+        }
+        counts
     }
 
     /// Get total artifact bytes per registry from the cached index (no rebuild).
     pub fn sizes(&self) -> HashMap<RegistryType, u64> {
-        self.indexes
+        let mut sizes = self
+            .indexes
             .iter()
             .filter(|(rt, _)| **rt != RegistryType::Npm)
             .filter_map(|(rt, idx)| idx.total_size().map(|size| (*rt, size)))
-            .collect()
+            .collect::<HashMap<_, _>>();
+        if let Some(runtime) = &self.persistent {
+            sizes.insert(
+                RegistryType::Maven,
+                runtime.maven_bytes.load(Ordering::Acquire),
+            );
+            sizes.insert(RegistryType::Npm, runtime.npm_bytes.load(Ordering::Acquire));
+        }
+        sizes
     }
 }
 
@@ -776,6 +2680,67 @@ async fn build_index(
 impl Default for RepoIndex {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl StorageMutationObserver for RepoIndex {
+    fn observe(&self, mutation: StorageMutation) {
+        if !mutation.key.starts_with("maven/") && !mutation.key.starts_with("npm/") {
+            return;
+        }
+        let Some(runtime) = &self.persistent else {
+            return;
+        };
+        let mut fence = runtime.fence.lock();
+        runtime.request_epoch.fetch_add(1, Ordering::AcqRel);
+        store_persistent_status_locked(runtime, IndexStatus::Warming, &fence);
+        #[cfg(test)]
+        wait_test_fence_barrier(&runtime.physical_admission_barrier);
+        let index = match current_persistent_index(runtime) {
+            Ok(index) => index,
+            Err(error) => {
+                store_persistent_status_locked(runtime, IndexStatus::Degraded, &fence);
+                require_full_reconcile_locked(runtime, &fence);
+                publish_pending_change_count_locked(runtime, &fence);
+                drop(fence);
+                runtime.fence_notify.notify_one();
+                tracing::warn!(
+                    error_class = %index_error_class(&error),
+                    "physical index invalidation retained in memory until writer recovery"
+                );
+                return;
+            }
+        };
+        match index.try_register_change(ChangeEvent::PhysicalDirty { key: mutation.key }) {
+            Ok(receive) => {
+                // The newest receipt fences every earlier command in the
+                // single FIFO redb writer. Replacing it keeps admission O(1)
+                // while the one coordinator prevents Ready until the fence is
+                // acknowledged and all semantic repairs have quiesced.
+                fence.physical_admitted = fence.physical_admitted.saturating_add(1);
+                let ticket = fence.physical_admitted;
+                fence.latest_physical_receipt = Some(PhysicalReceipt {
+                    ticket,
+                    index,
+                    receive,
+                });
+                if mutation.outcome == StorageMutationOutcome::Unknown {
+                    require_full_reconcile_locked(runtime, &fence);
+                }
+            }
+            Err(error) => {
+                require_full_reconcile_locked(runtime, &fence);
+                tracing::warn!(
+                    error_class = %index_error_class(&error),
+                    mutation_kind = ?mutation.kind,
+                    mutation_outcome = ?mutation.outcome,
+                    "redb invalidation queue saturated; bounded anti-entropy reconcile required"
+                );
+            }
+        }
+        publish_pending_change_count_locked(runtime, &fence);
+        drop(fence);
+        runtime.fence_notify.notify_one();
     }
 }
 
@@ -956,7 +2921,16 @@ fn npm_search_projection(
     })?;
     let manifest = versions.get(&version)?;
     let mut fields = serde_json::Map::new();
-    for field in ["description", "keywords", "publisher", "maintainers"] {
+    for field in [
+        "description",
+        "keywords",
+        "publisher",
+        "maintainers",
+        "license",
+        "author",
+        "homepage",
+        "repository",
+    ] {
         if let Some(value) = packument.get(field).or_else(|| manifest.get(field)) {
             fields.insert(field.to_string(), value.clone());
         }
@@ -1473,6 +3447,1216 @@ pub fn paginate<T: Clone>(data: &[T], page: usize, limit: usize) -> (Vec<T>, usi
 mod tests {
     use super::*;
 
+    async fn reopen_persistent_with_startup_state(
+        config: &Config,
+        enabled: &HashSet<RegistryType>,
+        storage: Storage,
+        startup_clean: bool,
+    ) -> Arc<RepoIndex> {
+        let digest = persistent_config_digest(config).unwrap();
+        let persistent = PersistentIndex::open_with_startup_state_for_test(
+            &config.index.path,
+            digest.clone(),
+            startup_clean,
+        )
+        .unwrap();
+        let meta = persistent.meta().await.unwrap();
+        RepoIndex::from_persistent(
+            config,
+            enabled,
+            storage,
+            Some(persistent),
+            Some(meta),
+            digest,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persistent_database_is_not_opened_without_maven_or_npm() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let index_dir = tempfile::tempdir().unwrap();
+        let path = index_dir.path().join("unused.redb");
+        let mut config = Config::default();
+        config.index.path = path.to_string_lossy().into_owned();
+        let index = RepoIndex::open_persistent_for_test(&config, &HashSet::new(), storage)
+            .await
+            .unwrap();
+        assert!(!index.has_persistent());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_warm_start_publishes_last_good_without_immediate_s3_reconcile() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        authoritative
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        config.index.reconcile_interval_secs = 1;
+        let enabled = HashSet::from([RegistryType::Maven]);
+
+        let first = RepoIndex::open_persistent_for_test(&config, &enabled, authoritative.clone())
+            .await
+            .unwrap();
+        first.reconcile_persistent_for_test().await.unwrap();
+        let generation = first.persistent_meta_for_test().await.unwrap().generation;
+        first.shutdown_persistent().await;
+        drop(first);
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::Healthy,
+            "only a caught-up mutation fence may persist a clean shutdown"
+        );
+
+        let (list_signal, mut list_attempted) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative)
+                .signal_list_attempts("maven/", list_signal),
+        );
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let reopened =
+            reopen_persistent_with_startup_state(&config, &enabled, storage.clone(), true).await;
+
+        assert_eq!(reopened.persistent_status(), Some(IndexStatus::Ready));
+        assert!(reopened.persistent_protocol_ready());
+        assert_eq!(
+            reopened
+                .persistent_meta_for_test()
+                .await
+                .unwrap()
+                .generation,
+            generation
+        );
+        let runtime = reopened.persistent.as_ref().unwrap();
+        assert!(runtime.initial_reconciled.load(Ordering::Acquire));
+        assert!(!full_reconcile_required(runtime));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let idle = runtime.background_waiting.notified();
+        let handle = reopened
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), idle)
+            .await
+            .expect("clean-start worker must reach its periodic idle state");
+        assert!(list_attempts.lock().is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), list_attempted.recv())
+                .await
+                .is_err(),
+            "a clean warm start must not perform an immediate root LIST"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), list_attempted.recv())
+            .await
+            .expect("periodic anti-entropy must still start at its configured interval")
+            .expect("LIST signal channel must remain open");
+
+        cancel.cancel();
+        handle.await.unwrap();
+        reopened.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn abnormal_process_shutdown_forces_unclean_preflight_and_immediate_reconcile() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        authoritative
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        config.index.reconcile_interval_secs = 3600;
+        let enabled = HashSet::from([RegistryType::Maven]);
+
+        let first = RepoIndex::open_persistent_for_test(&config, &enabled, authoritative.clone())
+            .await
+            .unwrap();
+        first.reconcile_persistent_for_test().await.unwrap();
+        first
+            .shutdown_persistent_until(Instant::now() + Duration::from_secs(5), false)
+            .await;
+        drop(first);
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::HealthyAfterIntegrity,
+            "an abnormal process-session boundary must never persist the fast-ready clean proof"
+        );
+
+        let (list_signal, mut list_attempted) = tokio::sync::mpsc::unbounded_channel();
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative)
+                .signal_list_attempts("maven/", list_signal),
+        ));
+        let reopened =
+            reopen_persistent_with_startup_state(&config, &enabled, storage.clone(), false).await;
+        assert_eq!(reopened.persistent_status(), Some(IndexStatus::Warming));
+        assert!(!reopened.persistent_protocol_ready());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = reopened
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), list_attempted.recv())
+            .await
+            .expect("unclean startup must issue an immediate authoritative LIST")
+            .expect("LIST signal channel must remain open");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !reopened.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authoritative S2 must restore Ready");
+
+        cancel.cancel();
+        handle.await.unwrap();
+        reopened.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn physical_receipt_progress_wakes_shutdown_before_shared_deadline() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        storage
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = Arc::clone(index.persistent.as_ref().unwrap());
+        let persistent = current_persistent_index(&runtime).unwrap();
+        let sequence = persistent.meta().await.unwrap().accepted_change_seq;
+        let (send, receive) = oneshot::channel();
+        {
+            let mut fence = runtime.fence.lock();
+            fence.physical_admitted = 1;
+            fence.latest_physical_receipt = Some(PhysicalReceipt {
+                ticket: 1,
+                index: persistent,
+                receive,
+            });
+            store_persistent_status_locked(&runtime, IndexStatus::Warming, &fence);
+        }
+        runtime.fence_notify.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let receipt_taken = {
+                    let fence = runtime.fence.lock();
+                    fence.latest_physical_receipt.is_none()
+                        && fence.physical_acked < fence.physical_admitted
+                };
+                if receipt_taken {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("coordinator must take the delayed receipt before shutdown starts");
+
+        let shutdown_waiting = runtime.shutdown_waiting.notified();
+        tokio::pin!(shutdown_waiting);
+        shutdown_waiting.as_mut().enable();
+        let shutting_down = Arc::clone(&index);
+        let shutdown = tokio::spawn(async move {
+            shutting_down
+                .shutdown_persistent_until(Instant::now() + Duration::from_secs(2), true)
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), &mut shutdown_waiting)
+            .await
+            .expect("shutdown must be waiting for the coordinator's receipt progress edge");
+        send.send(Ok(sequence)).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), shutdown)
+            .await
+            .expect("receipt settlement must wake shutdown without consuming its full deadline")
+            .unwrap();
+        drop(index);
+
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::Healthy,
+            "acknowledged receipt and caught-up durable meta should still close cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_file_with_durable_dirty_state_still_reconciles_fail_closed() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        authoritative
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        config.index.reconcile_interval_secs = 3600;
+        let enabled = HashSet::from([RegistryType::Maven]);
+
+        let first = RepoIndex::open_persistent_for_test(&config, &enabled, authoritative.clone())
+            .await
+            .unwrap();
+        first.reconcile_persistent_for_test().await.unwrap();
+        current_persistent_index(first.persistent.as_ref().unwrap())
+            .unwrap()
+            .register_change(ChangeEvent::GlobalDirty)
+            .await
+            .unwrap();
+        first.shutdown_persistent().await;
+        drop(first);
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::HealthyAfterIntegrity,
+            "durable dirty state must prevent a clean preflight classification"
+        );
+
+        let (list_signal, mut list_attempted) = tokio::sync::mpsc::unbounded_channel();
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative)
+                .signal_list_attempts("maven/", list_signal),
+        ));
+        let reopened =
+            reopen_persistent_with_startup_state(&config, &enabled, storage.clone(), true).await;
+        assert_eq!(reopened.persistent_status(), Some(IndexStatus::Warming));
+        assert!(!reopened.persistent_protocol_ready());
+        assert!(full_reconcile_required(
+            reopened.persistent.as_ref().unwrap()
+        ));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = reopened
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), list_attempted.recv())
+            .await
+            .expect("durable dirty state must force an immediate authoritative LIST")
+            .expect("LIST signal channel must remain open");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !reopened.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the authoritative reconcile must restore Ready");
+
+        cancel.cancel();
+        handle.await.unwrap();
+        reopened.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_clean_marker_requires_one_authoritative_reconcile() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        authoritative
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        config.index.reconcile_interval_secs = 3600;
+        let enabled = HashSet::from([RegistryType::Maven]);
+
+        let legacy_digest = persistent_config_digest_with_schema(&config, 1).unwrap();
+        let legacy_persistent =
+            PersistentIndex::open(&config.index.path, legacy_digest.clone()).unwrap();
+        let legacy_meta = legacy_persistent.meta().await.unwrap();
+        let legacy = RepoIndex::from_persistent(
+            &config,
+            &enabled,
+            authoritative.clone(),
+            Some(legacy_persistent),
+            Some(legacy_meta),
+            legacy_digest,
+        )
+        .await
+        .unwrap();
+        legacy.reconcile_persistent_for_test().await.unwrap();
+        legacy.shutdown_persistent().await;
+        drop(legacy);
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::Healthy,
+            "the legacy fixture intentionally carries its old clean marker"
+        );
+
+        let (list_signal, mut list_attempted) = tokio::sync::mpsc::unbounded_channel();
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative)
+                .signal_list_attempts("maven/", list_signal),
+        ));
+        let reopened =
+            reopen_persistent_with_startup_state(&config, &enabled, storage.clone(), true).await;
+        assert_eq!(reopened.persistent_status(), Some(IndexStatus::Warming));
+        assert!(!reopened.persistent_protocol_ready());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = reopened
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), list_attempted.recv())
+            .await
+            .expect("topology proof version change must force one immediate S3 reconcile")
+            .expect("LIST signal channel must remain open");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !reopened.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy PVC must become Ready only after current S2 publication");
+
+        cancel.cancel();
+        handle.await.unwrap();
+        reopened.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_object_revision_detects_reseed_with_reused_counters() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        storage
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"artifact")
+            .await
+            .unwrap();
+        storage
+            .put("maven/com/acme/app/2.0/app-2.0.jar", b"artifact-two")
+            .await
+            .unwrap();
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = first_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let before = index
+            .persistent_object_page("maven/", None, 1)
+            .await
+            .unwrap();
+        assert_eq!(before.items.len(), 1);
+        let next_after = before
+            .next_after
+            .clone()
+            .expect("the first page must have a continuation");
+
+        let runtime = index.persistent.as_ref().unwrap();
+        let replacement = PersistentIndex::open(
+            second_dir.path().join("index.redb"),
+            runtime.config_digest.clone(),
+        )
+        .unwrap();
+        let replacement_meta = persistent_builder::reconcile(
+            Arc::clone(&replacement),
+            storage,
+            runtime.config_digest.clone(),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement_meta.generation, before.revision.generation);
+        assert_eq!(
+            replacement_meta.active_watermark(),
+            before.revision.watermark
+        );
+        assert_eq!(replacement_meta.active_slot, before.revision.active_slot);
+
+        let replaced = {
+            let _fence = runtime.fence.lock();
+            runtime.index.swap(Some(replacement))
+        };
+        let after_page = index
+            .persistent_object_page("maven/", Some(next_after), 1)
+            .await
+            .unwrap();
+        assert_eq!(after_page.items.len(), 1);
+        let after = after_page.revision;
+        assert_ne!(
+            after, before.revision,
+            "a new database identity must supersede pages even when counters and slot repeat"
+        );
+        assert_ne!(after.db_uuid, before.revision.db_uuid);
+
+        if let Some(replaced) = replaced {
+            replaced.shutdown().await;
+        }
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn completed_maven_cache_write_repairs_physical_event_incrementally() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let artifact = "maven/com/acme/app/1.0/app-1.0.jar";
+        storage.put(artifact, b"old").await.unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        storage.set_mutation_observer(index.clone());
+
+        storage.put(artifact, b"replacement").await.unwrap();
+        assert!(!index.persistent_protocol_ready());
+        index.invalidate_cached_path("maven", artifact);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !index.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("typed cache invalidation catches up without a full reconcile");
+
+        let runtime = index.persistent.as_ref().unwrap();
+        let persistent = current_persistent_index(runtime).unwrap();
+        let meta = persistent.meta().await.unwrap();
+        assert_eq!(meta.generation, 2);
+        assert!(!meta.global_dirty);
+        assert_eq!(meta.active_watermark(), meta.accepted_change_seq);
+        assert_eq!(
+            persistent
+                .get_object_in_slot(meta.active_slot.unwrap(), artifact)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            b"replacement".len() as u64
+        );
+        storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn immutable_already_exists_retry_repairs_missing_redb_row_incrementally() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let artifact = "maven/com/acme/app/1.0/app-1.0.jar";
+        storage
+            .put(artifact, b"committed-before-crash")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        storage.set_mutation_observer(index.clone());
+
+        assert!(matches!(
+            storage.put_if_absent(artifact, b"retry-candidate").await,
+            Err(crate::storage::StorageError::AlreadyExists)
+        ));
+        index.invalidate_cached_path("maven", artifact);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !index.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("AlreadyExists retry must repair the exact existing S3 row");
+
+        let runtime = index.persistent.as_ref().unwrap();
+        let persistent = current_persistent_index(runtime).unwrap();
+        let meta = persistent.meta().await.unwrap();
+        assert_eq!(meta.generation, 2);
+        assert_eq!(meta.active_watermark(), meta.accepted_change_seq);
+        assert_eq!(
+            persistent
+                .get_object_in_slot(meta.active_slot.unwrap(), artifact)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            b"committed-before-crash".len() as u64,
+            "redb must index the authoritative winner, not retry bytes"
+        );
+        storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn semantic_overload_collapses_to_one_bounded_full_reconcile_fence() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = index.persistent.as_ref().unwrap();
+        let permits = (0..SEMANTIC_CHANGE_CONCURRENCY)
+            .map(|_| {
+                runtime
+                    .semantic_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        for sequence in 0..100 {
+            index.invalidate_maven_path("", &format!("com/acme/app/{sequence}.jar"));
+        }
+        assert_eq!(
+            runtime.semantic_tasks.len(),
+            0,
+            "overflow must not create a waiter or Tokio task per event"
+        );
+        assert!(full_reconcile_required(runtime));
+        assert!(!index.persistent_protocol_ready());
+
+        drop(permits);
+        index.shutdown_persistent().await;
+        assert_eq!(
+            preflight_database(std::path::Path::new(&config.index.path)),
+            ChildPreflight::HealthyAfterIntegrity,
+            "an in-memory full-reconcile requirement must survive restart as an unclean DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_mutation_burst_creates_no_per_event_tokio_tasks() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = index.persistent.as_ref().unwrap();
+
+        for sequence in 0..100 {
+            index.observe(StorageMutation {
+                key: format!("maven/com/acme/app/{sequence}.jar"),
+                kind: crate::storage::StorageMutationKind::Put,
+                outcome: StorageMutationOutcome::Confirmed,
+            });
+        }
+        assert_eq!(
+            runtime.semantic_tasks.len(),
+            0,
+            "physical invalidation admission must not create Tokio tasks"
+        );
+        let persistent = current_persistent_index(runtime).unwrap();
+        let meta = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let meta = persistent.meta().await.unwrap();
+                if meta.accepted_change_seq == 100 {
+                    break meta;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded writer queue must durably register the burst");
+        assert_eq!(meta.accepted_change_seq, 100);
+        assert!(meta.global_dirty);
+        assert!(!index.persistent_protocol_ready());
+
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn physical_admission_and_readiness_publication_share_one_fence() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let artifact = "maven/com/acme/app/1.0/app-1.0.jar";
+        storage.put(artifact, b"jar").await.unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = index.persistent.as_ref().unwrap();
+        let captured = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *runtime.physical_admission_barrier.lock() =
+            Some((Arc::clone(&captured), Arc::clone(&release)));
+
+        let observer = {
+            let index = Arc::clone(&index);
+            std::thread::spawn(move || {
+                index.observe(StorageMutation {
+                    key: artifact.to_string(),
+                    kind: crate::storage::StorageMutationKind::Put,
+                    outcome: StorageMutationOutcome::Confirmed,
+                });
+            })
+        };
+        tokio::task::spawn_blocking(move || captured.wait())
+            .await
+            .unwrap();
+
+        let readiness = {
+            let index = Arc::clone(&index);
+            tokio::task::spawn_blocking(move || index.persistent_protocol_ready())
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !readiness.is_finished(),
+            "readiness must not pass between epoch publication and physical writer admission"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        observer.join().unwrap();
+        assert!(!readiness.await.unwrap());
+        *runtime.physical_admission_barrier.lock() = None;
+
+        index.invalidate_cached_path("maven", artifact);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !index.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the paired semantic repair must close the admitted physical fence");
+        assert!(!full_reconcile_required(runtime));
+
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn out_of_order_semantic_repairs_settle_ready_without_periodic_reconcile() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let repository = "npm-private";
+        let first = "first-pkg";
+        let second = "second-pkg";
+        let first_current = crate::npm_layout::hosted_packument_current_key(repository, first);
+        let captured = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let backend = Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative.clone()).barrier_get(
+                first_current,
+                Arc::clone(&captured),
+                Arc::clone(&release),
+            ),
+        );
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Npm]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        list_attempts.lock().clear();
+        put_hosted_npm_generation(
+            &authoritative,
+            repository,
+            first,
+            &[("1.0.0", b"first")],
+            &[("latest", "1.0.0")],
+        )
+        .await;
+        put_hosted_npm_generation(
+            &authoritative,
+            repository,
+            second,
+            &[("1.0.0", b"second")],
+            &[("latest", "1.0.0")],
+        )
+        .await;
+
+        index.invalidate_npm_hosted(repository, first);
+        captured.wait().await;
+        let initial_generation = index.persistent_meta_for_test().await.unwrap().generation;
+        index.invalidate_npm_hosted(repository, second);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if index.persistent_meta_for_test().await.unwrap().generation > initial_generation {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the newer unrelated repair must complete while the older one is blocked");
+
+        release.wait().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !index.persistent_protocol_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("quiescent clean meta must resolve all epochs independent of completion order");
+        assert!(
+            !list_attempts.lock().iter().any(|prefix| prefix == "npm/"),
+            "settling out-of-order repairs must not wait for or trigger a root S3 reconcile"
+        );
+        let meta = index.persistent_meta_for_test().await.unwrap();
+        assert!(!meta.global_dirty);
+        assert_eq!(meta.active_watermark(), meta.accepted_change_seq);
+
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn acknowledged_storage_mutation_never_waits_for_an_unavailable_index_writer() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let storage = Storage::from_backend(Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative),
+        ));
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        storage.set_mutation_observer(index.clone());
+
+        let runtime = index.persistent.as_ref().unwrap();
+        let writer = current_persistent_index(runtime).unwrap();
+        writer.shutdown().await;
+        assert!(!writer.writer_healthy());
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            storage.put("maven/com/acme/app/1.0/app-1.0.jar", b"body"),
+        )
+        .await
+        .expect("derived index must not enter acknowledged storage-write latency")
+        .unwrap();
+        assert_eq!(
+            storage
+                .get("maven/com/acme/app/1.0/app-1.0.jar")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"body"
+        );
+        assert_eq!(index.persistent_status(), Some(IndexStatus::Degraded));
+
+        storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn aborted_semantic_repair_forces_immediate_authoritative_reconcile() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage)
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert!(index.persistent_protocol_ready());
+
+        let runtime = index.persistent.as_ref().unwrap();
+        let captured = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *runtime.semantic_registration_barrier.lock() = Some((Arc::clone(&captured), release));
+        let reconcile_notified = runtime.notify.notified();
+        tokio::pin!(reconcile_notified);
+
+        index.invalidate("maven");
+        tokio::time::timeout(Duration::from_secs(1), captured.wait())
+            .await
+            .expect("semantic task must reach the pre-registration barrier");
+        runtime
+            .semantic_abort_handles
+            .lock()
+            .last()
+            .expect("semantic task abort handle")
+            .abort();
+        tokio::time::timeout(Duration::from_secs(1), &mut reconcile_notified)
+            .await
+            .expect("abnormal task drop must wake authoritative reconciliation");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.fence.lock().semantic_inflight == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted task must release its inflight ticket");
+
+        assert!(full_reconcile_required(runtime));
+        assert_eq!(index.persistent_status(), Some(IndexStatus::Degraded));
+        assert!(!index.persistent_protocol_ready());
+
+        *runtime.semantic_registration_barrier.lock() = None;
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert!(index.persistent_protocol_ready());
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_reconcile_notifications_do_not_bypass_failure_backoff() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let authoritative = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let (list_signal, mut list_attempted) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(authoritative)
+                .fail_list("maven/")
+                .signal_list_attempts("maven/", list_signal),
+        );
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        let runtime = index.persistent.as_ref().unwrap();
+        runtime
+            .reconcile_retry_delay_millis
+            .store(200, Ordering::Release);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = index
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), list_attempted.recv())
+            .await
+            .expect("first LIST attempt must be admitted")
+            .expect("LIST attempt channel must remain open");
+        assert_eq!(list_attempts.lock().len(), 1);
+        runtime.reconcile_retry_scheduled.notified().await;
+        assert_eq!(index.persistent_status(), Some(IndexStatus::Degraded));
+
+        for _ in 0..32 {
+            runtime.notify.notify_one();
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), list_attempted.recv())
+                .await
+                .is_err(),
+            "request notifications must not bypass the retry deadline"
+        );
+        assert_eq!(
+            list_attempts.lock().len(),
+            1,
+            "request notifications must not turn a failed reconcile into a LIST storm"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), list_attempted.recv())
+            .await
+            .expect("second LIST attempt must run after the retry deadline")
+            .expect("LIST attempt channel must remain open");
+        assert_eq!(list_attempts.lock().len(), 2);
+
+        cancel.cancel();
+        handle.await.unwrap();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn incompatible_pvc_generation_stays_hidden_until_current_topology_reconciles() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        storage
+            .put("maven/com/acme/app/1.0/app-1.0.jar", b"jar")
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let index_path = index_dir.path().join("index.redb");
+        let mut first_config = Config::default();
+        first_config.maven.repositories.clear();
+        first_config.index.path = index_path.to_string_lossy().into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let first = RepoIndex::open_persistent_for_test(&first_config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        first.reconcile_persistent_for_test().await.unwrap();
+        first.shutdown_persistent().await;
+        drop(first);
+
+        let mut changed_config = first_config.clone();
+        changed_config.maven.repositories = vec![crate::config::MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        }];
+        let reopened =
+            reopen_persistent_with_startup_state(&changed_config, &enabled, storage, true).await;
+        assert!(reopened.persistent_writer_healthy());
+        assert!(matches!(
+            reopened
+                .persistent_maven_children(
+                    vec!["maven/repositories/releases/".to_string()],
+                    String::new(),
+                    None,
+                    10,
+                )
+                .await,
+            Err(StoreError::WriterUnavailable)
+        ));
+
+        reopened.reconcile_persistent_for_test().await.unwrap();
+        assert!(reopened
+            .persistent_maven_children(
+                vec!["maven/repositories/releases/".to_string()],
+                String::new(),
+                None,
+                10,
+            )
+            .await
+            .is_ok());
+        reopened.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn stopped_writer_is_reopened_and_reconciled_without_stopping_protocol_storage() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let artifact = "maven/com/acme/app/1.0/app-1.0.jar";
+        storage.put(artifact, b"jar").await.unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        config.index.reconcile_interval_secs = 3600;
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = index.persistent.as_ref().unwrap();
+        let old = current_persistent_index(runtime).unwrap();
+        let old_generation = old.meta().await.unwrap().generation;
+        old.shutdown().await;
+        drop(old);
+        assert!(!index.persistent_writer_healthy());
+        assert_eq!(storage.get(artifact).await.unwrap().as_ref(), b"jar");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = index
+            .start_persistent_background(storage, cancel.clone())
+            .unwrap();
+        require_full_reconcile(runtime);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if index.persistent_protocol_ready() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("writer recovery must reopen and publish a current generation");
+        let recovered = current_persistent_index(runtime).unwrap();
+        assert!(recovered.writer_healthy());
+        assert!(recovered.meta().await.unwrap().generation > old_generation);
+
+        cancel.cancel();
+        handle.await.unwrap();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_writer_completion_cannot_publish_sequence_into_reseeded_runtime() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let artifact = "maven/com/acme/app/1.0/app-1.0.jar";
+        storage.put(artifact, b"jar").await.unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.maven.repositories.clear();
+        config.index.path = index_dir
+            .path()
+            .join("old.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([RegistryType::Maven]);
+        let repo_index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        repo_index.reconcile_persistent_for_test().await.unwrap();
+        let runtime = Arc::clone(repo_index.persistent.as_ref().unwrap());
+        let old = current_persistent_index(&runtime).unwrap();
+        let captured = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        *runtime.publication_barrier.lock() = Some((Arc::clone(&captured), Arc::clone(&release)));
+
+        let event_epoch = {
+            let _fence = runtime.fence.lock();
+            runtime.request_epoch.fetch_add(1, Ordering::AcqRel) + 1
+        };
+        let task = tokio::spawn(process_persistent_change(
+            Arc::clone(&runtime),
+            event_epoch,
+            ChangeEvent::MavenPathChanged {
+                repository: String::new(),
+                path: "com/acme/app/1.0/app-1.0.jar".to_string(),
+            },
+        ));
+        tokio::task::spawn_blocking(move || captured.wait())
+            .await
+            .unwrap();
+
+        let fresh = PersistentIndex::open(
+            index_dir.path().join("fresh.redb"),
+            runtime.config_digest.clone(),
+        )
+        .unwrap();
+        let replacement = {
+            let runtime = Arc::clone(&runtime);
+            let fresh = Arc::clone(&fresh);
+            tokio::task::spawn_blocking(move || {
+                let mut fence = runtime.fence.lock();
+                runtime.index.store(Some(fresh));
+                runtime.requested_sequence.store(0, Ordering::Release);
+                runtime.published_sequence.store(0, Ordering::Release);
+                runtime.resolved_epoch.store(0, Ordering::Release);
+                fence.latest_physical_receipt = None;
+                fence.physical_admitted = 0;
+                fence.physical_acked = 0;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !replacement.is_finished(),
+            "writer replacement must wait while current-handle publication holds the fence"
+        );
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+        replacement.await.unwrap();
+        *runtime.publication_barrier.lock() = None;
+        task.await.unwrap();
+
+        assert_eq!(runtime.requested_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(runtime.published_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(fresh.meta().await.unwrap().accepted_change_seq, 0);
+        assert!(full_reconcile_required(&runtime));
+
+        old.shutdown().await;
+        fresh.shutdown().await;
+    }
+
     async fn put_hosted_npm_generation(
         storage: &Storage,
         repository: &str,
@@ -1577,12 +4761,15 @@ mod tests {
             .start_background(storage.clone(), [RegistryType::Npm], cancel.clone())
             .unwrap();
 
-        for _ in 0..100 {
-            if list_attempts.lock().len() == 1 && index.status("npm") == Some(IndexStatus::Degraded)
+        let npm_index = &index.indexes[&RegistryType::Npm];
+        loop {
+            let changed = npm_index.changed.notified();
+            if npm_index.published_generation.load(Ordering::Acquire) >= 1
+                && index.status("npm") == Some(IndexStatus::Degraded)
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            changed.await;
         }
         assert_eq!(list_attempts.lock().len(), 1);
         assert_eq!(index.status("npm"), Some(IndexStatus::Degraded));
@@ -1601,11 +4788,12 @@ mod tests {
 
         // Equal jitter is bounded by the 30-second first-attempt ceiling.
         tokio::time::advance(Duration::from_secs(16)).await;
-        for _ in 0..100 {
+        loop {
+            let changed = npm_index.changed.notified();
             if index.status("npm") == Some(IndexStatus::Ready) {
                 break;
             }
-            tokio::task::yield_now().await;
+            changed.await;
         }
         assert_eq!(list_attempts.lock().len(), 2);
         assert_eq!(index.status("npm"), Some(IndexStatus::Ready));
@@ -1629,11 +4817,13 @@ mod tests {
             .start_background(storage.clone(), [RegistryType::Npm], cancel.clone())
             .unwrap();
 
-        for _ in 0..100 {
-            if list_attempts.lock().len() == 1 {
+        let npm_index = &index.indexes[&RegistryType::Npm];
+        loop {
+            let changed = npm_index.changed.notified();
+            if npm_index.failed_generation.load(Ordering::Acquire) >= 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            changed.await;
         }
         assert_eq!(list_attempts.lock().len(), 1);
         assert_eq!(index.status("npm"), Some(IndexStatus::Degraded));
@@ -1652,13 +4842,9 @@ mod tests {
             "Notify and the old one-second dirty loop must not bypass backoff"
         );
 
+        let changed = npm_index.changed.notified();
         tokio::time::advance(Duration::from_secs(16)).await;
-        for _ in 0..100 {
-            if list_attempts.lock().len() == 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        changed.await;
         assert_eq!(list_attempts.lock().len(), 2);
 
         cancel.cancel();
@@ -2668,17 +5854,11 @@ mod tests {
         let entries = vec![
             (
                 "docker/library/app/manifests/latest.json".to_string(),
-                FileMeta {
-                    size: 100,
-                    modified: 5,
-                },
+                FileMeta::local(100, 5),
             ),
             (
                 "docker/library/app/blobs/sha256:lyr".to_string(),
-                FileMeta {
-                    size: 340,
-                    modified: 9,
-                },
+                FileMeta::local(340, 9),
             ),
         ];
         let storage = Storage::from_backend(Arc::new(CountingBackend {

@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
+
+# Production redb qualification runner. The base and every additional package
+# are exact inputs; the matrix itself pins the pushed result by OCI digest.
+FROM rust:1-alpine3.21@sha256:7dba3db75b0d5861af2e5dcf5b87347411e84403b5c9835be00ef1e72e299d2a
+
+RUN apk add --no-cache \
+        bash=5.2.37-r0 \
+        git=2.47.3-r0 \
+        jq=1.7.1-r0 \
+        musl-dev=1.2.5-r11 \
+        python3=3.12.13-r0
+
+LABEL io.nora.redb-runner-schema="1" \
+      org.opencontainers.image.source="https://github.com/ivaseeq/nora"

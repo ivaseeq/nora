@@ -12,6 +12,8 @@ use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURAT
 use crate::validation::{validate_storage_key, ValidationError};
 use async_trait::async_trait;
 use axum::body::Bytes;
+use futures::{Stream, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -20,11 +22,33 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 
 /// File metadata
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub size: u64,
     pub modified: u64, // Unix timestamp
+    /// Opaque provider identity returned by LIST/HEAD. It is only a strong
+    /// reconciliation identity for provider/object classes covered by a
+    /// contract test; callers must not infer that from the field being set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// Provider version identifier, when object versioning exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
 }
+
+impl FileMeta {
+    pub fn local(size: u64, modified: u64) -> Self {
+        Self {
+            size,
+            modified,
+            etag: None,
+            version_id: None,
+        }
+    }
+}
+
+pub type StorageListStream =
+    Pin<Box<dyn Stream<Item = Result<(String, FileMeta)>> + Send + 'static>>;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -51,6 +75,35 @@ pub enum StorageError {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMutationKind {
+    Put,
+    Create,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMutationOutcome {
+    Confirmed,
+    Existing,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageMutation {
+    pub key: String,
+    pub kind: StorageMutationKind,
+    pub outcome: StorageMutationOutcome,
+}
+
+pub trait StorageMutationObserver: Send + Sync {
+    /// Record a best-effort derived-index invalidation without ever coupling a
+    /// completed storage mutation to index/PVC latency. Implementations may
+    /// enqueue bounded background work, but this callback itself must not
+    /// block or wait for durable index I/O.
+    fn observe(&self, mutation: StorageMutation);
+}
 
 /// Registry prefix of a storage key, for metric labelling only
 /// (`npm/lodash/metadata.json` → `npm`). Storage stays format-agnostic: this
@@ -125,6 +178,13 @@ pub trait StorageBackend: Send + Sync {
         }
         Ok(out)
     }
+    /// Stream keys and metadata with bounded memory. Production object/local
+    /// backends override this; the collecting default keeps custom test
+    /// backends source compatible.
+    async fn list_with_meta_stream(&self, prefix: &str) -> Result<StorageListStream> {
+        let entries = self.list_with_meta(prefix).await?;
+        Ok(Box::pin(futures::stream::iter(entries.into_iter().map(Ok))))
+    }
     async fn health_check(&self) -> bool;
     /// Refresh cached backend reachability. Object stores implement a
     /// result- and wall-time-bounded probe; local storage keeps its existing
@@ -183,6 +243,12 @@ pub struct Storage {
     /// scans against the same backend. Reachability uses its separate bounded
     /// probe and deliberately does not acquire this permit.
     scan_permit: Arc<tokio::sync::Semaphore>,
+    // Weak ownership is load-bearing: RepoIndex itself retains a Storage clone
+    // for authoritative repair reads. A strong observer here would form
+    // Storage -> RepoIndex -> Storage and keep the redb handle/file lock alive
+    // after application shutdown.
+    mutation_observer:
+        Arc<parking_lot::RwLock<Option<std::sync::Weak<dyn StorageMutationObserver>>>>,
 }
 
 impl Storage {
@@ -192,6 +258,7 @@ impl Storage {
             inner: Arc::new(LocalStorage::new(path)),
             pin_store: Some(Arc::new(HashPinStore::new(pin_path))),
             scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            mutation_observer: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -238,6 +305,7 @@ impl Storage {
             )),
             pin_store: None,
             scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            mutation_observer: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -272,6 +340,7 @@ impl Storage {
             )),
             pin_store: None,
             scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            mutation_observer: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
@@ -285,6 +354,35 @@ impl Storage {
             inner,
             pin_store: None,
             scan_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            mutation_observer: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    pub fn set_mutation_observer(&self, observer: Arc<dyn StorageMutationObserver>) {
+        *self.mutation_observer.write() = Some(Arc::downgrade(&observer));
+    }
+
+    pub fn clear_mutation_observer(&self) {
+        self.mutation_observer.write().take();
+    }
+
+    fn observe_mutation(
+        &self,
+        key: &str,
+        kind: StorageMutationKind,
+        outcome: StorageMutationOutcome,
+    ) {
+        let observer = self
+            .mutation_observer
+            .read()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(observer) = observer {
+            observer.observe(StorageMutation {
+                key: key.to_string(),
+                kind,
+                outcome,
+            });
         }
     }
 
@@ -335,6 +433,11 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Put,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
@@ -344,18 +447,33 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Put,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
                         }
                     }
                 }
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Put,
+                    StorageMutationOutcome::Confirmed,
+                );
                 Ok(())
             }
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
                     .inc();
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Put,
+                    StorageMutationOutcome::Unknown,
+                );
                 Err(e)
             }
         }
@@ -388,6 +506,11 @@ impl Storage {
                                 .with_label_values(&["put_if_absent", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Create,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
@@ -397,12 +520,22 @@ impl Storage {
                                 .with_label_values(&["put_if_absent", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Create,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
                         }
                     }
                 }
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Create,
+                    StorageMutationOutcome::Confirmed,
+                );
                 Ok(())
             }
             Err(StorageError::AlreadyExists) => {
@@ -447,12 +580,22 @@ impl Storage {
                         }
                     }
                 }
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Create,
+                    StorageMutationOutcome::Existing,
+                );
                 Err(StorageError::AlreadyExists)
             }
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put_if_absent", "error"])
                     .inc();
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Create,
+                    StorageMutationOutcome::Unknown,
+                );
                 Err(e)
             }
         }
@@ -613,12 +756,22 @@ impl Storage {
                         }
                     }
                 }
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Delete,
+                    StorageMutationOutcome::Confirmed,
+                );
                 Ok(())
             }
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["delete", "error"])
                     .inc();
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Delete,
+                    StorageMutationOutcome::Unknown,
+                );
                 Err(e)
             }
         }
@@ -645,19 +798,39 @@ impl Storage {
     /// `.nora-` internal-file filter as [`list`]. Backends carry the metadata
     /// from the listing itself, avoiding a per-key `stat()` (#738).
     pub async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        self.list_with_meta_stream(prefix)
+            .await?
+            .try_collect()
+            .await
+    }
+
+    /// Bounded listing stream. The global scan permit remains owned by the
+    /// returned stream until EOF or drop, preventing accidental overlap of two
+    /// repository-wide scans.
+    pub async fn list_with_meta_stream(&self, prefix: &str) -> Result<StorageListStream> {
         if !prefix.is_empty() {
             validate_storage_key(prefix)?;
         }
-        let _permit = self
+        let permit = self
             .scan_permit
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .expect("storage scan semaphore is never closed");
-        let entries = self.inner.list_with_meta(prefix).await?;
-        Ok(entries
-            .into_iter()
-            .filter(|(k, _)| !k.starts_with(".nora-"))
-            .collect())
+        let stream = self.inner.list_with_meta_stream(prefix).await?;
+        let filtered = stream.filter_map(|entry| async move {
+            match entry {
+                Ok((key, _)) if key.starts_with(".nora-") => None,
+                other => Some(other),
+            }
+        });
+        let guarded = futures::stream::unfold(
+            (Box::pin(filtered) as StorageListStream, permit),
+            |(mut stream, permit)| async move {
+                stream.next().await.map(|item| (item, (stream, permit)))
+            },
+        );
+        Ok(Box::pin(guarded))
     }
 
     pub async fn stat(&self, key: &str) -> Result<Option<FileMeta>> {
@@ -766,6 +939,11 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Put,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
@@ -775,18 +953,33 @@ impl Storage {
                                 .with_label_values(&["put", "pin_error"])
                                 .inc();
                             tracing::error!(error = %e, key = %key, "hash-pin record task panicked");
+                            self.observe_mutation(
+                                key,
+                                StorageMutationKind::Put,
+                                StorageMutationOutcome::Unknown,
+                            );
                             return Err(StorageError::Io(std::io::Error::other(format!(
                                 "hash-pin record failed: {e}"
                             ))));
                         }
                     }
                 }
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Put,
+                    StorageMutationOutcome::Confirmed,
+                );
                 Ok(())
             }
             Err(e) => {
                 STORAGE_OPERATIONS
                     .with_label_values(&["put", "error"])
                     .inc();
+                self.observe_mutation(
+                    key,
+                    StorageMutationKind::Put,
+                    StorageMutationOutcome::Unknown,
+                );
                 Err(e)
             }
         }
@@ -848,8 +1041,80 @@ impl Storage {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        mutations: Mutex<Vec<StorageMutation>>,
+    }
+
+    impl StorageMutationObserver for RecordingObserver {
+        fn observe(&self, mutation: StorageMutation) {
+            self.mutations.lock().push(mutation);
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_observer_records_confirmed_existing_and_unknown_outcomes() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().join("plain").to_str().unwrap());
+        let observer = Arc::new(RecordingObserver::default());
+        storage.set_mutation_observer(observer.clone());
+
+        storage.put("maven/confirmed.jar", b"body").await.unwrap();
+        storage
+            .put_if_absent("npm/existing.tgz", b"winner")
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.put_if_absent("npm/existing.tgz", b"loser").await,
+            Err(StorageError::AlreadyExists)
+        ));
+        let recorded = observer.mutations.lock().clone();
+        assert!(recorded.iter().any(|mutation| {
+            mutation.key == "maven/confirmed.jar"
+                && mutation.kind == StorageMutationKind::Put
+                && mutation.outcome == StorageMutationOutcome::Confirmed
+        }));
+        assert!(recorded.iter().any(|mutation| {
+            mutation.key == "npm/existing.tgz"
+                && mutation.kind == StorageMutationKind::Create
+                && mutation.outcome == StorageMutationOutcome::Existing
+        }));
+
+        let inner = Storage::new_local(dir.path().join("fault").to_str().unwrap());
+        let backend = crate::test_helpers::FaultInjectBackend::new(inner.clone())
+            .fail_put_after("maven/unknown.jar");
+        let uncertain = Storage::from_backend(Arc::new(backend));
+        uncertain.set_mutation_observer(observer.clone());
+        assert!(matches!(
+            uncertain.put("maven/unknown.jar", b"committed").await,
+            Err(StorageError::Network(_))
+        ));
+        assert_eq!(
+            inner.get("maven/unknown.jar").await.unwrap().as_ref(),
+            b"committed",
+            "post-commit failure must model an actually committed unknown outcome"
+        );
+        assert!(observer.mutations.lock().iter().any(|mutation| {
+            mutation.key == "maven/unknown.jar"
+                && mutation.kind == StorageMutationKind::Put
+                && mutation.outcome == StorageMutationOutcome::Unknown
+        }));
+    }
+
+    #[test]
+    fn mutation_observer_is_weak_to_avoid_storage_index_cycles() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let observer = Arc::new(RecordingObserver::default());
+        let weak = Arc::downgrade(&observer);
+        storage.set_mutation_observer(observer.clone());
+        drop(observer);
+        assert!(weak.upgrade().is_none());
+    }
 
     /// The GCS wrapper constructs without credentials or network and disables
     /// the pin store, matching the S3 wrapper's at-rest posture.

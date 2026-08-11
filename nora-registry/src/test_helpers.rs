@@ -56,7 +56,11 @@ pub struct FaultInjectBackend {
     stat_none: HashSet<String>,
     list_failures: HashSet<String>,
     list_omissions: HashSet<String>,
+    synthesize_content_etags: bool,
     write_barriers: HashMap<String, Arc<tokio::sync::Barrier>>,
+    get_barriers: HashMap<String, (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    list_barriers: HashMap<String, (Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    list_attempt_signals: HashMap<String, tokio::sync::mpsc::UnboundedSender<()>>,
     delete_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     get_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
     reader_attempts: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -81,7 +85,11 @@ impl FaultInjectBackend {
             stat_none: HashSet::new(),
             list_failures: HashSet::new(),
             list_omissions: HashSet::new(),
+            synthesize_content_etags: false,
             write_barriers: HashMap::new(),
+            get_barriers: HashMap::new(),
+            list_barriers: HashMap::new(),
+            list_attempt_signals: HashMap::new(),
             delete_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             get_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
             reader_attempts: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -154,6 +162,14 @@ impl FaultInjectBackend {
         self
     }
 
+    /// Give local test objects deterministic strong identities, matching the
+    /// ETag/version metadata expected from S3 without weakening production
+    /// reuse rules for backends that expose only size and mtime.
+    pub fn with_content_etags(mut self) -> Self {
+        self.synthesize_content_etags = true;
+        self
+    }
+
     /// Hold every write to `key` until `parties` contenders reach the same
     /// storage boundary. This deterministically exposes stat-then-put races.
     pub fn barrier_writes(
@@ -162,6 +178,45 @@ impl FaultInjectBackend {
         barrier: Arc<tokio::sync::Barrier>,
     ) -> Self {
         self.write_barriers.insert(key.into(), barrier);
+        self
+    }
+
+    /// Hold a completed listing until the test releases it. Waiting after the
+    /// inner listing has materialised its result makes S3-scan/replay races
+    /// deterministic: subsequent writes are absent from the captured page.
+    pub fn barrier_lists(
+        mut self,
+        prefix: impl Into<String>,
+        captured: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.list_barriers
+            .insert(prefix.into(), (captured, release));
+        self
+    }
+
+    /// Emit one event as soon as a LIST attempt is admitted. Unlike the
+    /// completed-list barrier, this also observes injected failures and lets
+    /// backoff tests avoid virtual-time polling.
+    pub fn signal_list_attempts(
+        mut self,
+        prefix: impl Into<String>,
+        signal: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.list_attempt_signals.insert(prefix.into(), signal);
+        self
+    }
+
+    /// Hold an exact-key GET after the request has been admitted. Unlike a
+    /// LIST barrier this does not retain Storage's global scan permit, so it
+    /// can deterministically exercise out-of-order semantic preparation.
+    pub fn barrier_get(
+        mut self,
+        key: impl Into<String>,
+        captured: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.get_barriers.insert(key.into(), (captured, release));
         self
     }
 
@@ -234,6 +289,10 @@ impl StorageBackend for FaultInjectBackend {
 
     async fn get(&self, key: &str) -> crate::storage::Result<Bytes> {
         self.get_attempts.lock().push(key.to_string());
+        if let Some((captured, release)) = self.get_barriers.get(key) {
+            captured.wait().await;
+            release.wait().await;
+        }
         if self.get_failures.contains(key) {
             return Err(StorageError::Network("injected get failure".to_string()));
         }
@@ -273,6 +332,9 @@ impl StorageBackend for FaultInjectBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.list_attempts.lock().push(prefix.to_string());
+        if let Some(signal) = self.list_attempt_signals.get(prefix) {
+            let _ = signal.send(());
+        }
         if self.list_failures.contains(prefix) {
             return Err(StorageError::Network("injected list failure".to_string()));
         }
@@ -288,7 +350,15 @@ impl StorageBackend for FaultInjectBackend {
         if self.stat_none.contains(key) {
             return Ok(None);
         }
-        self.inner.stat(key).await
+        let mut meta = self.inner.stat(key).await?;
+        if self.synthesize_content_etags {
+            if let Some(meta) = &mut meta {
+                use sha2::Digest as _;
+                let bytes = self.inner.get(key).await?;
+                meta.etag = Some(hex::encode(sha2::Sha256::digest(&bytes)));
+            }
+        }
+        Ok(meta)
     }
 
     async fn list_with_meta(
@@ -296,12 +366,26 @@ impl StorageBackend for FaultInjectBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
         self.list_attempts.lock().push(prefix.to_string());
+        if let Some(signal) = self.list_attempt_signals.get(prefix) {
+            let _ = signal.send(());
+        }
         if self.list_failures.contains(prefix) {
             return Err(StorageError::Network("injected list failure".to_string()));
         }
         let mut entries = self.inner.list_with_meta(prefix).await?;
+        if let Some((captured, release)) = self.list_barriers.get(prefix) {
+            captured.wait().await;
+            release.wait().await;
+        }
         entries
             .retain(|(key, _)| !self.stat_none.contains(key) && !self.list_omissions.contains(key));
+        if self.synthesize_content_etags {
+            use sha2::Digest as _;
+            for (key, meta) in &mut entries {
+                let bytes = self.inner.get(key).await?;
+                meta.etag = Some(hex::encode(sha2::Sha256::digest(&bytes)));
+            }
+        }
         Ok(entries)
     }
 
@@ -410,6 +494,14 @@ fn build_context(
             gcs_service_account_path: None,
             gcs_base_url: None,
             ..StorageConfig::default()
+        },
+        index: crate::config::IndexConfig {
+            path: tempdir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned(),
+            ..crate::config::IndexConfig::default()
         },
         maven: MavenConfig {
             enabled: true,
@@ -615,6 +707,13 @@ fn build_context(
         signer,
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        background_mutations: tokio_util::task::TaskTracker::new(),
+        background_mutation_aborts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        startup_reconcile_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        background_mutation_permits: Arc::new(tokio::sync::Semaphore::new(
+            crate::BACKGROUND_MUTATION_CONCURRENCY,
+        )),
+        draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let _ = state.repo_index.start_background(
@@ -703,6 +802,10 @@ fn build_context(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::auth_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::reject_new_mutations_while_draining,
         ))
         .with_state(state.clone());
 

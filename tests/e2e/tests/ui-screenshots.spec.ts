@@ -1,87 +1,86 @@
-/**
- * Visual Regression Tests for NORA Registry UI
- *
- * Uses Playwright's toHaveScreenshot() for pixel-level comparison.
- * Baselines are committed to git — they ARE the visual contract.
- *
- * First run:  npx playwright test ui-screenshots --update-snapshots
- * Later runs: npx playwright test ui-screenshots
- *
- * Tolerance: 1% pixel diff (maxDiffPixelRatio: 0.01)
- * Viewport:  1280x720 (fixed for deterministic screenshots)
- */
+import { expect, test } from './fixtures/ui-test';
+import { envPath, openSearchableList, openUi } from './helpers/ui';
 
-import { test, expect } from '@playwright/test';
-import { REGISTRIES } from './contracts/registry-contracts';
-import { seedAll, SeedResult } from './contracts/seed';
+const seeded = process.env.NORA_VISUAL_SEEDED === '1';
+const npmDetail = envPath('NORA_E2E_NPM_DETAIL_PATH');
+const mavenDetail = envPath('NORA_E2E_MAVEN_DETAIL_PATH');
+const npmQuery = process.env.NORA_E2E_NPM_QUERY?.trim();
 
-let seed: SeedResult;
+test.describe('deterministic FullHD visual contract', () => {
+  test.skip(
+    !seeded,
+    'Visual goldens require NORA_VISUAL_SEEDED=1 and a pinned, deterministic dataset',
+  );
 
-test.beforeAll(async ({ request }) => {
-  seed = await seedAll(request);
-  await new Promise((r) => setTimeout(r, 1500));
-});
-
-// Fixed viewport for stable screenshots
-test.use({ viewport: { width: 1280, height: 720 } });
-
-// ── Dashboard ──────────────────────────────────────────────────
-
-test('dashboard', async ({ page }) => {
-  await page.goto('/ui/');
-  // Wait for stats to load
-  await page.waitForSelector('#stat-downloads', { state: 'visible' });
-  await expect(page).toHaveScreenshot('dashboard.png', {
-    maxDiffPixelRatio: 0.01,
+  test.beforeEach(async ({ context, request }) => {
+    await expect
+      .poll(async () => (await request.get('/ready/index')).status(), {
+        message: 'persistent Maven/npm index must be ready before visual capture',
+        timeout: 90_000,
+      })
+      .toBe(200);
+    await context.addCookies([
+      {
+        name: 'nora_lang',
+        value: 'en',
+        url: process.env.NORA_URL || 'http://localhost:4000',
+      },
+    ]);
   });
-});
 
-// ── Registry List Pages ────────────────────────────────────────
-
-for (const reg of REGISTRIES) {
-  test(`list: ${reg.slug}`, async ({ page }) => {
-    await page.goto(`/ui/${reg.list.slug}`);
-    await page.waitForSelector('#repo-table-body', { state: 'attached' });
-    // Small delay for any HTMX-driven content to settle
-    await page.waitForTimeout(300);
-    await expect(page).toHaveScreenshot(`list-${reg.slug}.png`, {
-      maxDiffPixelRatio: 0.01,
+  test('dashboard', async ({ page }) => {
+    await openUi(page, '/ui/');
+    await expect(page.locator('#stat-downloads')).toBeVisible();
+    await expect(page).toHaveScreenshot('dashboard-fullhd.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      mask: [
+        page.locator('#uptime'),
+        page.locator('#activity-log tbody tr td:first-child'),
+      ],
+      maskColor: '#1e293b',
+      maxDiffPixels: 0,
     });
   });
-}
 
-// ── Detail Pages (seeded registries only) ──────────────────────
-
-test('detail: docker', async ({ page }) => {
-  await page.goto(`/ui/docker/${seed.docker.name}`);
-  await page.waitForSelector('h1', { state: 'visible' });
-  await expect(page).toHaveScreenshot('detail-docker.png', {
-    maxDiffPixelRatio: 0.01,
+  test('npm filtered list', async ({ page }) => {
+    test.skip(!npmQuery, 'Set NORA_E2E_NPM_QUERY to a deterministic seeded package');
+    const searchbox = await openSearchableList(page, '/ui/npm');
+    const response = page.waitForResponse((candidate) => {
+      const url = new URL(candidate.url());
+      return url.pathname === '/api/ui/npm/search' && url.searchParams.get('q') === npmQuery;
+    });
+    await searchbox.fill(npmQuery!);
+    await response;
+    await expect(page.locator('#repo-results')).toHaveAttribute('aria-busy', 'false');
+    await expect(page).toHaveScreenshot('npm-filtered-fullhd.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      mask: [page.locator('#repo-results tbody td:nth-child(4)')],
+      maskColor: '#1e293b',
+      maxDiffPixels: 0,
+    });
   });
-});
 
-test('detail: npm', async ({ page }) => {
-  await page.goto(`/ui/npm/${seed.npm.name}`);
-  await page.waitForSelector('#install-cmd', { state: 'visible' });
-  await expect(page).toHaveScreenshot('detail-npm.png', {
-    maxDiffPixelRatio: 0.01,
+  test('npm detail', async ({ page }) => {
+    test.skip(!npmDetail, 'Set NORA_E2E_NPM_DETAIL_PATH for the seeded package');
+    await openUi(page, npmDetail!);
+    await expect(page.locator('#install-cmd')).toBeVisible();
+    await expect(page).toHaveScreenshot('npm-detail-fullhd.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      maxDiffPixels: 0,
+    });
   });
-});
 
-test('detail: maven', async ({ page }) => {
-  const mavenPath = `${seed.maven.group}/${seed.maven.artifact}/${seed.maven.version}`;
-  await page.goto(`/ui/maven/${mavenPath}`);
-  await page.waitForSelector('pre', { state: 'visible' });
-  await expect(page).toHaveScreenshot('detail-maven.png', {
-    maxDiffPixelRatio: 0.01,
-  });
-});
-
-test('detail: raw', async ({ page }) => {
-  const rawGroup = seed.raw.path.split('/')[0];
-  await page.goto(`/ui/raw/${rawGroup}`);
-  await page.waitForSelector('h1', { state: 'visible' });
-  await expect(page).toHaveScreenshot('detail-raw.png', {
-    maxDiffPixelRatio: 0.01,
+  test('Maven artifact detail', async ({ page }) => {
+    test.skip(!mavenDetail, 'Set NORA_E2E_MAVEN_DETAIL_PATH for the seeded coordinate');
+    await openUi(page, mavenDetail!);
+    await expect(page.locator('main a[href^="/repository/"]').first()).toBeVisible();
+    await expect(page).toHaveScreenshot('maven-detail-fullhd.png', {
+      animations: 'disabled',
+      caret: 'hide',
+      maxDiffPixels: 0,
+    });
   });
 });

@@ -1,0 +1,29 @@
+# One exact upstream redb git revision per line, added only after the NORA
+# SIGKILL, ENOSPC, torn-write, corruption, double-crash and recovery matrix
+# passes against the exact image. The canonical upstream URL is enforced by the
+# verifier; branches, tags, short revisions and repository substitutions fail.
+# Production approvals use exactly seven whitespace-separated fields. The last
+# two bind the approval to a checked-in immutable evidence locator manifest;
+# a free-form digest with no saved evidence is rejected:
+#   git <40-hex-revision> <resolved-40-hex-commit> <ENGINE_REVISION> <SCHEMA_VERSION> <evidence-manifest-sha256> <evidence-manifest-path>
+#
+# Keep this file empty until the selected revision has been independently
+# verified to include at least these crash/recovery fixes:
+#   fd82cedb081de675bdb05c866b522e43c84c6110
+#   88881b80b7a7bc0d65ab8e505bf2965209c95d79
+#   8e04e95b7f22cb15be50bbce9e23fd68c2e32593
+#   beb7c8ec7af5c4c2a37867301b5289cc0b84f01b
+# and the unsafe-corruption paths tracked by redb issues #1331 and #1332 have
+# either shipped fixes or are contained by an independently reviewed design.
+#
+# Adding a row also requires the full matrix, evidence schema 3, a fresh
+# ENGINE_REVISION, and a SCHEMA_VERSION bump so no DB created by an earlier
+# engine contract is reopened in production. The source gate binds the resolved
+# lock source, Cargo.lock digest, canonical load-bearing NORA source digest,
+# exact matrix/minio/runtime/upstream harness digests and an immutable OCI
+# evidence locator. The approval records the OCI manifest digest separately
+# from the downloaded tar SHA-256; the verifier fetches the descriptor, pulls
+# the artifact by digest, hashes both files and verifies that the embedded
+# matrix binds the exact tested Harbor image digest. The Helm chart digest and
+# rendered image are still bound by the separate chart-promotion gate.
+git c419f099fd55a7905d0f5370c1508070bf7ac14c c419f099fd55a7905d0f5370c1508070bf7ac14c redb-c419f099-dev 5 ce8c09df75df58b3b8f3bf5ec61bbeb064e59eee7c9a3084e43da74f284bf872 scripts/redb-production-evidence/c419f099fd55a7905d0f5370c1508070bf7ac14c.json

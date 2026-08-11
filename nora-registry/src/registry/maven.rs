@@ -318,6 +318,37 @@ fn metadata_artifact_coordinates(path: &str) -> Option<(String, String)> {
         })
 }
 
+fn invalidate_maven_document_index(
+    state: &AppState,
+    repository: &DirectRepository,
+    document_path: &str,
+    document: &[u8],
+) {
+    let server_managed_artifact_metadata = matches!(
+        classify_path(document_path),
+        MavenPathKind::ArtifactMeta { ref filename, .. } if filename == "maven-metadata.xml"
+    ) && matches!(
+        classify_metadata_level(document),
+        Some(
+            MavenMetadataLevel::Group
+                | MavenMetadataLevel::Artifact
+                | MavenMetadataLevel::ArtifactAndGroup
+        )
+    );
+    if server_managed_artifact_metadata {
+        if let Some((group_path, artifact_id)) = metadata_artifact_coordinates(document_path) {
+            state.repo_index.invalidate_maven_ga(
+                repository.name.as_deref().unwrap_or(""),
+                &format!("{group_path}/{artifact_id}"),
+            );
+            return;
+        }
+    }
+    state
+        .repo_index
+        .invalidate_maven_path(repository.name.as_deref().unwrap_or(""), document_path);
+}
+
 fn is_snapshot(version: &str) -> bool {
     version.ends_with("-SNAPSHOT")
 }
@@ -618,8 +649,16 @@ async fn download_direct(
         // between the recursive response and this lock), return the derived
         // checksum but do not leave an orphan sidecar behind.
         if latest.is_some() {
-            if let Err(error) = state.storage.put(&key, checksum.as_bytes()).await {
-                tracing::warn!(%error, %key, "Failed to refresh derived Maven checksum");
+            match state.storage.put(&key, checksum.as_bytes()).await {
+                Ok(()) => invalidate_maven_document_index(
+                    &state,
+                    &repository,
+                    document_path,
+                    checksum_source,
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, %key, "Failed to refresh derived Maven checksum");
+                }
             }
         }
         return with_content_type(&path, Bytes::from(checksum)).into_response();
@@ -1502,6 +1541,7 @@ where
         match state.storage.put(&key, expected.as_bytes()).await {
             Ok(()) => {
                 state.metrics.record_upload("maven");
+                invalidate_maven_document_index(&state, &repository, document_path, &document);
                 return StatusCode::CREATED.into_response();
             }
             Err(error) => {
@@ -1546,6 +1586,13 @@ where
                         }
                     };
                     if existing != body {
+                        // Storage reports AlreadyExists to the physical observer
+                        // even when no bytes changed. Pair it with the exact
+                        // semantic bundle so this rejected request cannot leave
+                        // the global index dirty and trigger a full S3 reconcile.
+                        state
+                            .repo_index
+                            .invalidate_maven_path(repository.name.as_deref().unwrap_or(""), &path);
                         return (
                             StatusCode::CONFLICT,
                             format!(
@@ -1616,7 +1663,10 @@ where
                 crate::registry_type::RegistryType::Maven,
                 "LOCAL",
             ));
-            state.repo_index.invalidate("maven");
+            state.repo_index.invalidate_maven_ga(
+                repository.name.as_deref().unwrap_or(""),
+                &format!("{}/{}", coords.group_path, coords.artifact_id),
+            );
 
             StatusCode::CREATED.into_response()
         }
@@ -1768,6 +1818,7 @@ where
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
                 state.metrics.record_upload("maven");
+                invalidate_maven_document_index(&state, &repository, &path, xml.as_bytes());
                 return StatusCode::CREATED.into_response();
             }
 
@@ -1803,6 +1854,7 @@ where
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                     state.metrics.record_upload("maven");
+                    invalidate_maven_document_index(&state, &repository, &path, &body);
                     StatusCode::CREATED.into_response()
                 }
                 Err(error) => {
@@ -1824,7 +1876,9 @@ where
                     crate::registry_type::RegistryType::Maven,
                     "LOCAL",
                 ));
-                state.repo_index.invalidate("maven");
+                state
+                    .repo_index
+                    .invalidate_maven_path(repository.name.as_deref().unwrap_or(""), &path);
                 StatusCode::CREATED.into_response()
             }
             Err(e) => {
@@ -2754,6 +2808,8 @@ async fn merge_and_cache_proxy_metadata(
             tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
         } else if let Err(error) = compute_and_store_checksums(&state.storage, &key, &data).await {
             tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata checksums");
+        } else {
+            invalidate_maven_document_index(state, repository, document_path, &data);
         }
     }
 
@@ -4087,8 +4143,8 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 mod integration_tests {
     use super::{
-        checksum_hex, compute_and_store_checksums, merge_and_cache_proxy_metadata,
-        parse_artifact_metadata, repository_storage_key, DirectRepository,
+        checksum_hex, compute_and_store_checksums, download_direct, merge_and_cache_proxy_metadata,
+        parse_artifact_metadata, repository_storage_key, upload_direct, DirectRepository,
     };
     use crate::config::{MavenRepository, MavenVersionPolicy, MavenWritePolicy};
     use crate::storage::{
@@ -4098,7 +4154,7 @@ mod integration_tests {
         body_bytes, create_test_context, create_test_context_with_config, send, send_with_headers,
     };
     use axum::body::{Body, Bytes};
-    use axum::http::{Method, StatusCode};
+    use axum::http::{HeaderMap, Method, StatusCode};
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::path::Path as FsPath;
@@ -4220,10 +4276,11 @@ mod integration_tests {
         }
 
         async fn stat(&self, key: &str) -> StorageResult<Option<FileMeta>> {
-            Ok(self.objects.lock().get(key).map(|data| FileMeta {
-                size: data.len() as u64,
-                modified: 1,
-            }))
+            Ok(self
+                .objects
+                .lock()
+                .get(key)
+                .map(|data| FileMeta::local(data.len() as u64, 1)))
         }
 
         async fn health_check(&self) -> bool {
@@ -6189,6 +6246,109 @@ mod integration_tests {
             String::from_utf8_lossy(&ctx.state.storage.get(&sidecar_key).await.unwrap()),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn checksum_and_managed_metadata_routes_cover_physical_events_without_root_reconcile() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+            config.maven.repositories.clear();
+        });
+        let backend = Arc::new(crate::test_helpers::FaultInjectBackend::new(
+            ctx.state.storage.clone(),
+        ));
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        list_attempts.lock().clear();
+
+        let mut state = ctx.state.clone();
+        state.storage = storage;
+        state.repo_index = Arc::clone(&index);
+        state.storage.set_mutation_observer(index.clone());
+        let repository = DirectRepository::legacy(&state);
+        let path = "com/example/indexed/1.0/indexed-1.0.jar";
+        let response = upload_direct(
+            state.clone(),
+            repository.clone(),
+            path.to_string(),
+            Bytes::from_static(b"jar"),
+            |_| true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let checksum_path = format!("{path}.sha256");
+        let checksum = checksum_hex("sha256", b"jar").unwrap();
+        let response = upload_direct(
+            state.clone(),
+            repository.clone(),
+            checksum_path.clone(),
+            Bytes::from(checksum),
+            |_| true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let sidecar_key = format!("maven/{checksum_path}");
+        state.storage.put(&sidecar_key, b"stale").await.unwrap();
+        let response = download_direct(
+            state.clone(),
+            HeaderMap::new(),
+            repository.clone(),
+            checksum_path,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let metadata_path = "com/example/indexed/maven-metadata.xml";
+        let metadata = state
+            .storage
+            .get(&format!("maven/{metadata_path}"))
+            .await
+            .unwrap();
+        let response = upload_direct(
+            state.clone(),
+            repository,
+            metadata_path.to_string(),
+            metadata,
+            |_| true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let caught_up = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !index.persistent_protocol_ready() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if caught_up.is_err() {
+            let meta = index.persistent_meta_for_test().await.unwrap();
+            panic!(
+                "typed Maven route hooks did not cover physical writes: meta={meta:?}, lists={:?}",
+                list_attempts.lock().as_slice()
+            );
+        }
+        assert!(
+            !list_attempts.lock().iter().any(|prefix| prefix == "maven/"),
+            "route-local repair may list one GA/directory but must not schedule a full Maven scan"
+        );
+        state.storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
     }
 
     #[tokio::test]

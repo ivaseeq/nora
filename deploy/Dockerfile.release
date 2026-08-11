@@ -11,6 +11,10 @@
 
 FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
 ARG TARGETARCH
+ARG NORA_SOURCE_TREE=unknown
+ARG NORA_CARGO_LOCK_SHA256=unknown
+LABEL io.nora.source-tree="$NORA_SOURCE_TREE" \
+      io.nora.cargo-lock-sha256="$NORA_CARGO_LOCK_SHA256"
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \

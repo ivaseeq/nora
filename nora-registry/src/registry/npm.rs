@@ -607,7 +607,7 @@ fn proxy_negative_key(repository: &str, package: &str) -> String {
     format!("{}/proxy/negative/{package}", repository_prefix(repository))
 }
 
-fn proxy_tarball_key(repository: &str, package: &str, filename: &str) -> String {
+pub(crate) fn proxy_tarball_key(repository: &str, package: &str, filename: &str) -> String {
     format!(
         "{}/proxy/tarballs/{package}/{filename}",
         repository_prefix(repository)
@@ -767,7 +767,7 @@ fn upstream_package_path(package: &str) -> String {
     package.replace('/', "%2F")
 }
 
-fn canonical_tarball_filename(package: &str, version: &str) -> String {
+pub(crate) fn canonical_tarball_filename(package: &str, version: &str) -> String {
     format!(
         "{}-{version}.tgz",
         package.split('/').next_back().unwrap_or(package)
@@ -2275,13 +2275,34 @@ async fn store_modified_proxy_packument(
         .await
         .map_err(|_| ReadError::StorageUnavailable)?;
     write_npm_proxy_validators(state, repository, package, key, &body, &validators).await;
-    state.repo_index.invalidate("npm");
     match state.storage.delete(negative_key).await {
         Ok(()) | Err(StorageError::NotFound) => {}
         Err(_) => return Err(ReadError::StorageUnavailable),
     }
     state.record_proxy_cache_access_locked(key).await;
+    state
+        .repo_index
+        .invalidate_npm_proxy(&repository.name, package);
     Ok(PackumentRead::fresh(value))
+}
+
+async fn store_proxy_negative_cache(
+    state: &AppState,
+    repository: &ProxyRepository,
+    package: &str,
+    negative_key: &str,
+) {
+    if repository.negative_ttl == 0 {
+        return;
+    }
+    if state.storage.put(negative_key, b"not-found").await.is_ok() {
+        // Pair the storage observer's physical event with the narrow logical
+        // package update. This lets redb coalesce the write instead of forcing
+        // a full npm namespace reconciliation for a negative-cache entry.
+        state
+            .repo_index
+            .invalidate_npm_proxy(&repository.name, package);
+    }
 }
 
 async fn proxy_packument_raw(
@@ -2394,6 +2415,9 @@ async fn proxy_packument_raw(
                     .await
                     .map_err(|_| ReadError::StorageUnavailable)?;
                 state.record_proxy_cache_access_locked(&key).await;
+                state
+                    .repo_index
+                    .invalidate_npm_proxy(&repository.name, package);
                 return Ok(PackumentRead::fresh(value));
             }
 
@@ -2422,9 +2446,7 @@ async fn proxy_packument_raw(
                 }
                 Ok(Revalidation::NotModified) => Err(ReadError::StorageUnavailable),
                 Err(ProxyError::NotFound) => {
-                    if repository.negative_ttl > 0 {
-                        let _ = state.storage.put(&negative_key, b"not-found").await;
-                    }
+                    store_proxy_negative_cache(state, repository, package, &negative_key).await;
                     Err(ReadError::NotFound)
                 }
                 Err(ProxyError::CircuitOpen(name)) => Err(ReadError::CircuitOpen(name)),
@@ -2449,9 +2471,7 @@ async fn proxy_packument_raw(
                     .with_label_values(&["npm"])
                     .inc();
             }
-            if repository.negative_ttl > 0 {
-                let _ = state.storage.put(&negative_key, b"not-found").await;
-            }
+            store_proxy_negative_cache(state, repository, package, &negative_key).await;
             Err(ReadError::NotFound)
         }
         Err(ProxyError::CircuitOpen(name)) => {
@@ -3039,7 +3059,9 @@ async fn serve_proxy_tarball(
                     return None;
                 }
                 state.record_proxy_cache_access_locked(&key).await;
-                state.repo_index.invalidate("npm");
+                state
+                    .repo_index
+                    .invalidate_npm_proxy(&repository.name, package);
                 state.metrics.record_cache_miss("npm");
                 state.activity.push(ActivityEntry::new(
                     ActionType::ProxyFetch,
@@ -4809,7 +4831,7 @@ async fn publish_import_version_locked(
         RegistryType::Npm,
         "LOCAL",
     ));
-    state.repo_index.invalidate("npm");
+    state.repo_index.invalidate_npm_hosted(repository, package);
     StatusCode::CREATED.into_response()
 }
 
@@ -4829,7 +4851,7 @@ async fn publish_with_import(
     let lock = state.publish_lock(&lock_key);
     let _guard = lock.lock().await;
     match resume_hosted_maintenance_operation(&state.storage, repository, package).await {
-        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(true) => state.repo_index.invalidate_npm_hosted(repository, package),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -5172,7 +5194,7 @@ async fn publish_with_import(
         RegistryType::Npm,
         "LOCAL",
     ));
-    state.repo_index.invalidate("npm");
+    state.repo_index.invalidate_npm_hosted(repository, package);
     StatusCode::CREATED.into_response()
 }
 
@@ -5774,7 +5796,9 @@ async fn named_import_finalize(
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
     match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
-        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(true) => state
+            .repo_index
+            .invalidate_npm_hosted(&repository, &package),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -6010,7 +6034,9 @@ async fn named_import_finalize(
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    state.repo_index.invalidate("npm");
+    state
+        .repo_index
+        .invalidate_npm_hosted(&repository, &package);
     import_receipt_response(receipt, StatusCode::CREATED)
 }
 
@@ -6081,7 +6107,7 @@ async fn deprecate(
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
     match resume_hosted_maintenance_operation(&state.storage, repository, package).await {
-        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(true) => state.repo_index.invalidate_npm_hosted(repository, package),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -6176,7 +6202,7 @@ async fn deprecate(
         .await
         {
             Ok(()) => {
-                state.repo_index.invalidate("npm");
+                state.repo_index.invalidate_npm_hosted(repository, package);
                 return StatusCode::CREATED.into_response();
             }
             Err(StorageError::AlreadyExists) if attempt == 0 => continue,
@@ -6393,7 +6419,9 @@ async fn handle_dist_tag_put(
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
     match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
-        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(true) => state
+            .repo_index
+            .invalidate_npm_hosted(&repository, &package),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -6476,7 +6504,9 @@ async fn handle_dist_tag_put(
         .await
         {
             Ok(()) => {
-                state.repo_index.invalidate("npm");
+                state
+                    .repo_index
+                    .invalidate_npm_hosted(&repository, &package);
                 return StatusCode::CREATED.into_response();
             }
             Err(StorageError::AlreadyExists) if attempt == 0 => continue,
@@ -6540,7 +6570,9 @@ async fn handle_dist_tag_delete(
     let lock = state.publish_lock(&format!("npm:{repository}:{package}"));
     let _guard = lock.lock().await;
     match resume_hosted_maintenance_operation(&state.storage, &repository, &package).await {
-        Ok(true) => state.repo_index.invalidate("npm"),
+        Ok(true) => state
+            .repo_index
+            .invalidate_npm_hosted(&repository, &package),
         Ok(false) => {}
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -6616,7 +6648,9 @@ async fn handle_dist_tag_delete(
         .await
         {
             Ok(()) => {
-                state.repo_index.invalidate("npm");
+                state
+                    .repo_index
+                    .invalidate_npm_hosted(&repository, &package);
                 return StatusCode::NO_CONTENT.into_response();
             }
             Err(StorageError::AlreadyExists) if attempt == 0 => continue,

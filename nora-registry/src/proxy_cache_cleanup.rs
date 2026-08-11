@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use crate::config::{Config, MavenRepository, NpmRepository, ProxyCacheCleanupConfig};
 use crate::npm_layout::{parse_npm_object_key, NpmObjectKind};
-use crate::repo_index::{IndexStatus, RepoIndex};
+use crate::repo_index::{IndexStatus, IndexedObject, RepoIndex};
 use crate::storage::{FileMeta, Storage, StorageError};
 use crate::{acquire_publish_lock, PublishLocks};
 
@@ -35,6 +35,7 @@ const SESSION_KEY: &str = ".nora-proxy-access/session-v1.json";
 const TOUCH_CAPACITY: usize = 16_384;
 const TOUCH_COALESCE: Duration = Duration::from_secs(3_600);
 const TOUCH_RETRY: Duration = Duration::from_secs(30);
+const CLEANUP_INDEX_PAGE_SIZE: usize = 1_000;
 
 static CLEANUP_DELETED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -590,6 +591,11 @@ pub async fn run_proxy_cache_cleanup(
     let mut result = ProxyCacheCleanupResult::default();
     let mut recovery_complete = true;
     let mut invalidated = HashSet::new();
+    // Persistent Maven/npm share one atomic generation. Capture the destructive
+    // admission gate once: this run's own first DELETE deliberately makes the
+    // runtime Warming, while per-page revision checks plus exact-key S3
+    // revalidation remain the safety oracle for the rest of the same batch.
+    let persistent_ready = repo_index.has_persistent() && repo_index.persistent_protocol_ready();
 
     for target in cleanup_targets(config) {
         if cancel.is_cancelled() {
@@ -597,12 +603,14 @@ pub async fn run_proxy_cache_cleanup(
             recovery_complete = false;
             break;
         }
-        // The repository index already owns the one full LIST snapshot. Reuse
-        // its immutable Arc<Vec<_>> so cleanup adds O(1) memory instead of a
-        // second O(objects) collection/sort beside the live index. A Degraded
-        // snapshot is never a destructive oracle; exact-key checks below still
-        // revalidate every candidate from a Ready snapshot.
-        if repo_index.status(target.registry) != Some(IndexStatus::Ready) {
+        // A Degraded snapshot is never a destructive oracle; exact-key checks
+        // below still revalidate every candidate from a Ready snapshot.
+        let target_ready = if repo_index.has_persistent() {
+            persistent_ready
+        } else {
+            repo_index.status(target.registry) == Some(IndexStatus::Ready)
+        };
+        if !target_ready {
             result.failures += 1;
             recovery_complete = false;
             CLEANUP_SKIPPED
@@ -614,39 +622,97 @@ pub async fn run_proxy_cache_cleanup(
             );
             continue;
         }
-        let entries = repo_index.objects(target.registry);
-        for entry in entries.iter() {
-            let key = &entry.key;
-            if !key.starts_with(&target.prefix) || !is_payload(target.kind, key) {
-                continue;
-            }
-            if cancel.is_cancelled() {
-                result.cancelled = true;
-                recovery_complete = false;
-                break;
-            }
-            result.scanned += 1;
-            if recovery {
-                match baseline_payload(storage, publish_locks, access, key, policy.dry_run).await {
-                    Ok(true) => result.baselined += 1,
-                    Ok(false) => {}
-                    Err(()) => {
+        if repo_index.has_persistent() {
+            // redb is an ordered derived inventory, so maintenance reads one
+            // bounded page at a time. A changing revision stops this target;
+            // exact-key checks make earlier decisions safe, and the next run
+            // resumes from the newly published generation.
+            let mut after = None;
+            let mut revision = None;
+            loop {
+                let page = match repo_index
+                    .persistent_object_page(&target.prefix, after, CLEANUP_INDEX_PAGE_SIZE)
+                    .await
+                {
+                    Ok(page) => page,
+                    Err(_) => {
                         result.failures += 1;
                         recovery_complete = false;
+                        CLEANUP_SKIPPED
+                            .with_label_values(&["index_unavailable"])
+                            .inc();
+                        warn!(
+                            registry = target.registry,
+                            "proxy-cache cleanup persistent index page unavailable; target kept"
+                        );
+                        break;
                     }
+                };
+                if revision
+                    .as_ref()
+                    .is_some_and(|expected| expected != &page.revision)
+                {
+                    result.failures += 1;
+                    recovery_complete = false;
+                    CLEANUP_SKIPPED.with_label_values(&["index_changed"]).inc();
+                    warn!(
+                        registry = target.registry,
+                        "proxy-cache cleanup index changed between pages; target pass stopped"
+                    );
+                    break;
                 }
-                continue;
+                revision = Some(page.revision.clone());
+                process_cleanup_entries(
+                    &page.items,
+                    storage,
+                    publish_locks,
+                    access,
+                    policy,
+                    &target,
+                    recovery,
+                    now,
+                    cancel,
+                    &mut result,
+                    &mut recovery_complete,
+                    &mut invalidated,
+                )
+                .await;
+                if result.cancelled {
+                    break;
+                }
+                let Some(next_after) = page.next_after else {
+                    match repo_index.persistent_object_revision().await {
+                        Ok(current) if revision.as_ref() == Some(&current) => {}
+                        _ => {
+                            result.failures += 1;
+                            recovery_complete = false;
+                            CLEANUP_SKIPPED.with_label_values(&["index_changed"]).inc();
+                            warn!(
+                                registry = target.registry,
+                                "proxy-cache cleanup index changed during target pass"
+                            );
+                        }
+                    }
+                    break;
+                };
+                after = Some(next_after);
             }
-            process_candidate(
+        } else {
+            // Legacy formats still publish an immutable in-memory snapshot.
+            // Reusing its Arc avoids a second O(objects) collection.
+            let entries = repo_index.objects(target.registry);
+            process_cleanup_entries(
+                &entries,
                 storage,
                 publish_locks,
                 access,
                 policy,
                 &target,
-                key,
-                entry.meta.clone(),
+                recovery,
                 now,
+                cancel,
                 &mut result,
+                &mut recovery_complete,
                 &mut invalidated,
             )
             .await;
@@ -670,6 +736,59 @@ pub async fn run_proxy_cache_cleanup(
     CLEANUP_DURATION.observe(result.duration_secs);
     CLEANUP_LAST_RUN.set(now as i64);
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_cleanup_entries(
+    entries: &[IndexedObject],
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    access: &ProxyCacheAccess,
+    policy: &ProxyCacheCleanupConfig,
+    target: &CleanupTarget,
+    recovery: bool,
+    now: u64,
+    cancel: &tokio_util::sync::CancellationToken,
+    result: &mut ProxyCacheCleanupResult,
+    recovery_complete: &mut bool,
+    invalidated: &mut HashSet<&'static str>,
+) {
+    for entry in entries {
+        let key = &entry.key;
+        if !key.starts_with(&target.prefix) || !is_payload(target.kind, key) {
+            continue;
+        }
+        if cancel.is_cancelled() {
+            result.cancelled = true;
+            *recovery_complete = false;
+            return;
+        }
+        result.scanned += 1;
+        if recovery {
+            match baseline_payload(storage, publish_locks, access, key, policy.dry_run).await {
+                Ok(true) => result.baselined += 1,
+                Ok(false) => {}
+                Err(()) => {
+                    result.failures += 1;
+                    *recovery_complete = false;
+                }
+            }
+            continue;
+        }
+        process_candidate(
+            storage,
+            publish_locks,
+            access,
+            policy,
+            target,
+            key,
+            entry.meta.clone(),
+            now,
+            result,
+            invalidated,
+        )
+        .await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1529,7 +1648,7 @@ mod tests {
                         format!(
                             "maven/repositories/central/com/acme/demo/{number}/demo-{number}.jar"
                         ),
-                        FileMeta { size: 1, modified },
+                        FileMeta::local(1, modified),
                     )
                 })
                 .collect(),
@@ -1550,6 +1669,65 @@ mod tests {
         assert_eq!(result.scanned, OBJECTS);
         assert_eq!(result.deleted, 0);
         assert!(list_attempts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_cleanup_pages_redb_inventory_without_storage_list() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(root.path().to_str().unwrap());
+        let backend = Arc::new(FaultInjectBackend::new(inner.clone()));
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let locks = test_locks();
+        let access = ProxyCacheAccess::start_session(storage.clone(), locks.clone())
+            .await
+            .unwrap();
+        access.mark_recovered();
+        let key = "maven/repositories/central/com/acme/demo/1.0/demo-1.0.jar";
+        storage.put(key, b"artifact").await.unwrap();
+        make_old(root.path(), key, Duration::from_secs(100));
+        write_marker(&storage, key, now_unix_secs() - 100).await;
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([
+            crate::registry_type::RegistryType::Maven,
+            crate::registry_type::RegistryType::Npm,
+        ]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        list_attempts.lock().clear();
+        storage.set_mutation_observer(index.clone());
+
+        let result = run_proxy_cache_cleanup(
+            &storage,
+            &locks,
+            &access,
+            &config,
+            &test_policy(),
+            &index,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.failures, 0);
+        assert!(matches!(inner.get(key).await, Err(StorageError::NotFound)));
+        assert!(
+            list_attempts.lock().is_empty(),
+            "cleanup must page redb rather than issue a storage LIST"
+        );
+
+        storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
     }
 
     #[tokio::test]

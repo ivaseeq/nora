@@ -2,17 +2,24 @@
 // SPDX-License-Identifier: MIT
 
 use super::components::{format_available_size, format_timestamp, html_escape, sanitize_href};
-use super::templates::encode_uri_component;
+use super::i18n::Lang;
+use super::templates::{
+    encode_uri_component, render_registry_search_error, render_registry_search_results,
+};
 use crate::activity_log::ActivityEntry;
 use crate::registry_type::RegistryType;
-use crate::repo_index::{IndexStatus, RepoInfo};
+use crate::repo_index::{
+    IndexStatus, LogicalIndexedObject, RepoInfo, RepoQuery, MAX_QUERY_EXAMINED,
+};
 use crate::validation::ends_with_ci;
 use crate::AppState;
 use crate::Storage;
 use axum::{
     extract::{Path, Query, State},
-    response::Json,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use utoipa::ToSchema;
@@ -137,11 +144,257 @@ pub struct MavenArtifact {
 #[derive(Serialize)]
 pub struct MavenDetail {
     pub artifacts: Vec<MavenArtifact>,
+    pub download_base: String,
+}
+
+pub struct MavenDirectoryEnvelope {
+    pub items: Vec<RepoInfo>,
+    pub continuation_token: Option<String>,
+    pub is_leaf: bool,
+}
+
+pub struct MavenDetailEnvelope {
+    pub detail: MavenDetail,
+    pub continuation_token: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
     pub q: Option<String>,
+    pub continuation_token: Option<String>,
+    pub limit: Option<usize>,
+    pub lang: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IndexListQuery {
+    pub q: Option<String>,
+    pub continuation_token: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IndexDetailQuery {
+    pub continuation_token: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexPageEnvelope {
+    pub items: Vec<RepoInfo>,
+    pub continuation_token: Option<String>,
+    pub generation: u64,
+    pub index_state: IndexStatus,
+}
+
+#[derive(Serialize)]
+pub struct NpmDetailEnvelope {
+    #[serde(flatten)]
+    pub detail: PackageDetail,
+    pub continuation_token: Option<String>,
+    pub generation: u64,
+    pub index_state: IndexStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexCursor {
+    schema: u8,
+    registry: String,
+    filter: String,
+    generation: u64,
+    config_digest: String,
+    last_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageError {
+    BadCursor,
+    GenerationChanged,
+    Unavailable,
+}
+
+impl PageError {
+    pub(crate) fn response(self) -> Response {
+        let (status, code) = match self {
+            Self::BadCursor => (StatusCode::BAD_REQUEST, "invalid_continuation_token"),
+            Self::GenerationChanged => (StatusCode::CONFLICT, "index_generation_changed"),
+            Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "index_unavailable"),
+        };
+        let mut response = (status, Json(serde_json::json!({ "error": code }))).into_response();
+        if self == Self::Unavailable {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod page_error_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_is_retryable_json_but_cursor_errors_are_not() {
+        let unavailable = PageError::Unavailable.response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("2"))
+        );
+        assert_eq!(
+            unavailable.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(unavailable.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": "index_unavailable"})
+        );
+
+        for (error, status) in [
+            (PageError::BadCursor, StatusCode::BAD_REQUEST),
+            (PageError::GenerationChanged, StatusCode::CONFLICT),
+        ] {
+            let response = error.response();
+            assert_eq!(response.status(), status);
+            assert!(!response.headers().contains_key(header::RETRY_AFTER));
+        }
+    }
+}
+
+fn encode_cursor(cursor: &IndexCursor) -> Option<String> {
+    serde_json::to_vec(cursor)
+        .ok()
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_cursor(token: &str) -> Result<IndexCursor, PageError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| PageError::BadCursor)?;
+    let cursor: IndexCursor = serde_json::from_slice(&bytes).map_err(|_| PageError::BadCursor)?;
+    if cursor.schema != 1 {
+        return Err(PageError::BadCursor);
+    }
+    Ok(cursor)
+}
+
+pub(crate) async fn persistent_page(
+    state: &AppState,
+    registry: &str,
+    filter: Option<String>,
+    continuation_token: Option<String>,
+    limit: usize,
+) -> Result<IndexPageEnvelope, PageError> {
+    let filter = filter.unwrap_or_default().trim().to_lowercase();
+    let cursor = continuation_token
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.registry != registry || cursor.filter != filter)
+    {
+        return Err(PageError::BadCursor);
+    }
+    let after = cursor
+        .as_ref()
+        .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.last_key))
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?;
+
+    let (name_prefix, before_name, allowed_repositories) = match registry {
+        "maven" if state.config.maven.repositories.is_empty() => {
+            (None, Some("repositories/".to_string()), None)
+        }
+        "maven" => (
+            Some("repositories/".to_string()),
+            None,
+            Some(
+                state
+                    .config
+                    .maven
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.name().to_string())
+                    .collect(),
+            ),
+        ),
+        "npm" if !state.config.npm.repositories.is_empty() => (
+            Some("repositories/".to_string()),
+            None,
+            Some(
+                state
+                    .config
+                    .npm
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.name().to_string())
+                    .collect(),
+            ),
+        ),
+        "npm" => (Some("repositories/".to_string()), None, None),
+        _ => (None, None, None),
+    };
+    let page = state
+        .repo_index
+        .persistent_repo_page(RepoQuery {
+            registry: registry.to_string(),
+            after,
+            filter: (!filter.is_empty()).then_some(filter.clone()),
+            limit,
+            max_examined: MAX_QUERY_EXAMINED,
+            deadline: std::time::Duration::from_millis(250),
+            name_prefix,
+            before_name,
+            allowed_repositories,
+        })
+        .await
+        .map_err(|_| PageError::Unavailable)?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.generation != page.generation || cursor.config_digest != page.config_digest
+    }) {
+        return Err(PageError::GenerationChanged);
+    }
+    let mut items = page.items;
+    if registry == "maven" {
+        if state.config.maven.repositories.is_empty() {
+            items.retain(|row| !row.name.starts_with("repositories/"));
+        } else {
+            items.retain_mut(|row| {
+                let Some(logical) = row.name.strip_prefix("repositories/") else {
+                    return false;
+                };
+                row.name = logical.to_string();
+                true
+            });
+        }
+    }
+    let continuation_token = page.next_after.and_then(|last_key| {
+        encode_cursor(&IndexCursor {
+            schema: 1,
+            registry: registry.to_string(),
+            filter,
+            generation: page.generation,
+            config_digest: page.config_digest,
+            last_key: URL_SAFE_NO_PAD.encode(last_key),
+        })
+    });
+    Ok(IndexPageEnvelope {
+        items,
+        continuation_token,
+        generation: page.generation,
+        index_state: state
+            .repo_index
+            .persistent_status()
+            .unwrap_or(IndexStatus::Warming),
+    })
 }
 
 #[derive(Serialize, ToSchema)]
@@ -218,6 +471,8 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
     let mut total_artifacts: usize = 0;
     let mut registry_card_stats = Vec::new();
     let mut mount_points = Vec::new();
+    let cached_counts = state.repo_index.counts();
+    let cached_sizes = state.repo_index.sizes();
 
     for reg in RegistryType::all() {
         if !state.enabled_registries.contains(reg) {
@@ -226,18 +481,32 @@ pub async fn api_dashboard(State(state): State<AppState>) -> Json<DashboardRespo
 
         let name = reg.as_str();
         let repos = state.repo_index.get(name, &state.storage).await;
-        let size_available = *reg != RegistryType::Npm
-            && if repos.is_empty() {
-                state.repo_index.status(name) == Some(IndexStatus::Ready)
+        let persistent = state.repo_index.has_persistent()
+            && matches!(reg, RegistryType::Maven | RegistryType::Npm);
+        let size_available = if persistent {
+            state.repo_index.status(name) == Some(IndexStatus::Ready)
+        } else {
+            *reg != RegistryType::Npm
+                && if repos.is_empty() {
+                    state.repo_index.status(name) == Some(IndexStatus::Ready)
+                } else {
+                    repos.iter().all(|repo| repo.size_available)
+                }
+        };
+        let size = if size_available {
+            if persistent {
+                cached_sizes.get(reg).copied().unwrap_or(0)
             } else {
-                repos.iter().all(|repo| repo.size_available)
-            };
-        let size: u64 = if size_available {
-            repos.iter().map(|r| r.size).sum()
+                repos.iter().map(|r| r.size).sum()
+            }
         } else {
             0
         };
-        let versions: usize = repos.iter().map(|r| r.versions).sum();
+        let versions = if persistent {
+            cached_counts.get(reg).copied().unwrap_or(0)
+        } else {
+            repos.iter().map(|r| r.versions).sum()
+        };
 
         total_artifacts += versions;
 
@@ -371,29 +640,58 @@ mod dashboard_size_tests {
 pub async fn api_list(
     State(state): State<AppState>,
     Path(registry_type): Path<String>,
-) -> Json<Vec<RepoInfo>> {
+    Query(query): Query<IndexListQuery>,
+) -> Response {
+    if matches!(registry_type.as_str(), "maven" | "npm") {
+        let limit = query.limit.unwrap_or(50).clamp(1, 100);
+        return match persistent_page(
+            &state,
+            &registry_type,
+            query.q,
+            query.continuation_token,
+            limit,
+        )
+        .await
+        {
+            Ok(page) => Json(page).into_response(),
+            Err(error) => error.response(),
+        };
+    }
     let repos = state.repo_index.get(&registry_type, &state.storage).await;
-    Json((*repos).clone())
+    Json((*repos).clone()).into_response()
 }
 
 pub async fn api_detail(
     State(state): State<AppState>,
     Path((registry_type, name)): Path<(String, String)>,
-) -> Json<serde_json::Value> {
+    Query(query): Query<IndexDetailQuery>,
+) -> Response {
     match registry_type.as_str() {
         "docker" => {
             let detail = get_docker_detail(&state, &name).await;
-            Json(serde_json::to_value(detail).unwrap_or_default())
+            Json(serde_json::to_value(detail).unwrap_or_default()).into_response()
         }
-        "npm" => {
-            let detail = get_npm_detail(&state, &name, true, true).await;
-            Json(serde_json::to_value(detail).unwrap_or_default())
-        }
+        "npm" if state.repo_index.has_persistent() => match get_npm_detail_page(
+            &state,
+            &name,
+            true,
+            query.continuation_token,
+            query.limit.unwrap_or(100).clamp(1, 100),
+        )
+        .await
+        {
+            Ok(page) => Json(serde_json::to_value(page).unwrap_or_default()).into_response(),
+            Err(error) => error.response(),
+        },
+        "npm" => match get_npm_detail(&state, &name, true, true).await {
+            Ok(detail) => Json(serde_json::to_value(detail).unwrap_or_default()).into_response(),
+            Err(error) => error.response(),
+        },
         "cargo" => {
             let detail = get_cargo_detail(&state, &name, true, true).await;
-            Json(serde_json::to_value(detail).unwrap_or_default())
+            Json(serde_json::to_value(detail).unwrap_or_default()).into_response()
         }
-        _ => Json(serde_json::json!({})),
+        _ => Json(serde_json::json!({})).into_response(),
     }
 }
 
@@ -401,22 +699,100 @@ pub async fn api_search(
     State(state): State<AppState>,
     Path(registry_type): Path<String>,
     Query(params): Query<SearchQuery>,
-) -> axum::response::Html<String> {
-    let query = params.q.unwrap_or_default().to_lowercase();
+) -> Response {
+    let query = params.q.unwrap_or_default().trim().to_string();
+    let persistent = matches!(registry_type.as_str(), "maven" | "npm");
+    if persistent {
+        let limit = params.limit.unwrap_or(50).clamp(1, 100);
+        let lang = params
+            .lang
+            .as_deref()
+            .map(Lang::from_str)
+            .unwrap_or_default();
+        let page = if registry_type == "maven" && query.is_empty() {
+            get_maven_dir_page(&state, "", params.continuation_token, limit)
+                .await
+                .map(|page| IndexPageEnvelope {
+                    items: page.items,
+                    continuation_token: page.continuation_token,
+                    generation: 0,
+                    index_state: IndexStatus::Ready,
+                })
+        } else {
+            persistent_page(
+                &state,
+                &registry_type,
+                Some(query.clone()),
+                params.continuation_token,
+                limit,
+            )
+            .await
+        };
+        return match page {
+            Ok(page) => {
+                let title = if registry_type == "maven" {
+                    "Maven Repository"
+                } else {
+                    "npm Registry"
+                };
+                let html = render_registry_search_results(
+                    &registry_type,
+                    title,
+                    &page.items,
+                    limit,
+                    page.continuation_token.as_deref(),
+                    &query,
+                    lang,
+                );
+                let mut response = axum::response::Html(html).into_response();
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                let page_url = format!(
+                    "/ui/{}?q={}&limit={}&lang={}",
+                    encode_uri_component(&registry_type),
+                    encode_uri_component(&query),
+                    limit,
+                    lang.code(),
+                );
+                if let Ok(value) = HeaderValue::from_str(&page_url) {
+                    response.headers_mut().insert("hx-replace-url", value);
+                }
+                response
+            }
+            Err(error) => {
+                let unavailable = error == PageError::Unavailable;
+                let html =
+                    render_registry_search_error(&registry_type, &query, limit, lang, unavailable);
+                let status = match error {
+                    PageError::BadCursor => StatusCode::BAD_REQUEST,
+                    PageError::GenerationChanged => StatusCode::CONFLICT,
+                    PageError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                let mut response = (status, axum::response::Html(html)).into_response();
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                if unavailable {
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+                }
+                response
+            }
+        };
+    }
 
-    let repos = state.repo_index.get(&registry_type, &state.storage).await;
-
-    let filtered: Vec<&RepoInfo> = if query.is_empty() {
-        repos.iter().collect()
-    } else {
-        repos
-            .iter()
-            .filter(|r| r.name.to_lowercase().contains(&query))
-            .collect()
-    };
+    let snapshot = state.repo_index.get(&registry_type, &state.storage).await;
+    let normalized_query = query.to_lowercase();
+    let persistent_items = (*snapshot).clone();
+    let repos = persistent_items
+        .iter()
+        .filter(|r| r.name.to_lowercase().contains(&normalized_query))
+        .collect::<Vec<_>>();
 
     // Return HTML fragment for HTMX
-    let html = if filtered.is_empty() {
+    let html = if repos.is_empty() {
         r#"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
             <div class="text-4xl mb-2">🔍</div>
             <div>No matching repositories found</div>
@@ -424,14 +800,14 @@ pub async fn api_search(
             .to_string()
     } else {
         let folder_icon = r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#;
-        filtered
+        repos
             .iter()
             .map(|repo| {
                 let detail_url =
                     format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
                 format!(
                     r#"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -440,7 +816,6 @@ pub async fn api_search(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "#,
-                    detail_url,
                     folder_icon,
                     detail_url,
                     html_escape(&repo.name),
@@ -453,7 +828,7 @@ pub async fn api_search(
             .join("")
     };
 
-    axum::response::Html(html)
+    axum::response::Html(html).into_response()
 }
 
 pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
@@ -587,109 +962,165 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
-fn direct_maven_objects(
-    state: &AppState,
-    repository: &str,
-) -> Vec<(String, crate::storage::FileMeta)> {
-    let prefix = format!("maven/repositories/{repository}/");
-    state
-        .repo_index
-        .maven_objects()
-        .iter()
-        .filter_map(|object| {
-            object
-                .key
-                .strip_prefix(&prefix)
-                .map(|path| (path.to_string(), object.meta.clone()))
-        })
-        .collect()
-}
-
-fn logical_maven_objects(
-    state: &AppState,
-    repository: &str,
-) -> Option<Vec<(String, crate::storage::FileMeta)>> {
+fn maven_prefixes(state: &AppState, repository: &str) -> Option<Vec<String>> {
     use crate::config::MavenRepository;
 
     match state.config.maven.repository(repository)? {
         MavenRepository::Hosted { .. } | MavenRepository::Proxy { .. } => {
-            Some(direct_maven_objects(state, repository))
+            Some(vec![format!("maven/repositories/{repository}/")])
         }
-        MavenRepository::Group { members, .. } => {
-            let mut selected = BTreeMap::new();
-            for member in members {
-                for (path, meta) in direct_maven_objects(state, member) {
-                    // Same first-member precedence as the protocol group GET.
-                    selected.entry(path).or_insert(meta);
-                }
-            }
-            Some(selected.into_iter().collect())
-        }
+        MavenRepository::Group { members, .. } => Some(
+            members
+                .iter()
+                .map(|member| format!("maven/repositories/{member}/"))
+                .collect(),
+        ),
     }
 }
 
-fn legacy_maven_objects(state: &AppState) -> Vec<(String, crate::storage::FileMeta)> {
-    state
-        .repo_index
-        .maven_objects()
+async fn indexed_maven_objects(
+    state: &AppState,
+    repository: Option<&str>,
+    logical_prefix: &str,
+) -> Result<(Vec<LogicalIndexedObject>, bool), PageError> {
+    let base_prefixes = match repository {
+        Some(repository) => match maven_prefixes(state, repository) {
+            Some(prefixes) => prefixes,
+            None => return Ok((Vec::new(), false)),
+        },
+        None => vec!["maven/".to_string()],
+    };
+    let logical_prefix = logical_prefix.trim_matches('/');
+    let prefixes = base_prefixes
         .iter()
-        .filter_map(|object| {
-            object
-                .key
-                .strip_prefix("maven/")
-                .filter(|path| !path.starts_with("repositories/"))
-                .map(|path| (path.to_string(), object.meta.clone()))
-        })
-        .collect()
-}
-
-fn maven_repository_rows(state: &AppState) -> Vec<RepoInfo> {
-    state
-        .config
-        .maven
-        .repositories
-        .iter()
-        .map(|repository| {
-            let objects = logical_maven_objects(state, repository.name()).unwrap_or_default();
-            let versions = objects
-                .iter()
-                .filter(|(path, _)| {
-                    !crate::gc::is_checksum_sidecar(path) && !path.ends_with("maven-metadata.xml")
-                })
-                .count();
-            let size = objects.iter().map(|(_, meta)| meta.size).sum();
-            let modified = objects
-                .iter()
-                .map(|(_, meta)| meta.modified)
-                .max()
-                .unwrap_or(0);
-            RepoInfo {
-                name: repository.name().to_string(),
-                versions,
-                size,
-                size_available: true,
-                updated: format_timestamp(modified),
-                ..Default::default()
+        .map(|base| {
+            if logical_prefix.is_empty() {
+                base.clone()
+            } else {
+                format!("{base}{logical_prefix}/")
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let restore_logical_prefix = |path: String| {
+        if logical_prefix.is_empty() {
+            path
+        } else if path.is_empty() {
+            logical_prefix.to_string()
+        } else {
+            format!("{logical_prefix}/{path}")
+        }
+    };
+    if !state.repo_index.has_persistent() {
+        let snapshot = state.repo_index.maven_objects();
+        let mut selected = BTreeMap::new();
+        for prefix in &prefixes {
+            for object in snapshot.iter() {
+                if let Some(path) = object.key.strip_prefix(prefix) {
+                    selected
+                        .entry(restore_logical_prefix(path.to_string()))
+                        .or_insert_with(|| object.meta.clone());
+                }
+            }
+        }
+        let mut objects: Vec<_> = selected
+            .into_iter()
+            .map(|(path, meta)| LogicalIndexedObject { path, meta })
+            .collect();
+        if repository.is_none() {
+            objects.retain(|object| !object.path.starts_with("repositories/"));
+        }
+        return Ok((objects, false));
+    }
+    match state
+        .repo_index
+        .persistent_logical_objects(&prefixes, MAX_QUERY_EXAMINED)
+        .await
+    {
+        Ok((mut objects, _, truncated)) => {
+            for object in &mut objects {
+                object.path = restore_logical_prefix(std::mem::take(&mut object.path));
+            }
+            if repository.is_none() {
+                objects.retain(|object| !object.path.starts_with("repositories/"));
+            }
+            Ok((objects, truncated))
+        }
+        Err(_) => Err(PageError::Unavailable),
+    }
+}
+
+async fn maven_repository_rows(state: &AppState) -> Result<Vec<RepoInfo>, PageError> {
+    let mut rows = Vec::with_capacity(state.config.maven.repositories.len());
+    for repository in &state.config.maven.repositories {
+        let (objects, truncated) =
+            indexed_maven_objects(state, Some(repository.name()), "").await?;
+        if truncated {
+            return Err(PageError::Unavailable);
+        }
+        let versions = objects
+            .iter()
+            .filter(|object| {
+                !crate::gc::is_checksum_sidecar(&object.path)
+                    && !object.path.ends_with("maven-metadata.xml")
+            })
+            .count();
+        let size = objects.iter().map(|object| object.meta.size).sum();
+        let modified = objects
+            .iter()
+            .map(|object| object.meta.modified)
+            .max()
+            .unwrap_or(0);
+        rows.push(RepoInfo {
+            name: repository.name().to_string(),
+            versions,
+            size,
+            size_available: true,
+            updated: format_timestamp(modified),
+            ..Default::default()
+        });
+    }
+    Ok(rows)
 }
 
 /// List immediate children of a logical Maven repository path from the last
 /// background snapshot. Named groups merge member objects in configured order;
 /// groups never acquire a physical storage prefix of their own.
-pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInfo>, bool) {
+#[cfg(test)]
+pub async fn get_maven_dir_listing(
+    state: &AppState,
+    path: &str,
+) -> Result<(Vec<RepoInfo>, bool), PageError> {
+    if state.repo_index.has_persistent() {
+        let page = get_maven_dir_page(state, path, None, 100).await?;
+        return Ok((page.items, page.is_leaf));
+    }
+    get_maven_dir_listing_legacy(state, path).await
+}
+
+async fn get_maven_dir_listing_legacy(
+    state: &AppState,
+    path: &str,
+) -> Result<(Vec<RepoInfo>, bool), PageError> {
     if !state.config.maven.repositories.is_empty() && path.is_empty() {
-        return (maven_repository_rows(state), false);
+        return Ok((maven_repository_rows(state).await?, false));
     }
 
     let (objects, logical_path) = if state.config.maven.repositories.is_empty() {
-        (legacy_maven_objects(state), path)
+        let (objects, truncated) = indexed_maven_objects(state, None, path).await?;
+        if truncated {
+            return Err(PageError::Unavailable);
+        }
+        (objects, path)
     } else {
         let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
-        let Some(objects) = logical_maven_objects(state, repository) else {
-            return (Vec::new(), false);
-        };
+        let (objects, truncated) =
+            indexed_maven_objects(state, Some(repository), logical_path).await?;
+        if truncated {
+            return Err(PageError::Unavailable);
+        }
+        if objects.is_empty() && state.config.maven.repository(repository).is_none() {
+            return Ok((Vec::new(), false));
+        }
         (objects, logical_path)
     };
     let prefix = if logical_path.is_empty() {
@@ -699,10 +1130,15 @@ pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInf
     };
     let keys: Vec<_> = objects
         .iter()
-        .filter_map(|(key, meta)| key.strip_prefix(&prefix).map(|rest| (rest, meta)))
+        .filter_map(|object| {
+            object
+                .path
+                .strip_prefix(&prefix)
+                .map(|rest| (rest, &object.meta))
+        })
         .collect();
     if keys.is_empty() {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false));
     }
 
     // Leaf = no subdirectories (only direct files like JARs, POMs, checksums).
@@ -710,7 +1146,7 @@ pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInf
         .iter()
         .any(|(rest, _)| !rest.is_empty() && rest.contains('/'));
     if !has_subdirs {
-        return (vec![], true);
+        return Ok((vec![], true));
     }
 
     // Group by immediate child segment (skip direct files like maven-metadata.xml)
@@ -741,18 +1177,212 @@ pub async fn get_maven_dir_listing(state: &AppState, path: &str) -> (Vec<RepoInf
         .collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
 
-    (result, false)
+    Ok((result, false))
 }
 
-pub async fn get_maven_detail(state: &AppState, path: &str) -> MavenDetail {
-    let (objects, logical_path) = if state.config.maven.repositories.is_empty() {
-        (legacy_maven_objects(state), path)
+pub async fn get_maven_dir_page(
+    state: &AppState,
+    path: &str,
+    continuation_token: Option<String>,
+    limit: usize,
+) -> Result<MavenDirectoryEnvelope, PageError> {
+    let limit = limit.clamp(1, 100);
+    let logical_cursor = format!("maven-dir:{}", path.trim_matches('/'));
+    let cursor = continuation_token
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.registry != logical_cursor || !cursor.filter.is_empty())
+    {
+        return Err(PageError::BadCursor);
+    }
+    let after = cursor
+        .as_ref()
+        .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.last_key))
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?;
+
+    if !state.repo_index.has_persistent() {
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.generation != 0 || cursor.config_digest != "volatile")
+        {
+            return Err(PageError::GenerationChanged);
+        }
+        let (mut items, is_leaf) = get_maven_dir_listing_legacy(state, path).await?;
+        items.retain(|row| after.as_ref().is_none_or(|after| row.name > *after));
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let continuation_token = has_more
+            .then(|| items.last().map(|row| row.name.as_bytes().to_vec()))
+            .flatten()
+            .and_then(|last_key| {
+                encode_cursor(&IndexCursor {
+                    schema: 1,
+                    registry: logical_cursor,
+                    filter: String::new(),
+                    generation: 0,
+                    config_digest: "volatile".to_string(),
+                    last_key: URL_SAFE_NO_PAD.encode(last_key),
+                })
+            });
+        return Ok(MavenDirectoryEnvelope {
+            items,
+            continuation_token,
+            is_leaf,
+        });
+    }
+
+    if !state.config.maven.repositories.is_empty() && path.is_empty() {
+        let identity = state
+            .repo_index
+            .persistent_maven_children(Vec::new(), String::new(), None, 1)
+            .await
+            .map_err(|_| PageError::Unavailable)?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            cursor.generation != identity.generation
+                || cursor.config_digest != identity.config_digest
+        }) {
+            return Err(PageError::GenerationChanged);
+        }
+        let mut names = state
+            .config
+            .maven
+            .repositories
+            .iter()
+            .map(|repository| repository.name().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        let mut rows = names
+            .into_iter()
+            .filter(|name| after.as_ref().is_none_or(|after| name > after))
+            .take(limit + 1)
+            .map(|name| RepoInfo {
+                name,
+                versions: 0,
+                size: 0,
+                size_available: false,
+                updated: "N/A".to_string(),
+                is_file: false,
+            })
+            .collect::<Vec<_>>();
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let continuation_token = has_more
+            .then(|| rows.last().map(|row| row.name.as_bytes().to_vec()))
+            .flatten()
+            .and_then(|last_key| {
+                encode_cursor(&IndexCursor {
+                    schema: 1,
+                    registry: logical_cursor,
+                    filter: String::new(),
+                    generation: identity.generation,
+                    config_digest: identity.config_digest,
+                    last_key: URL_SAFE_NO_PAD.encode(last_key),
+                })
+            });
+        return Ok(MavenDirectoryEnvelope {
+            items: rows,
+            continuation_token,
+            is_leaf: false,
+        });
+    }
+
+    let (prefixes, logical_path) = if state.config.maven.repositories.is_empty() {
+        (
+            vec!["maven/".to_string()],
+            path.trim_matches('/').to_string(),
+        )
     } else {
         let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
-        let Some(objects) = logical_maven_objects(state, repository) else {
-            return MavenDetail { artifacts: vec![] };
+        let Some(prefixes) = maven_prefixes(state, repository) else {
+            return Ok(MavenDirectoryEnvelope {
+                items: Vec::new(),
+                continuation_token: None,
+                is_leaf: false,
+            });
         };
-        (objects, logical_path)
+        (prefixes, logical_path.trim_matches('/').to_string())
+    };
+    let mut page = state
+        .repo_index
+        .persistent_maven_children(prefixes, logical_path, after, limit)
+        .await
+        .map_err(|_| PageError::Unavailable)?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.generation != page.generation || cursor.config_digest != page.config_digest
+    }) {
+        return Err(PageError::GenerationChanged);
+    }
+    if state.config.maven.repositories.is_empty() && path.is_empty() {
+        page.items.retain(|row| row.name != "repositories");
+    }
+    let continuation_token = page.next_after.and_then(|last_key| {
+        encode_cursor(&IndexCursor {
+            schema: 1,
+            registry: logical_cursor,
+            filter: String::new(),
+            generation: page.generation,
+            config_digest: page.config_digest,
+            last_key: URL_SAFE_NO_PAD.encode(last_key.as_bytes()),
+        })
+    });
+    Ok(MavenDirectoryEnvelope {
+        is_leaf: page.items.is_empty() && page.has_direct_files,
+        items: page.items,
+        continuation_token,
+    })
+}
+
+#[cfg(test)]
+pub async fn get_maven_detail(state: &AppState, path: &str) -> Result<MavenDetail, PageError> {
+    if state.repo_index.has_persistent() {
+        return get_maven_detail_page(state, path, None, 100)
+            .await
+            .map(|page| page.detail);
+    }
+    get_maven_detail_legacy(state, path).await
+}
+
+async fn get_maven_detail_legacy(state: &AppState, path: &str) -> Result<MavenDetail, PageError> {
+    let (objects, logical_path, download_base) = if state.config.maven.repositories.is_empty() {
+        let (objects, truncated) = indexed_maven_objects(state, None, path).await?;
+        if truncated {
+            return Err(PageError::Unavailable);
+        }
+        (
+            objects,
+            path,
+            format!("/maven2/{}", encode_path_segments(path)),
+        )
+    } else {
+        let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
+        let (objects, truncated) =
+            indexed_maven_objects(state, Some(repository), logical_path).await?;
+        if truncated {
+            return Err(PageError::Unavailable);
+        }
+        if state.config.maven.repository(repository).is_none() {
+            return Ok(MavenDetail {
+                artifacts: vec![],
+                download_base: String::new(),
+            });
+        }
+        (
+            objects,
+            logical_path,
+            format!(
+                "/repository/{}/{}",
+                encode_uri_component(repository),
+                encode_path_segments(logical_path)
+            ),
+        )
     };
     let prefix = if logical_path.is_empty() {
         String::new()
@@ -761,26 +1391,236 @@ pub async fn get_maven_detail(state: &AppState, path: &str) -> MavenDetail {
     };
 
     let mut artifacts = Vec::new();
-    for (key, meta) in objects {
-        if let Some(filename) = key.strip_prefix(&prefix) {
+    for object in objects {
+        if let Some(filename) = object.path.strip_prefix(&prefix) {
             if filename.contains('/') {
                 continue;
             }
             artifacts.push(MavenArtifact {
                 filename: filename.to_string(),
-                size: meta.size,
+                size: object.meta.size,
             });
         }
     }
     artifacts.sort_by(|left, right| left.filename.cmp(&right.filename));
 
-    MavenDetail { artifacts }
+    Ok(MavenDetail {
+        artifacts,
+        download_base: download_base.trim_end_matches('/').to_string(),
+    })
+}
+
+pub async fn get_maven_detail_page(
+    state: &AppState,
+    path: &str,
+    continuation_token: Option<String>,
+    limit: usize,
+) -> Result<MavenDetailEnvelope, PageError> {
+    let limit = limit.clamp(1, 100);
+    let logical_cursor = format!("maven-files:{}", path.trim_matches('/'));
+    let cursor = continuation_token
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.registry != logical_cursor || !cursor.filter.is_empty())
+    {
+        return Err(PageError::BadCursor);
+    }
+    let after = cursor
+        .as_ref()
+        .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.last_key))
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?;
+
+    if !state.repo_index.has_persistent() {
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.generation != 0 || cursor.config_digest != "volatile")
+        {
+            return Err(PageError::GenerationChanged);
+        }
+        let mut detail = get_maven_detail_legacy(state, path).await?;
+        detail.artifacts.retain(|artifact| {
+            after
+                .as_ref()
+                .is_none_or(|after| artifact.filename > *after)
+        });
+        let has_more = detail.artifacts.len() > limit;
+        detail.artifacts.truncate(limit);
+        let continuation_token = has_more
+            .then(|| {
+                detail
+                    .artifacts
+                    .last()
+                    .map(|artifact| artifact.filename.as_bytes().to_vec())
+            })
+            .flatten()
+            .and_then(|last_key| {
+                encode_cursor(&IndexCursor {
+                    schema: 1,
+                    registry: logical_cursor,
+                    filter: String::new(),
+                    generation: 0,
+                    config_digest: "volatile".to_string(),
+                    last_key: URL_SAFE_NO_PAD.encode(last_key),
+                })
+            });
+        return Ok(MavenDetailEnvelope {
+            detail,
+            continuation_token,
+        });
+    }
+    let (prefixes, logical_path, download_base) = if state.config.maven.repositories.is_empty() {
+        (
+            vec!["maven/".to_string()],
+            path.trim_matches('/').to_string(),
+            format!("/maven2/{}", encode_path_segments(path)),
+        )
+    } else {
+        let (repository, logical_path) = path.split_once('/').unwrap_or((path, ""));
+        let Some(prefixes) = maven_prefixes(state, repository) else {
+            return Ok(MavenDetailEnvelope {
+                detail: MavenDetail {
+                    artifacts: Vec::new(),
+                    download_base: String::new(),
+                },
+                continuation_token: None,
+            });
+        };
+        (
+            prefixes,
+            logical_path.trim_matches('/').to_string(),
+            format!(
+                "/repository/{}/{}",
+                encode_uri_component(repository),
+                encode_path_segments(logical_path)
+            ),
+        )
+    };
+    let page = state
+        .repo_index
+        .persistent_maven_files(prefixes, logical_path, after, limit)
+        .await
+        .map_err(|_| PageError::Unavailable)?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.generation != page.generation || cursor.config_digest != page.config_digest
+    }) {
+        return Err(PageError::GenerationChanged);
+    }
+    let continuation_token = page.next_after.and_then(|last_key| {
+        encode_cursor(&IndexCursor {
+            schema: 1,
+            registry: logical_cursor,
+            filter: String::new(),
+            generation: page.generation,
+            config_digest: page.config_digest,
+            last_key: URL_SAFE_NO_PAD.encode(last_key.as_bytes()),
+        })
+    });
+    Ok(MavenDetailEnvelope {
+        detail: MavenDetail {
+            artifacts: page
+                .items
+                .into_iter()
+                .map(|(filename, meta)| MavenArtifact {
+                    filename,
+                    size: meta.size,
+                })
+                .collect(),
+            download_base: download_base.trim_end_matches('/').to_string(),
+        },
+        continuation_token,
+    })
+}
+
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
 mod named_maven_tests {
     use super::*;
     use crate::config::{MavenRepository, MavenVersionPolicy, MavenWritePolicy};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn persistent_search_returns_atomic_fragment_without_storage_io() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+            config.maven.repositories = vec![MavenRepository::Hosted {
+                name: "releases".to_string(),
+                version_policy: MavenVersionPolicy::Mixed,
+                write_policy: MavenWritePolicy::AllowOnce,
+            }];
+        });
+        ctx.state
+            .storage
+            .put(
+                "maven/repositories/releases/com/acme/app/1.0/app-1.0.jar",
+                b"jar",
+            )
+            .await
+            .unwrap();
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            ctx.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let get_attempts = backend.get_attempts();
+        let mut indexed_only = ctx.state.clone();
+        indexed_only.storage = Storage::from_backend(Arc::new(backend));
+        indexed_only.repo_index = Arc::clone(&index);
+
+        let response = api_search(
+            State(indexed_only),
+            Path("maven".to_string()),
+            Query(SearchQuery {
+                q: Some("App".to_string()),
+                continuation_token: None,
+                limit: Some(50),
+                lang: Some("en".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get("hx-replace-url").unwrap(),
+            "/ui/maven?q=App&limit=50&lang=en"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("id=\"repo-results\""));
+        assert!(html.contains("data-search-announcement=\"1 result for “App” on this page\""));
+        assert!(list_attempts.lock().is_empty());
+        assert!(get_attempts.lock().is_empty());
+        index.shutdown_persistent().await;
+    }
 
     #[tokio::test]
     async fn group_browser_deduplicates_with_first_member_precedence_without_storage_scans() {
@@ -837,16 +1677,23 @@ mod named_maven_tests {
         let mut snapshot_only = ctx.state.clone();
         snapshot_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
 
-        let objects = logical_maven_objects(&snapshot_only, "public").unwrap();
-        let duplicate = objects.iter().find(|(path, _)| path == logical).unwrap();
-        assert_eq!(duplicate.1.size, 5, "first group member must win");
+        let (objects, _) = indexed_maven_objects(&snapshot_only, Some("public"), "")
+            .await
+            .unwrap();
+        let duplicate = objects
+            .iter()
+            .find(|object| object.path == logical)
+            .unwrap();
+        assert_eq!(duplicate.meta.size, 5, "first group member must win");
         assert_eq!(
             objects.len(),
             2,
             "duplicate logical path must be counted once"
         );
 
-        let detail = get_maven_detail(&snapshot_only, "public/com/example/app/1.0").await;
+        let detail = get_maven_detail(&snapshot_only, "public/com/example/app/1.0")
+            .await
+            .unwrap();
         assert_eq!(
             detail
                 .artifacts
@@ -860,6 +1707,288 @@ mod named_maven_tests {
             "Maven browser request path must use only the published snapshot"
         );
     }
+
+    #[tokio::test]
+    async fn persistent_group_browser_uses_only_the_requested_redb_prefix() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+            config.maven.repositories = vec![
+                MavenRepository::Hosted {
+                    name: "first".to_string(),
+                    version_policy: MavenVersionPolicy::Mixed,
+                    write_policy: MavenWritePolicy::AllowOnce,
+                },
+                MavenRepository::Hosted {
+                    name: "second".to_string(),
+                    version_policy: MavenVersionPolicy::Mixed,
+                    write_policy: MavenWritePolicy::AllowOnce,
+                },
+                MavenRepository::Group {
+                    name: "public".to_string(),
+                    members: vec!["first".to_string(), "second".to_string()],
+                },
+            ];
+        });
+        let logical = "com/example/app/1.0/app-1.0.jar";
+        ctx.state
+            .storage
+            .put(&format!("maven/repositories/first/{logical}"), b"first")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                &format!("maven/repositories/second/{logical}"),
+                b"second-copy",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "maven/repositories/second/com/example/app/1.0/app-1.0.pom",
+                b"pom",
+            )
+            .await
+            .unwrap();
+
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            ctx.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let mut indexed_only = ctx.state.clone();
+        indexed_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
+        indexed_only.repo_index = Arc::clone(&index);
+
+        let (entries, leaf) = get_maven_dir_listing(&indexed_only, "public/com/example/app/1.0")
+            .await
+            .unwrap();
+        assert!(leaf);
+        assert!(entries.is_empty());
+        let detail = get_maven_detail(&indexed_only, "public/com/example/app/1.0")
+            .await
+            .unwrap();
+        assert_eq!(
+            detail
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app-1.0.jar", "app-1.0.pom"]
+        );
+        assert_eq!(
+            detail.download_base,
+            "/repository/public/com/example/app/1.0"
+        );
+        assert!(list_attempts.lock().is_empty());
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_maven_children_and_files_use_bounded_keyset_pages_without_storage_io() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+            config.maven.repositories = vec![MavenRepository::Hosted {
+                name: "releases".to_string(),
+                version_policy: MavenVersionPolicy::Mixed,
+                write_policy: MavenWritePolicy::AllowOnce,
+            }];
+        });
+        for number in 0..105 {
+            ctx.state
+                .storage
+                .put(
+                    &format!(
+                        "maven/repositories/releases/com/example/artifact{number:03}/1.0/artifact{number:03}-1.0.jar"
+                    ),
+                    b"jar",
+                )
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put(
+                    &format!(
+                        "maven/repositories/releases/com/example/bundle/1.0/file{number:03}.jar"
+                    ),
+                    b"file",
+                )
+                .await
+                .unwrap();
+        }
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            ctx.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+
+        let backend = crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone());
+        let list_attempts = backend.list_attempts();
+        let get_attempts = backend.get_attempts();
+        let mut indexed_only = ctx.state.clone();
+        indexed_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
+        indexed_only.repo_index = Arc::clone(&index);
+
+        let first = get_maven_dir_page(&indexed_only, "releases/com/example", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 100);
+        let token = first
+            .continuation_token
+            .expect("children need a second page");
+        let second = get_maven_dir_page(&indexed_only, "releases/com/example", Some(token), 100)
+            .await
+            .unwrap();
+        let child_names = first
+            .items
+            .into_iter()
+            .chain(second.items)
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+        assert_eq!(child_names.len(), 106, "105 artifacts plus bundle");
+        assert_eq!(child_names.first().unwrap(), "artifact000");
+        assert_eq!(child_names.last().unwrap(), "bundle");
+        assert!(second.continuation_token.is_none());
+
+        let first =
+            get_maven_detail_page(&indexed_only, "releases/com/example/bundle/1.0", None, 100)
+                .await
+                .unwrap();
+        assert_eq!(first.detail.artifacts.len(), 100);
+        let token = first.continuation_token.expect("files need a second page");
+        let second = get_maven_detail_page(
+            &indexed_only,
+            "releases/com/example/bundle/1.0",
+            Some(token),
+            100,
+        )
+        .await
+        .unwrap();
+        let filenames = first
+            .detail
+            .artifacts
+            .into_iter()
+            .chain(second.detail.artifacts)
+            .map(|artifact| artifact.filename)
+            .collect::<Vec<_>>();
+        assert_eq!(filenames.len(), 105);
+        assert_eq!(filenames.first().unwrap(), "file000.jar");
+        assert_eq!(filenames.last().unwrap(), "file104.jar");
+        assert!(second.continuation_token.is_none());
+        assert!(list_attempts.lock().is_empty());
+        assert!(get_attempts.lock().is_empty());
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_cursor_binds_generation_filter_and_topology() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+            config.maven.repositories = vec![MavenRepository::Hosted {
+                name: "releases".to_string(),
+                version_policy: MavenVersionPolicy::Mixed,
+                write_policy: MavenWritePolicy::AllowOnce,
+            }];
+        });
+        for artifact in ["alpha", "beta"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!(
+                        "maven/repositories/releases/com/example/{artifact}/1.0/{artifact}-1.0.jar"
+                    ),
+                    artifact.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            ctx.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let mut state = ctx.state.clone();
+        state.repo_index = Arc::clone(&index);
+
+        let first = persistent_page(&state, "maven", None, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert!(first.items[0].name.starts_with("releases/"));
+        let token = first.continuation_token.expect("second page cursor");
+        let second = persistent_page(&state, "maven", None, Some(token.clone()), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_ne!(first.items[0].name, second.items[0].name);
+        assert_eq!(
+            persistent_page(
+                &state,
+                "maven",
+                Some("different".to_string()),
+                Some(token.clone()),
+                1,
+            )
+            .await
+            .unwrap_err(),
+            PageError::BadCursor
+        );
+
+        let mut decoded = decode_cursor(&token).unwrap();
+        decoded.config_digest = "different-topology".to_string();
+        let wrong_topology = encode_cursor(&decoded).unwrap();
+        assert_eq!(
+            persistent_page(&state, "maven", None, Some(wrong_topology), 1)
+                .await
+                .unwrap_err(),
+            PageError::GenerationChanged
+        );
+
+        ctx.state
+            .storage
+            .put(
+                "maven/repositories/releases/com/example/gamma/1.0/gamma-1.0.jar",
+                b"gamma",
+            )
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert_eq!(
+            persistent_page(&state, "maven", None, Some(token), 1)
+                .await
+                .unwrap_err(),
+            PageError::GenerationChanged
+        );
+        index.shutdown_persistent().await;
+    }
 }
 
 pub async fn get_npm_detail(
@@ -867,19 +1996,31 @@ pub async fn get_npm_detail(
     name: &str,
     show_prerelease: bool,
     show_all: bool,
-) -> PackageDetail {
+) -> Result<PackageDetail, PageError> {
     let storage = &state.storage;
     let Some((repository, package)) = name
         .strip_prefix("repositories/")
         .and_then(|rest| rest.split_once('/'))
     else {
-        return PackageDetail {
+        return Ok(PackageDetail {
             versions: vec![],
             prerelease_count: 0,
             total_stable: 0,
             metadata: PackageMetadata::default(),
-        };
+        });
     };
+
+    if state.repo_index.has_persistent() {
+        return get_npm_detail_page(
+            state,
+            name,
+            show_prerelease,
+            None,
+            if show_all { 100 } else { 20 },
+        )
+        .await
+        .map(|page| page.detail);
+    }
 
     let package_leaf = package.split('/').next_back().unwrap_or(package);
     let hosted_versions_prefix = format!("npm/repositories/{repository}/{package}/versions/");
@@ -1042,8 +2183,206 @@ pub async fn get_npm_detail(
             .unwrap_or_default();
     }
 
-    PackageDetail {
+    Ok(PackageDetail {
         versions: stable_versions,
+        prerelease_count,
+        total_stable,
+        metadata,
+    })
+}
+
+pub async fn get_npm_detail_page(
+    state: &AppState,
+    name: &str,
+    show_prerelease: bool,
+    continuation_token: Option<String>,
+    limit: usize,
+) -> Result<NpmDetailEnvelope, PageError> {
+    let Some((repository, package)) = name
+        .strip_prefix("repositories/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return Ok(NpmDetailEnvelope {
+            detail: empty_package_detail(),
+            continuation_token: None,
+            generation: 0,
+            index_state: state
+                .repo_index
+                .persistent_status()
+                .unwrap_or(IndexStatus::Warming),
+        });
+    };
+    let limit = limit.clamp(1, 100);
+    let cursor_registry = format!("npm-detail:{repository}/{package}");
+    let cursor_filter = format!("prerelease={show_prerelease}");
+    let cursor = continuation_token
+        .as_deref()
+        .map(decode_cursor)
+        .transpose()?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.registry != cursor_registry || cursor.filter != cursor_filter)
+    {
+        return Err(PageError::BadCursor);
+    }
+    let after = cursor
+        .as_ref()
+        .map(|cursor| URL_SAFE_NO_PAD.decode(&cursor.last_key))
+        .transpose()
+        .map_err(|_| PageError::BadCursor)?;
+    let (package_row, rows, next_after, generation, config_digest) = state
+        .repo_index
+        .persistent_npm_package(repository, package, after, limit)
+        .await
+        .map_err(|_| PageError::Unavailable)?;
+    if cursor.as_ref().is_some_and(|cursor| {
+        cursor.generation != generation || cursor.config_digest != config_digest
+    }) {
+        return Err(PageError::GenerationChanged);
+    }
+    let Some(package_row) = package_row else {
+        return Ok(NpmDetailEnvelope {
+            detail: empty_package_detail(),
+            continuation_token: None,
+            generation,
+            index_state: state
+                .repo_index
+                .persistent_status()
+                .unwrap_or(IndexStatus::Warming),
+        });
+    };
+    let metadata_json = package_row
+        .search
+        .as_ref()
+        .map(|search| serde_json::Value::Object(search.fields.clone()))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let versions = rows
+        .into_iter()
+        .map(|row| VersionInfo {
+            version: row.version,
+            size: row
+                .payload_meta
+                .as_ref()
+                .map_or(row.declared_size, |meta| meta.size),
+            published: row.published,
+            cached: row.payload_meta.is_some(),
+        })
+        .collect();
+    let mut detail = finish_package_detail(versions, Some(metadata_json), show_prerelease, true);
+    detail.total_stable = usize::try_from(package_row.stable_versions).unwrap_or(usize::MAX);
+    detail.prerelease_count =
+        usize::try_from(package_row.prerelease_versions).unwrap_or(usize::MAX);
+    let continuation_token = next_after.and_then(|last_key| {
+        encode_cursor(&IndexCursor {
+            schema: 1,
+            registry: cursor_registry,
+            filter: cursor_filter,
+            generation,
+            config_digest,
+            last_key: URL_SAFE_NO_PAD.encode(last_key),
+        })
+    });
+    Ok(NpmDetailEnvelope {
+        detail,
+        continuation_token,
+        generation,
+        index_state: state
+            .repo_index
+            .persistent_status()
+            .unwrap_or(IndexStatus::Warming),
+    })
+}
+
+fn empty_package_detail() -> PackageDetail {
+    PackageDetail {
+        versions: Vec::new(),
+        prerelease_count: 0,
+        total_stable: 0,
+        metadata: PackageMetadata::default(),
+    }
+}
+
+fn finish_package_detail(
+    mut versions: Vec<VersionInfo>,
+    metadata_json: Option<serde_json::Value>,
+    show_prerelease: bool,
+    show_all: bool,
+) -> PackageDetail {
+    versions.sort_by(|left, right| {
+        let parsed_left = semver::Version::parse(left.version.trim_start_matches('v'));
+        let parsed_right = semver::Version::parse(right.version.trim_start_matches('v'));
+        match (parsed_left, parsed_right) {
+            (Ok(parsed_left), Ok(parsed_right)) => parsed_right.cmp(&parsed_left),
+            _ => right.version.cmp(&left.version),
+        }
+    });
+    let prerelease_count = versions
+        .iter()
+        .filter(|version| version.version.contains('-'))
+        .count();
+    let total_stable = versions
+        .iter()
+        .filter(|version| !version.version.contains('-'))
+        .count();
+    if !show_prerelease {
+        versions.retain(|version| !version.version.contains('-'));
+    }
+    if !show_all && versions.len() > 20 {
+        versions.truncate(20);
+    }
+    let mut metadata = PackageMetadata::default();
+    if let Some(meta_json) = metadata_json {
+        metadata.description = meta_json
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        metadata.license = meta_json
+            .get("license")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        metadata.author = meta_json.get("author").and_then(|value| {
+            value.as_str().map(str::to_string).or_else(|| {
+                value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+        });
+        metadata.homepage = meta_json
+            .get("homepage")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && sanitize_href(value).is_some())
+            .map(str::to_string);
+        metadata.repository = meta_json
+            .get("repository")
+            .and_then(|value| {
+                value.as_str().map(str::to_string).or_else(|| {
+                    value
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+            })
+            .map(|value| {
+                value
+                    .trim_start_matches("git+")
+                    .trim_end_matches(".git")
+                    .to_string()
+            })
+            .filter(|value| sanitize_href(value).is_some());
+        metadata.keywords = meta_json
+            .get("keywords")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    PackageDetail {
+        versions,
         prerelease_count,
         total_stable,
         metadata,
@@ -2365,7 +3704,8 @@ mod named_npm_tests {
             true,
             true,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(detail.versions.len(), 1);
         assert_eq!(detail.versions[0].version, "1.2.3");

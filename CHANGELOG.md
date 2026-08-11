@@ -2,6 +2,63 @@
 ## [Unreleased]
 
 ### Added
+- **Maven/npm browse shows live index warm-up progress** — when an S3-backed
+  redb projection has no usable generation yet, browser routes render an
+  accessible loading screen instead of the JSON `index_unavailable` error.
+  It reports the current recovery/inventory/authority/publish phase and exact
+  committed Maven-object, npm-object, and npm-package counts, polling one small
+  HTML fragment every two seconds and refreshing automatically once the first
+  generation is published. The counters reuse existing bounded redb batches
+  and add no S3 LIST/GET work; protocol artifact routes remain available.
+- **Persistent, rebuildable Maven/npm browse and search index** — Maven/npm S3
+  inventory, logical repository rows and validated npm package/version search
+  projections now live in a bounded redb database instead of an unbounded RAM
+  snapshot. S3 and protocol-native metadata remain authoritative. NORA writes
+  repair affected entities incrementally; unknown/out-of-band changes and a
+  periodic anti-entropy pass build an invisible A/B shadow generation and
+  publish it atomically. UI list/search uses bounded key-range pagination with
+  generation-bound continuation tokens and performs no request-path S3 LIST.
+  `/ready/index` exposes projection catch-up separately from storage `/ready`.
+  A resource-limited child preflights an existing file, proven corrupt or
+  incompatible state is preserved under a quarantine name, and a missing index
+  is safely reseeded from S3. This remains a singleton design: a PVC improves
+  warm restart but does not permit overlapping writers. The feature is S3-only;
+  local and GCS behavior is unchanged. LIST omissions are exact-HEADed before
+  removal, unchanged npm authorities reuse a strong ETag/version-bound
+  projection, physical mutation events enter one bounded writer FIFO without
+  per-event Tokio receipt tasks, and one O(1) fence coordinator prevents
+  out-of-order repairs or a superseded writer from publishing false readiness.
+  Shutdown is deadline-bounded down to a process watchdog for stuck PVC I/O.
+  Drain rejects new Maven/npm mutations before termination while keeping reads
+  available. Clean restarts use a bounded child open + schema/meta preflight;
+  only an unclean prior exit adds the isolated full redb integrity scan, avoiding
+  an O(database-size) read on every routine rollout without weakening crash or
+  corruption containment. If that isolated preflight exceeds its bounded
+  startup window, NORA kills and reaps the child, preserves the old derived DB
+  as distinct timeout evidence, and starts a fresh S3 reconciliation after a
+  conservative disk-admission check. At most one timeout-evidence file remains:
+  after admission a newer timed-out primary replaces older timeout evidence,
+  and the final evidence is retired after a complete S2 generation is atomically
+  published. I/O, signal/OOM and writer overlap never take this fallback.
+  Production tags remain gated until the exact canonical upstream redb
+  revision is bound to a fresh engine identity, application schema, canonical
+  load-bearing source digest, exact matrix/minio/runtime/upstream harnesses and
+  a saved digest-verified recovery evidence locator; the gate reads the remote
+  OCI manifest digest, downloads the tar and matrix by that digest, hashes their
+  bytes and verifies the tested Harbor image encoded by the matrix. Branches,
+  tags, short revisions, repository
+  substitutions and inherited test-root overrides are rejected. The tested
+  immutable image is bound by that matrix; chart package/render binding remains
+  the separate post-build Helm gate.
+- **Redb qualification evidence is snapshot- and content-bound** — the full
+  matrix re-executes from an immutable archive, independently recomputes the
+  reviewed tree inside that snapshot, and runs only in a dependency-complete
+  redb runner pinned by its read-back Harbor digest with bounded deadlines. It
+  rejects host-run provenance. MinIO manifests enumerate every inner artifact
+  and all nine integration phases; the outer bundle has one canonical member
+  set, rejecting missing, duplicate, unexpected, or tampered evidence. OCI
+  publication uses a tree-and-bundle content-addressed staging tag and promotes
+  only the independently read-back manifest digest.
 - **Resumable downloads (`Range` / `206 Partial Content`) for every format** — what Docker blob GET gained in #657 now covers all artifact payloads: maven release artifacts, npm tarballs, pypi files, gems, cargo `.crate`s, go module zips, nuget `.nupkg`s, terraform provider/module archives, conan blobs, deb/rpm packages, ansible collections, pub archives, and raw files. A single-range request is served straight from the storage backend's native ranged read (local file seek, S3/GCS ranged GET) via a shared helper, so an interrupted `curl -C -`/pip/apt download resumes instead of restarting; a resume at end-of-file gets the RFC 9110 `416` + `Content-Range: bytes */{size}` that tells the client it already has everything (previously Docker re-served the full blob), and a failed ranged read falls back to the full 200 instead of a 500. Full-200 artifact responses advertise `Accept-Ranges: bytes`. Mutable content (maven-metadata.xml, packuments, indexes, `dists/`, `repodata/`) neither advertises nor honors ranges — a resumed range across a rewrite would splice two generations. For the same reason `raw`, the one overwritable format, honors `If-Range` against its pin ETag. A partial body cannot be re-hashed, so a ranged serve carries no server-side integrity check (the #657 precedent — the client's own lockfile/checksum covers it), and on formats where the digest-quarantine gate needs the whole object a range request under an active quarantine policy falls back to the gated full response rather than bypassing it.
 - **Nexus-style named Maven and npm repositories** — fresh installations can declare independent `hosted`, `proxy`, and `group` repositories under the shared `/repository/{repository}/...` namespace. Maven and npm names are validated globally, group members resolve in configured order, npm groups may nominate one hosted `writable_member`, and groups persist no authoritative objects. Hosted write policy is explicit: `allow` replaces a Maven/npm coordinate and reapplies mutable npm publish state, while `allow_once` (the default) keeps exact retries idempotent and rejects different bytes. An incomplete `allow_once` publish must be retried before later versions/dist-tag/deprecation mutations are accepted, preventing delayed repair from rewinding newer mutable state. npm hosted version manifests reference content-addressed SHA-512 blobs and remain physically separate from proxy packuments/tarballs/negative cache. Plain-text npm search merges hosted/proxy/group results with member-order precedence; every upstream response is capped at 8 MiB, direct proxies preserve exact pagination when namespace filtering is inactive, hosted scans cap packages/versions at 10,000, and filtered direct/group proxy backfill caps results at 10,000 and pages at 40 under a shared 30-second deadline. Group search is fail-soft and labels its successful-member total estimate as approximate, so a failed member can make it an undercount. Bulk, quick, and full audit requests are forwarded only after bounded internal-namespace filtering. Maven repositories are isolated below `maven/repositories/{name}/`. GC, retention, browse index, UI, metrics, auth classification and OpenAPI understand named repositories.
 
@@ -9,6 +66,8 @@
 - **Maven/npm migration is protocol-first and fresh-layout-only** — old NORA storage layouts are not migrated in place. Nexus hosted content must be copied into named hosted repositories through the Maven/npm protocol endpoints and verified through groups; proxy caches and group materializations are rebuilt, never imported. Direct-storage npm import is rejected, and direct Maven import is rejected when named Maven repositories are configured.
 
 ### Fixed
+- **Clean persistent-index restarts skip the immediate full S3 scan without trusting legacy or abnormal shutdowns** — immediate warm readiness now requires a versioned process-clean proof, a current parent-read clean marker, exact topology, and a caught-up durable watermark. Older PVCs perform one authoritative S2. HTTP drain/scheduler failures and background mutation panic/timeout irreversibly force the next startup to reconcile, and physical-receipt completion explicitly wakes a shutdown waiter instead of consuming the whole shared deadline.
+- **The web UI serves a favicon** — the binary now embeds an SVG NORA mark, declares it in every page, serves both `/favicon.svg` and browsers' legacy `/favicon.ico` probe, and carries the path through sub-path `public_url` rewriting and the same auth policy as the UI.
 - **Cancelling a blob upload frees the session instead of leaking it** — `DELETE /v2/{name}/blobs/uploads/{uuid}`, the OCI cancel verb, was never routed: the upload dispatcher matched only `PATCH` and `PUT`, so a client that correctly cancelled got `405 Method Not Allowed` and its session stayed in the map until the 30-minute TTL, still holding one of `max_upload_sessions`. Concurrent CI pushes then filled the ceiling with dead entries and rejected each other with `TOOMANYREQUESTS` while barely any upload was actually in flight — a push that normally takes ~1.5 min stretched past 19 min, nearly all of it re-transferring blobs that were refused at the end. `DELETE` now removes the session and its temp file and answers `204 No Content` (`404` if the session is unknown, `400` on a repository mismatch, matching the `PATCH`/`PUT` name check). Two supporting fixes: a rejected `POST` no longer leaves behind the zero-byte temp file it created before the limit check, and the `429`'s `Retry-After` is jittered over 3–10s instead of a fixed 5s, so refused clients don't re-synchronize onto one cadence and return as a herd. New gauges `nora_upload_sessions` and `nora_upload_in_flight` expose the session-map size and the count of uploads actually streaming, so the gap between them — the idle-session backlog this bug produced — is measurable rather than inferred from client logs.
 - **Maven keeps server-generated artifact metadata authoritative** — a Maven client that re-uploads a stale artifact-level `maven-metadata.xml` after a concurrent deploy no longer overwrites the version list NORA generates: an uploaded artifact-level metadata document (and its checksums) is recognized by its shape and dropped, while version-level (SNAPSHOT) and group-level (plugin) metadata are still stored verbatim. On a proxy refresh, locally hosted versions are merged into the refreshed upstream document instead of being replaced by it, and the `.md5`/`.sha1`/`.sha256`/`.sha512` sidecars are recomputed from the merged document. The proxy-side merge runs under the same `publish_lock` as the upload-side regeneration, so the document and its checksums are written as one critical section and stay mutually consistent under concurrent fetch and publish (#886).
 

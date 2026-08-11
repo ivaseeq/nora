@@ -127,12 +127,58 @@ model.
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
 - **Backup & Restore** — `nora backup` / `nora restore`
 - **S3 Storage** — AWS S3, Ceph RGW, any S3-compatible backend
+- **Persistent Maven/npm index** — bounded redb-backed browse/search pages,
+  incremental repair after NORA writes, and background S3 reconciliation
 - **Prometheus Metrics** — `/metrics` endpoint, [Grafana dashboard](MONITORING.md)
 - **Rate Limiting** — configurable per-endpoint rate limits
 
 ## Configuration
 
 NORA works out of the box. For advanced setup — auth, S3, retention, curation — see [getnora.dev/configuration](https://getnora.dev/configuration/settings/).
+
+For Maven/npm on S3, keep the derived index on persistent local storage:
+
+```toml
+[index]
+path = "/var/lib/nora/index/nora.redb"
+reconcile_interval_secs = 3600
+```
+
+S3 remains authoritative; deleting the redb file only forces a background
+rebuild. Run exactly one NORA process. A PVC improves warm restart and UI/search
+availability but is not an HA or distributed-locking mechanism. `/ready` is the
+storage gate and `/ready/index` is the independent Maven/npm projection gate.
+Until the first usable generation is published, Maven/npm browser pages show
+the current indexing phase and exact committed object/package counts; this
+progress display does not issue additional storage requests, and artifact API
+reads remain independent.
+After a durably clean shutdown, an exact-topology generation whose accepted
+changes are fully covered by its active watermark is published immediately;
+dirty or unclean state still reconciles from S3 before `/ready/index` becomes
+ready. The clean-proof contract is versioned: a database last closed by a
+binary without that proof performs one fail-closed S3 reconciliation before
+warm reuse. Periodic reconciliation remains the anti-entropy path for
+out-of-band changes.
+Local and GCS storage keep their existing in-memory index path. The current
+implementation pins one full upstream redb revision containing required
+post-4.1 crash/recovery fixes. Production promotion accepts only that canonical
+repository and revision after it is bound to a new application schema and a
+saved crash/recovery evidence manifest. The qualification path is deliberately
+split: `redb-production-matrix.sh` tests one immutable Harbor image;
+`publish-redb-production-evidence.sh` publishes the resulting tar plus matrix
+as an OCI artifact and reads it back by the registry manifest digest; the
+checked-in approval records that OCI digest separately from the tar SHA-256.
+The matrix re-executes from an immutable archive and independently recomputes
+the reviewed Git tree inside that snapshot. It uses the dependency-complete
+redb runner only by its read-back Harbor digest, enforces bounded deadlines,
+and archives only a canonical, hash-enumerated evidence member set. The
+publisher derives a content-addressed staging tag from the tree and bundle
+hash; the approval always names the immutable OCI manifest digest.
+The production source gate then pulls and hashes the actual artifact, verifies
+the embedded matrix, dependency, Cargo.lock, canonical load-bearing source and
+all four exact harnesses, and binds the tested Harbor image digest. The Helm
+chart package/render has its own later digest gate because it does not exist at
+application build time.
 
 ```bash
 # Auth

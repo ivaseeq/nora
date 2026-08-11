@@ -67,6 +67,39 @@ jobs:
       - name: Diff-coverage helper self-test
         run: bash scripts/test-diff-coverage.sh
 
+  ui-static:
+    name: UI assets and Chromium smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: tests/e2e/package-lock.json
+      - name: Install pinned UI tooling
+        working-directory: tests/e2e
+        run: npm ci
+      - name: Verify embedded Tailwind CSS is current
+        working-directory: tests/e2e
+        run: npm run check:css
+      - name: Collect read-only browser contracts
+        working-directory: tests/e2e
+        run: npm run test:list
+      - name: Build NORA with embedded UI
+        run: cargo build --locked --package nora-registry
+      - name: Install pinned Chromium
+        working-directory: tests/e2e
+        run: npx playwright install --with-deps chromium
+      - name: Execute local Swagger and static-asset contracts
+        working-directory: tests/e2e
+        run: npm run test:smoke:local
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -84,6 +117,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --package nora-registry --all-targets -- -D warnings
+
+      - name: Test redb production gate
+        run: scripts/test-redb-production-release-gate.sh
 
       - name: Run tests
         run: cargo test --package nora-registry

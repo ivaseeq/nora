@@ -35,6 +35,7 @@ pub use go::routes as go_routes;
 pub use maven::routes as maven_routes;
 pub use named::routes as named_repository_routes;
 pub use npm::routes as npm_routes;
+pub(crate) use npm::{canonical_tarball_filename, proxy_tarball_key};
 
 // Storage-key builders reused by `nora import` so imported keys are
 // byte-identical to the keys these handlers serve — GC/retention/UI browse walk
