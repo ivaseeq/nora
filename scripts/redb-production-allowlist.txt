@@ -26,4 +26,4 @@
 # the artifact by digest, hashes both files and verifies that the embedded
 # matrix binds the exact tested Harbor image digest. The Helm chart digest and
 # rendered image are still bound by the separate chart-promotion gate.
-git c419f099fd55a7905d0f5370c1508070bf7ac14c c419f099fd55a7905d0f5370c1508070bf7ac14c redb-c419f099-dev 6 4280e44489a7759710425fd0a181fa8831b42b5a31eaa9646ef783e651f61c9e scripts/redb-production-evidence/c419f099fd55a7905d0f5370c1508070bf7ac14c.json
+git c419f099fd55a7905d0f5370c1508070bf7ac14c c419f099fd55a7905d0f5370c1508070bf7ac14c redb-c419f099-dev 6 d3b2f8858daa8504b85ff924c53f68b3c4d7a6798e678ee2396e361910eaf2c5 scripts/redb-production-evidence/c419f099fd55a7905d0f5370c1508070bf7ac14c.json
