@@ -93,6 +93,19 @@ require_consistent_line() {
     printf '%s\n' "${matches[0]}"
 }
 
+extract_immutable_helm_output() {
+    local raw=$1 expected_ref=$2 expected_digest=$3 output=$4 label=$5
+    local pulled digest
+    pulled=$(sed -n '1p' "$raw")
+    digest=$(sed -n '2p' "$raw")
+    [[ "$pulled" == "Pulled: ${expected_ref#oci://}" \
+        && "$digest" == "Digest: $expected_digest" ]] \
+        || fail "$label did not report the exact immutable chart pull"
+    sed '1,2d' "$raw" >"$output"
+    [[ -s "$output" ]] \
+        || fail "$label returned no chart output after its immutable pull identity"
+}
+
 require_harbor_immutability() {
     local docker_config_file curl_config response
     HARBOR_POLICY_CHECKS=$((HARBOR_POLICY_CHECKS + 1))
@@ -323,8 +336,9 @@ run_promotion() {
     local verify_log image_line tree_line approved_image approved_tree approved_digest
     local chart_yaml values_yaml version tags package_dir package chart_push_log
     local push_line pushed_digest descriptor remote_digest immutable_chart
-    local remote_chart_yaml remote_values_yaml live_values promoted_values template_manifest
-    local dry_run_json dry_run_manifest
+    local remote_chart_raw remote_chart_yaml remote_values_raw remote_values_yaml
+    local live_values promoted_values template_raw template_manifest
+    local dry_run_raw dry_run_json dry_run_manifest
     local -a common_values
 
     [[ "$mode" == preflight || "$mode" == apply ]] || usage
@@ -490,31 +504,48 @@ run_promotion() {
         || fail "remote chart manifest digest does not match the pushed digest"
     immutable_chart="oci://$CHART_REPOSITORY@$remote_digest"
 
+    remote_chart_raw="$RUN_ROOT/remote-Chart.raw"
     remote_chart_yaml="$RUN_ROOT/remote-Chart.yaml"
+    remote_values_raw="$RUN_ROOT/remote-values.raw"
     remote_values_yaml="$RUN_ROOT/remote-values.yaml"
-    helm show chart "$immutable_chart" >"$remote_chart_yaml" \
+    helm show chart "$immutable_chart" >"$remote_chart_raw" \
         || fail "cannot read chart metadata by immutable digest"
-    helm show values "$immutable_chart" >"$remote_values_yaml" \
+    extract_immutable_helm_output "$remote_chart_raw" "$immutable_chart" \
+        "$remote_digest" "$remote_chart_yaml" "immutable chart metadata read-back"
+    helm show values "$immutable_chart" >"$remote_values_raw" \
         || fail "cannot read chart defaults by immutable digest"
+    extract_immutable_helm_output "$remote_values_raw" "$immutable_chart" \
+        "$remote_digest" "$remote_values_yaml" "immutable chart defaults read-back"
     [[ $(require_chart_identity \
         "$remote_chart_yaml" "$remote_values_yaml" \
         "$approved_tree" "$approved_digest") == "$version" ]] \
         || fail "immutable chart read-back changed the chart version"
 
+    template_raw="$RUN_ROOT/immutable-template.raw"
     template_manifest="$RUN_ROOT/immutable-template.yaml"
     helm template "$RELEASE" "$immutable_chart" \
         --kube-context "$KUBE_CONTEXT" --namespace "$NAMESPACE" \
-        --values "$promoted_values" "${common_values[@]}" >"$template_manifest" \
+        --values "$promoted_values" "${common_values[@]}" >"$template_raw" \
         || fail "immutable chart render failed"
+    extract_immutable_helm_output "$template_raw" "$immutable_chart" \
+        "$remote_digest" "$template_manifest" "immutable client render"
+    [[ $(sed -n '1p' "$template_manifest") == --- ]] \
+        || fail "immutable client render returned an unexpected payload"
     require_rendered_deployment "$template_manifest" "$approved_image" "immutable client render"
 
+    dry_run_raw="$RUN_ROOT/immutable-server-dry-run.raw"
     dry_run_json="$RUN_ROOT/immutable-server-dry-run.json"
     helm upgrade "$RELEASE" "$immutable_chart" \
         --kube-context "$KUBE_CONTEXT" --namespace "$NAMESPACE" \
         --dry-run=server --hide-secret --output json \
         --reset-values --values "$promoted_values" \
-        "${common_values[@]}" >"$dry_run_json" \
+        "${common_values[@]}" >"$dry_run_raw" \
         || fail "immutable chart server dry-run failed"
+    extract_immutable_helm_output "$dry_run_raw" "$immutable_chart" \
+        "$remote_digest" "$dry_run_json" "immutable server dry-run"
+    jq -e -s 'length == 1 and (.[0] | type == "object")' \
+        "$dry_run_json" >/dev/null \
+        || fail "immutable server dry-run returned an unexpected JSON payload"
     dry_run_manifest="$RUN_ROOT/immutable-server-dry-run.yaml"
     jq -er '.manifest | select(type == "string" and length > 0)' \
         "$dry_run_json" >"$dry_run_manifest" \

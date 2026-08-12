@@ -180,6 +180,17 @@ image="docker-hub.just-ai.com/infra/artifact-nora@sha256:$(printf 'b%.0s' {1..64
 chart_digest="sha256:$(printf 'd%.0s' {1..64})"
 immutable="oci://docker-hub.just-ai.com/helm-charts/nora@$chart_digest"
 
+emit_immutable_pull() {
+    local pulled=${immutable#oci://} digest=$chart_digest
+    if [[ ${NORA_PROMOTION_TEST_BAD_PULL_REF:-0} == 1 ]]; then
+        pulled=docker-hub.just-ai.com/helm-charts/other@$chart_digest
+    fi
+    if [[ ${NORA_PROMOTION_TEST_BAD_PULL_DIGEST:-0} == 1 ]]; then
+        digest="sha256:$(printf 'e%.0s' {1..64})"
+    fi
+    printf 'Pulled: %s\nDigest: %s\n' "$pulled" "$digest"
+}
+
 render() {
     local phase=${1:-client}
     local selected_image=$image
@@ -195,6 +206,7 @@ render() {
         selected_image="docker-hub.just-ai.com/infra/artifact-nora@sha256:$(printf 'c%.0s' {1..64})"
     fi
     cat <<YAML
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -260,9 +272,11 @@ elif [[ "$1" == push ]]; then
     echo "Digest: $chart_digest"
 elif [[ "$1 $2" == "show chart" ]]; then
     [[ "$3" == "$immutable" ]]
+    emit_immutable_pull
     cat "$NORA_PROMOTION_TEST_CHART/Chart.yaml"
 elif [[ "$1 $2" == "show values" ]]; then
     [[ "$3" == "$immutable" ]]
+    emit_immutable_pull
     cat "$NORA_PROMOTION_TEST_CHART/values.yaml"
 elif [[ "$1" == --kube-context ]]; then
     [[ "$2 $3 $4 $5 $6 $7 $8" == "testcloud-k8s -n nora get values nora -o" && "$9" == yaml ]]
@@ -277,7 +291,10 @@ elif [[ "$1" == template ]]; then
     [[ "$2" == nora && ("$3" == "$immutable" || "$3" == */nora-0.5.11.tgz) ]]
     require_promotion_overrides "$@"
     phase=local-client
-    [[ "$3" == "$immutable" ]] && phase=immutable-client
+    if [[ "$3" == "$immutable" ]]; then
+        phase=immutable-client
+        emit_immutable_pull
+    fi
     render "$phase"
 elif [[ "$1" == upgrade ]]; then
     [[ "$2" == nora && ("$3" == "$immutable" || "$3" == */nora-0.5.11.tgz) ]]
@@ -285,8 +302,15 @@ elif [[ "$1" == upgrade ]]; then
     if [[ " $* " == *" --dry-run=server "* ]]; then
         [[ " $* " == *" --reset-values "* ]]
         phase=local-dry-run
-        [[ "$3" == "$immutable" ]] && phase=immutable-dry-run
+        if [[ "$3" == "$immutable" ]]; then
+            phase=immutable-dry-run
+            emit_immutable_pull
+        fi
         manifest=$(render "$phase")
+        if [[ "$phase" == immutable-dry-run \
+            && ${NORA_PROMOTION_TEST_EXTRA_DRY_RUN_OUTPUT:-0} == 1 ]]; then
+            echo unexpected-prefix
+        fi
         jq -n --arg manifest "$manifest" '{manifest: $manifest}'
     else
         [[ "$3" == "$immutable" ]]
@@ -446,6 +470,15 @@ expect_failure "local server dry-run Deployment does not preserve" \
     "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
 expect_failure "remote chart manifest digest does not match" \
     env NORA_PROMOTION_TEST_BAD_REMOTE_DIGEST=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
+expect_failure "immutable chart metadata read-back did not report the exact immutable chart pull" \
+    env NORA_PROMOTION_TEST_BAD_PULL_REF=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
+expect_failure "immutable chart metadata read-back did not report the exact immutable chart pull" \
+    env NORA_PROMOTION_TEST_BAD_PULL_DIGEST=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
+expect_failure "immutable server dry-run returned an unexpected JSON payload" \
+    env NORA_PROMOTION_TEST_EXTRA_DRY_RUN_OUTPUT=1 \
     "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
 expect_failure "immutable server dry-run Deployment does not preserve" \
     env NORA_PROMOTION_TEST_BAD_IMMUTABLE_DRY_RUN=1 \
