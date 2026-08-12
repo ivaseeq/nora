@@ -1,0 +1,38 @@
+{
+  "schema": 3,
+  "redb_source_kind": "git",
+  "redb_repository": "https://github.com/cberner/redb",
+  "redb_revision": "c419f099fd55a7905d0f5370c1508070bf7ac14c",
+  "redb_resolved_commit": "c419f099fd55a7905d0f5370c1508070bf7ac14c",
+  "redb_package_version": "4.1.0",
+  "redb_lock_source": "git+https://github.com/cberner/redb?rev=c419f099fd55a7905d0f5370c1508070bf7ac14c#c419f099fd55a7905d0f5370c1508070bf7ac14c",
+  "cargo_lock_sha256": "cbb0313a5018e60a74a3de6241157848254256e53608a980e94f094db2450f79",
+  "engine_revision": "redb-c419f099-dev",
+  "nora_schema_version": 6,
+  "nora_source_digest": "d9b88d18b0667600343093464dddaaa7ae7d903a07368492c5fd7a69434dadf3",
+  "image_ref": "docker-hub.just-ai.com/infra/artifact-nora@sha256:446824398f072bf8e581944b24739af426d76da5bfc1f649be62b39b7329960e",
+  "image_digest": "sha256:446824398f072bf8e581944b24739af426d76da5bfc1f649be62b39b7329960e",
+  "image_source_tree": "af13aa447b85fe864f8a8efa0a2a165874bf79bf",
+  "harnesses": {
+    "matrix_sha256": "088b5c6dee0fe8eaf7ef88fb34d41d9564a7fb70fe0f5dcb9b26fbd4f326bc66",
+    "minio_sha256": "d8e716df11362b170b02714c164e1567c0f300960b98cc63df431289bcb053e6",
+    "runtime_sha256": "7c7765569d3477df9212936d94503d18e142d99fbff514cf4d8a1914b6d75763",
+    "upstream_sha256": "936554d40e471e8b4553b33242b28427642eb244cbde8802c8659726fdf5b4d4",
+    "enospc_test_sha256": "6970da481f06d8eb289bfd959f8d4f66a61c550f686ec8fe07fa81da42b4881d"
+  },
+  "bundle_uri": "oci://docker-hub.just-ai.com/infra/artifact-nora-redb-evidence@sha256:6467b8c6d61cbd182df1aff67c5183410687c12f3a6bd2de4df5953cead901b7",
+  "evidence_oci_manifest_digest": "sha256:6467b8c6d61cbd182df1aff67c5183410687c12f3a6bd2de4df5953cead901b7",
+  "bundle_sha256": "f34429bc9d93c7213f3e34c00c99f252fffcd2ee16e531662cef96980066300b",
+  "matrix_manifest_sha256": "1d8f32aeb1694e988db3cf5dfa34dc5c420bdddf129ee63fc8348533b57e0cc9",
+  "verified_phases": [
+    "sigkill",
+    "enospc",
+    "double_crash",
+    "torn_write",
+    "corruption",
+    "generic_io",
+    "timeout",
+    "second_open",
+    "recovery"
+  ]
+}

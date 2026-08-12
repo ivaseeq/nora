@@ -373,7 +373,12 @@ async fn upload(
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
-    let file_exists = state.storage.stat(&key).await.is_some();
+    let file_exists = match state.storage.stat(&key).await {
+        Ok(meta) => meta.is_some(),
+        Err(error) => {
+            return crate::registry::storage_error_response("raw", "stat", &key, &error);
+        }
+    };
 
     match (file_exists, if_none_match.as_deref(), if_match.as_deref()) {
         // No conditional headers, file exists → 409 (backward compat)
@@ -560,7 +565,7 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.storage.stat(&key).await {
-        Some(meta) => {
+        Ok(Some(meta)) => {
             let mut builder = axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_LENGTH, meta.size.to_string())
@@ -577,7 +582,8 @@ async fn check_exists(State(state): State<AppState>, Path(path): Path<String>) -
                 .expect("valid response")
                 .into_response()
         }
-        None => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => crate::registry::storage_error_response("raw", "stat", &key, &error),
     }
 }
 
@@ -810,6 +816,24 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn stat_failure_is_not_reported_as_not_found() {
+        let ctx = create_test_context();
+        let key = "raw/test.txt";
+        let mut state = ctx.state.clone();
+        state.storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::test_helpers::FaultInjectBackend::new(ctx.state.storage.clone()).fail_stat(key),
+        ));
+
+        let response = super::check_exists(
+            axum::extract::State(state),
+            axum::extract::Path("test.txt".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
     async fn test_raw_delete() {
         let ctx = create_test_context();
         send(&ctx.app, Method::PUT, "/raw/test.txt", b"data".to_vec()).await;
@@ -858,7 +882,13 @@ mod integration_tests {
         let body = vec![0u8; 2 * 1024 * 1024];
         let put = send(&ctx.app, Method::PUT, "/raw/big.bin", body).await;
         assert_eq!(put.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(ctx.state.storage.stat("raw/big.bin").await.is_none());
+        assert!(ctx
+            .state
+            .storage
+            .stat("raw/big.bin")
+            .await
+            .unwrap()
+            .is_none());
         let tmp = std::path::Path::new(&ctx.state.config.storage.path).join("tmp/raw-uploads");
         let leftovers = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
         assert_eq!(leftovers, 0, "aborted stream must not leak its temp file");

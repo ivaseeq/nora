@@ -9,12 +9,14 @@ mod static_assets;
 mod templates;
 
 use crate::repo_index::paginate;
+#[cfg(test)]
+use crate::repo_index::IndexStatus;
 use crate::tokens::Role;
 use crate::AppState;
 use axum::{
     body::Body,
-    extract::{Path, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{OriginalUri, Path, Query, Request, State},
+    http::{header, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -24,6 +26,7 @@ use axum::{
 use crate::auth::{AuthenticatedRole, AuthenticatedUser};
 use api::*;
 use i18n::Lang;
+use percent_encoding::percent_decode_str;
 use templates::*;
 
 /// Returns base URL for UI install commands.
@@ -40,17 +43,28 @@ struct LangQuery {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct IndexStatusQuery {
+    registry: Option<String>,
+    lang: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct DetailQuery {
     lang: Option<String>,
     prerelease: Option<bool>,
     all: Option<bool>,
+    continuation_token: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ListQuery {
     lang: Option<String>,
+    q: Option<String>,
     page: Option<usize>,
     limit: Option<usize>,
+    continuation_token: Option<String>,
+    view: Option<String>,
 }
 
 const DEFAULT_PAGE_SIZE: usize = 50;
@@ -120,12 +134,16 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(|| async { Redirect::to("/ui/") }))
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
         .route("/ui/", get(dashboard))
+        // Browsers probe `/favicon.ico` even when a page declares an SVG icon.
+        // Serve both paths from the same embedded, storage-independent asset.
+        .route("/favicon.ico", get(static_assets::serve_favicon))
+        .route("/favicon.svg", get(static_assets::serve_favicon))
         .route("/ui/docker", get(docker_list))
         .route("/ui/docker/{name}", get(docker_detail))
         .route("/ui/maven", get(maven_list))
         .route("/ui/maven/{*path}", get(maven_detail))
         .route("/ui/npm", get(npm_list))
-        .route("/ui/npm/{name}", get(npm_detail))
+        .route("/ui/npm/{*name}", get(npm_detail))
         .route("/ui/cargo", get(cargo_list))
         .route("/ui/cargo/{name}", get(cargo_detail))
         .route("/ui/pypi", get(pypi_list))
@@ -166,9 +184,134 @@ pub fn routes() -> Router<AppState> {
         // API endpoints for HTMX
         .route("/api/ui/stats", get(api_stats))
         .route("/api/ui/dashboard", get(api_dashboard))
+        .route("/api/ui/index-status", get(index_status))
         .route("/api/ui/{registry_type}/list", get(api_list))
-        .route("/api/ui/{registry_type}/{name}", get(api_detail))
+        .route("/api/ui/{registry_type}/{*name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
+}
+
+fn index_loading_response(
+    state: &AppState,
+    registry_type: &str,
+    registry_title: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> Response {
+    let mut response = Html(render_index_loading(
+        registry_type,
+        registry_title,
+        lang,
+        auth_enabled,
+        state.repo_index.persistent_index_progress(),
+    ))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn index_page_error_response(
+    error: PageError,
+    state: &AppState,
+    registry_type: &str,
+    registry_title: &str,
+    lang: Lang,
+    auth_enabled: bool,
+    request_uri: &Uri,
+) -> Response {
+    if error == PageError::Unavailable && !state.repo_index.persistent_projection_available() {
+        index_loading_response(state, registry_type, registry_title, lang, auth_enabled)
+    } else if matches!(error, PageError::BadCursor | PageError::GenerationChanged) {
+        let mut response = Redirect::to(&cursor_reset_location(request_uri)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+    } else if error == PageError::Unavailable {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(render_index_unavailable(
+                registry_type,
+                registry_title,
+                &cursor_reset_location(request_uri),
+                lang,
+                auth_enabled,
+            )),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+        response
+    } else {
+        error.response()
+    }
+}
+
+/// Drop only the opaque cursor from a browser URL. The remaining raw query
+/// pairs are already percent-encoded, so preserving them verbatim avoids
+/// changing the user's search text, language, page size or detail view.
+fn cursor_reset_location(uri: &Uri) -> String {
+    let retained = uri
+        .query()
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|pair| !query_key_matches(pair, b"continuation_token"))
+        .collect::<Vec<_>>()
+        .join("&");
+    if retained.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{}?{retained}", uri.path())
+    }
+}
+
+fn query_key_matches(pair: &str, expected: &[u8]) -> bool {
+    let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+    percent_decode_str(key)
+        .decode_utf8()
+        .is_ok_and(|decoded| decoded.as_bytes() == expected)
+}
+
+async fn index_status(
+    State(state): State<AppState>,
+    Query(query): Query<IndexStatusQuery>,
+) -> Response {
+    let (registry_type, registry_title) = match query.registry.as_deref().unwrap_or("maven") {
+        "maven" => ("maven", "Maven"),
+        "npm" => ("npm", "npm"),
+        _ => return (StatusCode::BAD_REQUEST, "unsupported registry").into_response(),
+    };
+    let lang = query
+        .lang
+        .as_deref()
+        .map_or_else(Lang::default, Lang::from_str);
+    let available = state.repo_index.persistent_projection_available();
+    let mut response = if available {
+        StatusCode::OK.into_response()
+    } else {
+        Html(render_index_loading_fragment(
+            registry_type,
+            registry_title,
+            lang,
+            state.repo_index.persistent_index_progress(),
+        ))
+        .into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if available {
+        response.headers_mut().insert(
+            HeaderName::from_static("hx-refresh"),
+            HeaderValue::from_static("true"),
+        );
+    }
+    response
 }
 
 /// Prefix NORA's root-absolute UI self-links with `base` so the UI works when
@@ -187,13 +330,40 @@ fn apply_base_path(html: &str, base: &str) -> String {
         // spec URL the Swagger initializer embeds ("/api-docs/openapi.json").
         .replace("\"/api-docs", &format!("\"{base}/api-docs"))
         .replace("'/api-docs", &format!("'{base}/api-docs"))
+        .replace("\"/favicon", &format!("\"{base}/favicon"))
+        .replace("'/favicon", &format!("'{base}/favicon"))
+}
+
+/// Prefix one response-navigation header when it points at a NORA UI route.
+/// Besides ordinary redirects, HTMX uses `HX-Replace-Url` to update browser
+/// history after an in-place search. Both must honor `public_url`'s path.
+fn prefix_ui_response_header(headers: &mut axum::http::HeaderMap, name: HeaderName, base: &str) {
+    let Some(value) = headers
+        .get(&name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let is_ui_path = value == "/ui"
+        || value.starts_with("/ui/")
+        || value == "/api/ui"
+        || value.starts_with("/api/ui/")
+        || value == "/api-docs"
+        || value.starts_with("/api-docs/");
+    if is_ui_path && !value.starts_with(base) {
+        if let Ok(value) = HeaderValue::from_str(&format!("{base}{value}")) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Response middleware: rewrite the UI's root-absolute self-links to carry the
 /// configured `public_url` path prefix. Covers HTML bodies (links + inline JS
-/// `fetch`), the Swagger UI initializer's spec URL, and redirect `Location`
-/// headers. A no-op when `base_path` is empty (the router keeps serving `/ui`,
-/// `/api/ui` and `/api-docs`; the proxy strips the prefix).
+/// `fetch`), the Swagger UI initializer's spec URL, and browser-navigation
+/// headers (`Location` and HTMX's `HX-Replace-Url`). A no-op when `base_path`
+/// is empty (the router keeps serving `/ui`, `/api/ui` and `/api-docs`; the
+/// proxy strips the prefix).
 pub(crate) async fn rewrite_ui_base_path(
     State(state): State<AppState>,
     req: Request,
@@ -208,20 +378,11 @@ pub(crate) async fn rewrite_ui_base_path(
     if base.is_empty() {
         return resp;
     }
-    // A redirect target (e.g. "/" -> "/ui/", "/api-docs" -> "/api-docs/") must
-    // carry the prefix too.
-    if let Some(loc) = resp
-        .headers()
-        .get(header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if (loc.starts_with("/ui") || loc.starts_with("/api/ui") || loc.starts_with("/api-docs"))
-            && !loc.starts_with(&base)
-        {
-            if let Ok(hv) = HeaderValue::from_str(&format!("{base}{loc}")) {
-                resp.headers_mut().insert(header::LOCATION, hv);
-            }
-        }
+    // Both an ordinary redirect and HTMX's history replacement must carry the
+    // prefix. Otherwise an in-place search under `/nora` silently changes the
+    // address bar to `/ui/...`, and the next reload escapes the deployment.
+    for name in [header::LOCATION, HeaderName::from_static("hx-replace-url")] {
+        prefix_ui_response_header(resp.headers_mut(), name, &base);
     }
     let is_html = resp
         .headers()
@@ -269,7 +430,7 @@ async fn docker_list(
 ) -> impl IntoResponse {
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 100);
     let auth_enabled = state.auth.is_some();
 
     let all_repos = state.repo_index.get("docker", &state.storage).await;
@@ -312,89 +473,240 @@ async fn docker_detail(
 // Maven pages
 async fn maven_list(
     State(state): State<AppState>,
+    OriginalUri(request_uri): OriginalUri,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let auth_enabled = state.auth.is_some();
 
-    // Show top-level namespace directories (com, org, io, etc.)
-    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
-    let total = entries.len();
+    if !state.repo_index.persistent_projection_available() {
+        return index_loading_response(&state, "maven", "Maven", lang, auth_enabled);
+    }
 
-    Html(templates::render_maven_dir(
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 100);
+    let search_query = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    if let Some(search_query) = search_query {
+        let page = match api::persistent_page(
+            &state,
+            "maven",
+            Some(search_query.to_string()),
+            query.continuation_token.clone(),
+            limit,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return index_page_error_response(
+                    error,
+                    &state,
+                    "maven",
+                    "Maven",
+                    lang,
+                    auth_enabled,
+                    &request_uri,
+                )
+            }
+        };
+        return Html(render_registry_list_cursor(
+            "maven",
+            "Maven Repository",
+            &page.items,
+            limit,
+            page.continuation_token.as_deref(),
+            search_query,
+            lang,
+            auth_enabled,
+        ))
+        .into_response();
+    }
+    let page = match api::get_maven_dir_page(&state, "", query.continuation_token, limit).await {
+        Ok(page) => page,
+        Err(error) => {
+            return index_page_error_response(
+                error,
+                &state,
+                "maven",
+                "Maven",
+                lang,
+                auth_enabled,
+                &request_uri,
+            )
+        }
+    };
+    let total = page.items.len();
+
+    Html(templates::render_maven_dir_cursor(
         "",
-        &entries,
+        &page.items,
         total,
+        page.continuation_token.as_deref(),
+        limit,
         lang,
         auth_enabled,
     ))
+    .into_response()
 }
 
 async fn maven_detail(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    Query(query): Query<LangQuery>,
+    OriginalUri(request_uri): OriginalUri,
+    Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    let lang = extract_lang(
-        &Query(query),
-        headers.get("cookie").and_then(|v| v.to_str().ok()),
-    );
+) -> Response {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
     let auth_enabled = state.auth.is_some();
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 100);
 
-    // Try hierarchical browsing: check if this is a directory or leaf artifact
-    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+    if !state.repo_index.persistent_projection_available() {
+        return index_loading_response(&state, "maven", "Maven", lang, auth_enabled);
+    }
 
-    if is_leaf || entries.is_empty() {
-        // Leaf artifact — show files (JARs, POMs, etc.)
-        let detail = get_maven_detail(&state.storage, &path).await;
-        Html(render_maven_detail(&path, &detail, lang, auth_enabled))
-    } else {
-        // Namespace directory — show children
-        let total = entries.len();
-        Html(templates::render_maven_dir(
+    if query.view.as_deref() == Some("files") {
+        let page = match get_maven_detail_page(&state, &path, query.continuation_token, limit).await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return index_page_error_response(
+                    error,
+                    &state,
+                    "maven",
+                    "Maven",
+                    lang,
+                    auth_enabled,
+                    &request_uri,
+                )
+            }
+        };
+        return Html(render_maven_detail_cursor(
             &path,
-            &entries,
-            total,
+            &page.detail,
+            page.continuation_token.as_deref(),
+            limit,
             lang,
             auth_enabled,
         ))
+        .into_response();
+    }
+
+    // Try hierarchical browsing: check if this is a directory or leaf artifact
+    let page = match api::get_maven_dir_page(&state, &path, query.continuation_token, limit).await {
+        Ok(page) => page,
+        Err(error) => {
+            return index_page_error_response(
+                error,
+                &state,
+                "maven",
+                "Maven",
+                lang,
+                auth_enabled,
+                &request_uri,
+            )
+        }
+    };
+
+    if page.is_leaf || page.items.is_empty() {
+        // Leaf artifact — show files (JARs, POMs, etc.)
+        let detail_page = match get_maven_detail_page(&state, &path, None, limit).await {
+            Ok(detail) => detail,
+            Err(error) => {
+                return index_page_error_response(
+                    error,
+                    &state,
+                    "maven",
+                    "Maven",
+                    lang,
+                    auth_enabled,
+                    &request_uri,
+                )
+            }
+        };
+        Html(render_maven_detail_cursor(
+            &path,
+            &detail_page.detail,
+            detail_page.continuation_token.as_deref(),
+            limit,
+            lang,
+            auth_enabled,
+        ))
+        .into_response()
+    } else {
+        // Namespace directory — show children
+        let total = page.items.len();
+        Html(templates::render_maven_dir_cursor(
+            &path,
+            &page.items,
+            total,
+            page.continuation_token.as_deref(),
+            limit,
+            lang,
+            auth_enabled,
+        ))
+        .into_response()
     }
 }
 
 // npm pages
 async fn npm_list(
     State(state): State<AppState>,
+    OriginalUri(request_uri): OriginalUri,
     Query(query): Query<ListQuery>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, 100);
     let auth_enabled = state.auth.is_some();
 
-    let all_packages = state.repo_index.get("npm", &state.storage).await;
-    let (packages, total) = paginate(&all_packages, page, limit);
+    if !state.repo_index.persistent_projection_available() {
+        return index_loading_response(&state, "npm", "npm", lang, auth_enabled);
+    }
 
-    Html(render_registry_list_paginated(
+    let search_query = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    let page = api::persistent_page(
+        &state,
+        "npm",
+        search_query.map(str::to_string),
+        query.continuation_token.clone(),
+        limit,
+    )
+    .await;
+    let (packages, next) = match page {
+        Ok(page) => (page.items, page.continuation_token),
+        Err(error) => {
+            return index_page_error_response(
+                error,
+                &state,
+                "npm",
+                "npm",
+                lang,
+                auth_enabled,
+                &request_uri,
+            )
+        }
+    };
+
+    Html(render_registry_list_cursor(
         "npm",
         "npm Registry",
         &packages,
-        page,
         limit,
-        total,
+        next.as_deref(),
+        search_query.unwrap_or_default(),
         lang,
         auth_enabled,
     ))
+    .into_response()
 }
 
 async fn npm_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    OriginalUri(request_uri): OriginalUri,
     Query(query): Query<DetailQuery>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
+) -> Response {
     let lang = {
         let lang_q = LangQuery {
             lang: query.lang.clone(),
@@ -408,7 +720,50 @@ async fn npm_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_npm_detail(&state.storage, &name, show_prerelease, show_all).await;
+    if state.repo_index.has_persistent() {
+        if !state.repo_index.persistent_projection_available() {
+            return index_loading_response(&state, "npm", "npm", lang, auth_enabled);
+        }
+        let limit = query.limit.unwrap_or(50).clamp(1, 100);
+        let page = match get_npm_detail_page(
+            &state,
+            &name,
+            show_prerelease,
+            query.continuation_token,
+            limit,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return index_page_error_response(
+                    error,
+                    &state,
+                    "npm",
+                    "npm",
+                    lang,
+                    auth_enabled,
+                    &request_uri,
+                )
+            }
+        };
+        return Html(render_package_detail_cursor(
+            "npm",
+            &name,
+            &page.detail,
+            page.continuation_token.as_deref(),
+            limit,
+            show_prerelease,
+            lang,
+            &base_url,
+            auth_enabled,
+        ))
+        .into_response();
+    }
+    let detail = match get_npm_detail(&state, &name, show_prerelease, show_all).await {
+        Ok(detail) => detail,
+        Err(error) => return error.response(),
+    };
     Html(render_package_detail(
         "npm",
         &name,
@@ -417,6 +772,7 @@ async fn npm_detail(
         &base_url,
         auth_enabled,
     ))
+    .into_response()
 }
 
 // Cargo pages
@@ -464,7 +820,7 @@ async fn cargo_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_cargo_detail(&state.storage, &name, show_prerelease, show_all).await;
+    let detail = get_cargo_detail(&state, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "cargo",
         &name,
@@ -520,7 +876,7 @@ async fn pypi_detail(
     let auth_enabled = state.auth.is_some();
     let show_prerelease = query.prerelease.unwrap_or(false);
     let show_all = query.all.unwrap_or(false);
-    let detail = get_pypi_detail(&state.storage, &name, show_prerelease, show_all).await;
+    let detail = get_pypi_detail(&state, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         "pypi",
         &name,
@@ -541,7 +897,7 @@ async fn go_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (github.com, golang.org, etc.)
-    let (entries, _) = api::get_go_dir_listing(&state.storage, "").await;
+    let (entries, _) = api::get_go_dir_listing(&state, "").await;
     let total = entries.len();
 
     Html(templates::render_go_dir(
@@ -571,14 +927,14 @@ async fn go_detail(
     let auth_enabled = state.auth.is_some();
 
     // Try hierarchical browsing: check if this is a directory or leaf module
-    let (entries, is_leaf) = api::get_go_dir_listing(&state.storage, &name).await;
+    let (entries, is_leaf) = api::get_go_dir_listing(&state, &name).await;
 
     if is_leaf || entries.is_empty() {
         // Leaf module — show version detail page
         let base_url = resolve_base_url(&state);
         let show_prerelease = query.prerelease.unwrap_or(false);
         let show_all = query.all.unwrap_or(false);
-        let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
+        let detail = get_go_detail(&state, &name, show_prerelease, show_all).await;
         Html(render_package_detail(
             "go",
             &name,
@@ -640,7 +996,7 @@ async fn raw_detail(
     let auth_enabled = state.auth.is_some();
 
     // Check if this path is a directory (has children) or a single file
-    let (entries, is_dir) = api::get_raw_dir_listing(&state.storage, &name).await;
+    let (entries, is_dir) = api::get_raw_dir_listing(&state, &name).await;
 
     if is_dir && !entries.is_empty() {
         // Directory with children — render as browsable folder listing
@@ -654,7 +1010,7 @@ async fn raw_detail(
         ))
     } else {
         // Single file or leaf directory — render detail page
-        let detail = api::get_raw_detail(&state.storage, &name).await;
+        let detail = api::get_raw_detail(&state, &name).await;
         Html(templates::render_package_detail(
             "raw",
             &name,
@@ -735,14 +1091,7 @@ async fn generic_registry_detail(
         .and_then(|s| s.split('/').next())
         .unwrap_or("raw");
 
-    let detail = get_generic_detail(
-        &state.storage,
-        registry_key,
-        &name,
-        show_prerelease,
-        show_all,
-    )
-    .await;
+    let detail = get_generic_detail(&state, registry_key, &name, show_prerelease, show_all).await;
     Html(render_package_detail(
         registry_key,
         &name,
@@ -765,7 +1114,7 @@ async fn ansible_browse_root(
     );
     let auth_enabled = state.auth.is_some();
 
-    let entries = api::get_ansible_namespace_listing(&state.storage, "").await;
+    let entries = api::get_ansible_namespace_listing(&state, "").await;
     let total = entries.len();
 
     Html(templates::render_ansible_dir(
@@ -799,7 +1148,7 @@ async fn ansible_browse(
     match segments.len() {
         // /ui/ansible/community → list collections in namespace
         1 => {
-            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let entries = api::get_ansible_namespace_listing(&state, &path).await;
             let total = entries.len();
             Html(templates::render_ansible_dir(
                 &path,
@@ -815,14 +1164,8 @@ async fn ansible_browse(
             let show_prerelease = query.prerelease.unwrap_or(false);
             let show_all = query.all.unwrap_or(false);
             let full_name = format!("{}.{}", segments[0], segments[1]);
-            let detail = get_generic_detail(
-                &state.storage,
-                "ansible",
-                &full_name,
-                show_prerelease,
-                show_all,
-            )
-            .await;
+            let detail =
+                get_generic_detail(&state, "ansible", &full_name, show_prerelease, show_all).await;
             Html(render_package_detail(
                 "ansible",
                 &full_name,
@@ -1036,6 +1379,52 @@ mod base_path_tests {
     use super::*;
 
     #[test]
+    fn cursor_reset_preserves_browser_state_and_removes_encoded_cursor_keys() {
+        let npm: Uri = "/ui/npm?q=%40Scope%2FPkg&limit=1&continuation_token=old&lang=ru"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            cursor_reset_location(&npm),
+            "/ui/npm?q=%40Scope%2FPkg&limit=1&lang=ru"
+        );
+
+        let maven: Uri =
+            "/ui/maven/repo/com%20acme?view=files&limit=25&continuation%5Ftoken=old&lang=zh"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            cursor_reset_location(&maven),
+            "/ui/maven/repo/com%20acme?view=files&limit=25&lang=zh"
+        );
+    }
+
+    #[test]
+    fn stale_browser_cursor_redirects_without_rendering_json() {
+        let ctx = crate::test_helpers::create_test_context();
+        let uri: Uri = "/ui/npm?q=pkg&limit=10&continuation_token=stale&lang=en"
+            .parse()
+            .unwrap();
+        let response = index_page_error_response(
+            PageError::GenerationChanged,
+            &ctx.state,
+            "npm",
+            "npm",
+            Lang::En,
+            false,
+            &uri,
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/ui/npm?q=pkg&limit=10&lang=en"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+    }
+
+    #[test]
     fn apply_base_path_is_noop_when_empty() {
         let html = r#"<a href="/ui/docker">d</a><script src="/ui/static/x.js"></script>"#;
         assert_eq!(apply_base_path(html, ""), html);
@@ -1044,20 +1433,90 @@ mod base_path_tests {
     #[test]
     fn apply_base_path_prefixes_ui_and_api_links() {
         let html = concat!(
+            r#"<link rel="icon" href="/favicon.svg">"#,
             r#"<link href="/ui/static/tailwind.css">"#,
             r#"<a href="/ui/docker">d</a>"#,
             r#"<script>fetch('/api/ui/dashboard')</script>"#,
             r#"<form action="/api/ui/tokens/create">"#,
+            r#"<div hx-get="/api/ui/index-status"></div>"#,
         );
         let out = apply_base_path(html, "/nora");
+        assert!(out.contains(r#"href="/nora/favicon.svg""#));
         assert!(out.contains(r#"href="/nora/ui/static/tailwind.css""#));
         assert!(out.contains(r#"href="/nora/ui/docker""#));
         assert!(out.contains("fetch('/nora/api/ui/dashboard')"));
         assert!(out.contains(r#"action="/nora/api/ui/tokens/create""#));
+        assert!(out.contains(r#"hx-get="/nora/api/ui/index-status""#));
         // No leftover bare links, no double-prefix.
         assert!(!out.contains(r#"href="/ui/"#));
         assert!(!out.contains("fetch('/api/ui"));
         assert!(!out.contains("/nora/nora/"));
+    }
+
+    #[test]
+    fn base_path_prefixes_redirect_and_htmx_history_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::LOCATION,
+            HeaderValue::from_static("/api-docs/?lang=en"),
+        );
+        headers.insert(
+            HeaderName::from_static("hx-replace-url"),
+            HeaderValue::from_static("/ui/npm?q=%40Scope%2FPkg&limit=50&lang=en"),
+        );
+
+        prefix_ui_response_header(&mut headers, header::LOCATION, "/nora");
+        prefix_ui_response_header(
+            &mut headers,
+            HeaderName::from_static("hx-replace-url"),
+            "/nora",
+        );
+
+        assert_eq!(
+            headers.get(header::LOCATION).unwrap(),
+            "/nora/api-docs/?lang=en"
+        );
+        assert_eq!(
+            headers.get("hx-replace-url").unwrap(),
+            "/nora/ui/npm?q=%40Scope%2FPkg&limit=50&lang=en"
+        );
+
+        // A second middleware pass is idempotent, and an unrelated absolute
+        // path is never captured just because it starts with similar text.
+        prefix_ui_response_header(
+            &mut headers,
+            HeaderName::from_static("hx-replace-url"),
+            "/nora",
+        );
+        headers.insert(
+            HeaderName::from_static("hx-location"),
+            HeaderValue::from_static("/ui-not-nora"),
+        );
+        prefix_ui_response_header(
+            &mut headers,
+            HeaderName::from_static("hx-location"),
+            "/nora",
+        );
+        assert_eq!(
+            headers.get("hx-replace-url").unwrap(),
+            "/nora/ui/npm?q=%40Scope%2FPkg&limit=50&lang=en"
+        );
+        assert_eq!(headers.get("hx-location").unwrap(), "/ui-not-nora");
+    }
+
+    #[tokio::test]
+    async fn embedded_favicon_is_available_on_declared_and_legacy_paths() {
+        let ctx = crate::test_helpers::create_test_context();
+        for path in ["/favicon.svg", "/favicon.ico"] {
+            let response =
+                crate::test_helpers::send(&ctx.app, axum::http::Method::GET, path, "").await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("image/svg+xml; charset=utf-8")),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -1081,5 +1540,225 @@ mod base_path_tests {
         // body text) is not a self-link and must not be rewritten.
         let html = r#"<p>the path /ui/docker is shown</p>"#;
         assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+}
+
+#[cfg(test)]
+mod index_loading_route_tests {
+    use super::*;
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::Method;
+
+    #[tokio::test]
+    async fn persistent_ui_loads_friendly_shell_then_refreshes_when_projection_is_ready() {
+        let context = create_test_context();
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &context.state.config,
+            context.state.enabled_registries.as_ref(),
+            context.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(index.persistent_status(), Some(IndexStatus::Warming));
+        assert!(!index.persistent_projection_available());
+
+        let mut state = context.state.clone();
+        state.repo_index = index.clone();
+        let app = super::routes().with_state(state);
+
+        for path in [
+            "/ui/maven",
+            "/ui/maven/com/example",
+            "/ui/npm",
+            "/ui/npm/example",
+        ] {
+            let response = send(&app, Method::GET, path, "").await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+                "{path}"
+            );
+            let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+            assert!(html.contains("id=\"index-loading-status\""), "{path}");
+            assert!(!html.contains("\"error\":\"index_unavailable\""), "{path}");
+        }
+
+        for path in ["/api/ui/maven/list", "/api/ui/npm/list"] {
+            let response = send(&app, Method::GET, path, "").await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER),
+                Some(&HeaderValue::from_static("2")),
+                "{path}"
+            );
+        }
+
+        let warming = send(
+            &app,
+            Method::GET,
+            "/api/ui/index-status?registry=maven&lang=ru",
+            "",
+        )
+        .await;
+        assert_eq!(warming.status(), StatusCode::OK);
+        assert_eq!(
+            warming.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert!(!warming.headers().contains_key(header::RETRY_AFTER));
+        assert!(!warming.headers().contains_key("hx-refresh"));
+        let warming_body = String::from_utf8(body_bytes(warming).await.to_vec()).unwrap();
+        assert!(warming_body.contains("Подготовка локального индекса"));
+        assert!(warming_body.contains("Объектов Maven проиндексировано"));
+        assert!(warming_body.contains("hx-swap=\"outerHTML\""));
+        assert!(!warming_body.contains("aria-valuenow"));
+
+        let invalid = send(&app, Method::GET, "/api/ui/index-status?registry=raw", "").await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert_eq!(index.persistent_status(), Some(IndexStatus::Ready));
+        assert!(index.persistent_projection_available());
+        assert_eq!(
+            index.persistent_index_progress().phase,
+            crate::repo_index::PersistentIndexPhase::Idle
+        );
+
+        let ready = send(
+            &app,
+            Method::GET,
+            "/api/ui/index-status?registry=maven&lang=ru",
+            "",
+        )
+        .await;
+        assert_eq!(ready.status(), StatusCode::OK);
+        assert_eq!(
+            ready.headers().get("hx-refresh"),
+            Some(&HeaderValue::from_static("true"))
+        );
+        assert!(!ready.headers().contains_key(header::RETRY_AFTER));
+
+        for path in ["/ui/maven", "/ui/npm"] {
+            let response = send(&app, Method::GET, path, "").await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let html = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+            assert!(!html.contains("id=\"index-loading-status\""), "{path}");
+        }
+
+        index.shutdown_persistent().await;
+    }
+}
+
+#[cfg(test)]
+mod named_npm_route_tests {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn encoded_repository_qualified_npm_link_opens_detail_page() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let context = create_test_context_with_config(|config| {
+            config.npm.repositories = vec![crate::config::NpmRepository::Hosted {
+                name: "npm-private".to_string(),
+                write_policy: crate::config::NpmWritePolicy::AllowOnce,
+            }];
+            config.npm.default_repository = Some("npm-private".to_string());
+        });
+        let blob = b"tarball";
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "name": "@scope/pkg",
+            "version": "1.0.0",
+            "dist": {
+                "integrity": format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(blob))
+                )
+            }
+        }))
+        .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                "npm/repositories/npm-private/@scope/pkg/versions/1.0.0.json",
+                &manifest,
+            )
+            .await
+            .unwrap();
+        context
+            .state
+            .storage
+            .put(
+                &crate::npm_layout::hosted_blob_key_from_manifest(
+                    "npm-private",
+                    "@scope/pkg",
+                    &manifest,
+                )
+                .unwrap(),
+                blob,
+            )
+            .await
+            .unwrap();
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let packument = serde_json::json!({
+            "name": "@scope/pkg",
+            "versions": {"1.0.0": manifest_value},
+            "dist-tags": {"latest": "1.0.0"}
+        });
+        let full = serde_json::to_vec(&packument).unwrap();
+        let pointer = crate::registry::write_hosted_packument_generation_documents(
+            &context.state.storage,
+            "npm-private",
+            "@scope/pkg",
+            &packument,
+            &full,
+        )
+        .await
+        .unwrap();
+        crate::registry::commit_hosted_packument_pointer(
+            &context.state.storage,
+            "npm-private",
+            "@scope/pkg",
+            &pointer,
+        )
+        .await
+        .unwrap();
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &context.state.config,
+            context.state.enabled_registries.as_ref(),
+            context.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let mut state = context.state.clone();
+        state.repo_index = index.clone();
+        let app = super::routes().with_state(state);
+
+        let list = send(&app, Method::GET, "/ui/npm", "").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_html = String::from_utf8(body_bytes(list).await.to_vec()).unwrap();
+        let detail_path = "/ui/npm/repositories%2Fnpm-private%2F%40scope%2Fpkg";
+        assert!(list_html.contains(detail_path));
+
+        let clamped = send(&app, Method::GET, "/ui/npm?limit=0", "").await;
+        assert_eq!(clamped.status(), StatusCode::OK);
+        let clamped_html = String::from_utf8(body_bytes(clamped).await.to_vec()).unwrap();
+        assert!(clamped_html.contains("name=\"limit\" value=\"1\""));
+        assert!(clamped_html.contains("/api/ui/npm/search?limit=1&amp;lang=en"));
+        assert!(!clamped_html.contains("limit=0"));
+
+        let detail = send(&app, Method::GET, detail_path, "").await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_html = String::from_utf8(body_bytes(detail).await.to_vec()).unwrap();
+        assert!(detail_html.contains(&format!(
+            "npm install @scope/pkg --registry {}/repository/npm-private",
+            context.state.config.server.public_base_url()
+        )));
+        index.shutdown_persistent().await;
     }
 }

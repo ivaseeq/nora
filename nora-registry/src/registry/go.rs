@@ -131,7 +131,12 @@ async fn handle(
     //    within the positive `metadata_ttl` window. `cached` is kept for the stale-on-error path.
     let cached = state.storage.get(&storage_key).await.ok();
     let modified = if cached.is_some() && is_mutable {
-        state.storage.stat(&storage_key).await.map(|m| m.modified)
+        match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta.map(|m| m.modified),
+            Err(error) => {
+                return crate::registry::storage_error_response("go", "stat", &storage_key, &error);
+            }
+        }
     } else {
         None
     };

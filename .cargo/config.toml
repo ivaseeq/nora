@@ -1,0 +1,5 @@
+# utoipa-swagger-ui 9.0.2 defaults to Swagger UI 5.17.14. Pin the
+# v5.32.13 release commit so OpenAPI 3.1 binary request bodies render a real
+# file chooser and every local/CI/release build embeds the same UI assets.
+[env]
+SWAGGER_UI_DOWNLOAD_URL = { value = "https://github.com/swagger-api/swagger-ui/archive/2a33d7805eb5fff693952cebb9203ee113ab4663.zip", force = true }

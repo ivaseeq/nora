@@ -6,6 +6,7 @@
 use crate::secrets::ProtectedString;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +54,34 @@ pub struct StorageConfig {
     /// signing — do not point this at a plaintext non-emulator endpoint.
     #[serde(default)]
     pub gcs_base_url: Option<String>,
+    /// Overall timeout for one object-store request, including a streamed body.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Deadline covering the initial attempt and transparent retries.
+    #[serde(default = "default_retry_timeout_secs")]
+    pub retry_timeout_secs: u64,
+    /// Maximum transparent retries performed by `object_store`.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    /// Independent wall-time bound for the background reachability probe.
+    #[serde(default = "default_health_probe_timeout_secs")]
+    pub health_probe_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    3_600
+}
+
+fn default_retry_timeout_secs() -> u64 {
+    7_200
+}
+
+fn default_max_retries() -> usize {
+    10
+}
+
+fn default_health_probe_timeout_secs() -> u64 {
+    10
 }
 
 pub(super) fn default_s3_region() -> String {
@@ -84,6 +113,10 @@ impl Default for StorageConfig {
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
+            request_timeout_secs: default_request_timeout_secs(),
+            retry_timeout_secs: default_retry_timeout_secs(),
+            max_retries: default_max_retries(),
+            health_probe_timeout_secs: default_health_probe_timeout_secs(),
         }
     }
 }
@@ -141,9 +174,41 @@ impl StorageConfig {
         if let Ok(val) = env::var("NORA_STORAGE_S3_VIRTUAL_HOSTED") {
             self.s3_virtual_hosted = val.to_lowercase() == "true" || val == "1";
         }
+        if let Ok(val) = env::var("NORA_STORAGE_REQUEST_TIMEOUT_SECS") {
+            self.request_timeout_secs = parse_env("NORA_STORAGE_REQUEST_TIMEOUT_SECS", &val)?;
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_RETRY_TIMEOUT_SECS") {
+            self.retry_timeout_secs = parse_env("NORA_STORAGE_RETRY_TIMEOUT_SECS", &val)?;
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_MAX_RETRIES") {
+            self.max_retries = parse_env("NORA_STORAGE_MAX_RETRIES", &val)?;
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_HEALTH_PROBE_TIMEOUT_SECS") {
+            self.health_probe_timeout_secs =
+                parse_env("NORA_STORAGE_HEALTH_PROBE_TIMEOUT_SECS", &val)?;
+        }
 
         Ok(())
     }
+
+    pub fn object_store_options(&self) -> crate::storage::ObjectStoreOptions {
+        crate::storage::ObjectStoreOptions {
+            request_timeout: Duration::from_secs(self.request_timeout_secs),
+            retry_timeout: Duration::from_secs(self.retry_timeout_secs),
+            max_retries: self.max_retries,
+            health_probe_timeout: Duration::from_secs(self.health_probe_timeout_secs),
+        }
+    }
+}
+
+fn parse_env<T>(name: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|error| format!("{name}={value:?} is invalid: {error}"))
 }
 
 #[cfg(test)]
@@ -153,6 +218,7 @@ mod tests {
 
     #[test]
     fn test_gcs_mode_parses_from_toml_and_env() {
+        let _lock = super::super::ENV_MUTEX.lock().unwrap();
         let cfg: StorageConfig = toml::from_str("mode = \"gcs\"\nbucket = \"artifacts\"").unwrap();
         assert_eq!(cfg.mode, StorageMode::Gcs);
         assert_eq!(cfg.bucket, "artifacts");
@@ -160,7 +226,6 @@ mod tests {
         assert_eq!(cfg.gcs_base_url, None);
 
         let mut cfg = StorageConfig::default();
-        // Serialized via a fresh process env in CI would race; set/remove inline.
         std::env::set_var("NORA_STORAGE_MODE", "gcs");
         std::env::set_var("NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH", "/sa.json");
         std::env::set_var("NORA_STORAGE_GCS_BASE_URL", "http://127.0.0.1:4443");
@@ -176,11 +241,46 @@ mod tests {
 
     #[test]
     fn test_unknown_mode_still_fails_closed() {
+        let _lock = super::super::ENV_MUTEX.lock().unwrap();
         let mut cfg = StorageConfig::default();
         std::env::set_var("NORA_STORAGE_MODE", "azure");
         let r = cfg.apply_env_overrides();
         std::env::remove_var("NORA_STORAGE_MODE");
         let err = r.unwrap_err();
         assert!(err.contains("local, s3, gcs"), "{err}");
+    }
+
+    #[test]
+    fn object_store_timeout_defaults_are_transfer_safe() {
+        let cfg: StorageConfig = toml::from_str("mode = \"s3\"").unwrap();
+        let options = cfg.object_store_options();
+        assert_eq!(options.request_timeout, Duration::from_secs(3_600));
+        assert_eq!(options.retry_timeout, Duration::from_secs(7_200));
+        assert_eq!(options.max_retries, 10);
+        assert_eq!(options.health_probe_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn object_store_timeouts_are_configurable() {
+        let cfg: StorageConfig = toml::from_str(
+            r#"
+                mode = "gcs"
+                request_timeout_secs = 120
+                retry_timeout_secs = 300
+                max_retries = 4
+                health_probe_timeout_secs = 7
+            "#,
+        )
+        .unwrap();
+        let options = cfg.object_store_options();
+        assert_eq!(options.request_timeout, Duration::from_secs(120));
+        assert_eq!(options.retry_timeout, Duration::from_secs(300));
+        assert_eq!(options.max_retries, 4);
+        assert_eq!(options.health_probe_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn malformed_timeout_override_fails_closed() {
+        assert!(parse_env::<u64>("NORA_STORAGE_REQUEST_TIMEOUT_SECS", "slow").is_err());
     }
 }

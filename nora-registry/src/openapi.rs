@@ -9,11 +9,12 @@
 
 use axum::Router;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::activity_log::ActivityEntry;
 use crate::auth::{TokenListItem, TokenListResponse};
 use crate::health::StorageHealth;
+use crate::repo_index::RepoInfo;
 use crate::ui::api::{DashboardResponse, GlobalStats, MountPoint, RegistryCardStats};
 use crate::AppState;
 
@@ -34,8 +35,8 @@ use crate::AppState;
         (name = "metrics", description = "Prometheus metrics"),
         (name = "dashboard", description = "Dashboard & Metrics API"),
         (name = "docker", description = "Docker Registry v2 API"),
-        (name = "maven", description = "Maven Repository API"),
-        (name = "npm", description = "npm Registry API"),
+        (name = "maven", description = "Maven Repository API. Use /repository/{repository}/{path} for named hosted, proxy and group repositories. /maven2/{path} is a compatibility alias: it uses maven.default_repository when configured and otherwise the isolated legacy Maven namespace."),
+        (name = "npm", description = "npm Registry API. Use /repository/{repository}/{path} for named hosted, proxy and group repositories. /npm paths are compatibility aliases: they use npm.default_repository when configured and otherwise isolated synthetic hosted/proxy namespaces."),
         (name = "cargo", description = "Cargo Registry API"),
         (name = "pypi", description = "PyPI Simple API"),
         (name = "go", description = "Go Module Proxy API"),
@@ -54,6 +55,7 @@ use crate::AppState;
         // Health
         crate::openapi::health_check,
         crate::openapi::readiness_check,
+        crate::openapi::index_readiness_check,
         // Metrics
         crate::openapi::prometheus_metrics,
         // Dashboard
@@ -74,6 +76,10 @@ use crate::AppState;
         // Maven
         crate::openapi::maven_artifact_get,
         crate::openapi::maven_artifact_put,
+        crate::openapi::named_repository_get,
+        crate::openapi::named_repository_put,
+        crate::openapi::named_repository_post,
+        crate::openapi::named_repository_delete,
         // npm
         crate::openapi::npm_package,
         crate::openapi::npm_publish,
@@ -144,6 +150,7 @@ use crate::AppState;
             DashboardResponse,
             GlobalStats,
             RegistryCardStats,
+            RepoInfo,
             MountPoint,
             ActivityEntry,
             DockerVersion,
@@ -258,6 +265,14 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Raw artifact bytes accepted by Maven upload endpoints.
+///
+/// The explicit `string`/`binary` OpenAPI representation lets Swagger UI use
+/// a file chooser while NORA continues to accept arbitrary octets on the wire.
+#[derive(ToSchema)]
+#[schema(value_type = String, format = Binary)]
+pub struct BinaryArtifactBody(Vec<u8>);
+
 // ============ Path Operations (documentation only) ============
 
 // -------------------- Health --------------------
@@ -284,6 +299,22 @@ pub async fn health_check() {}
     )
 )]
 pub async fn readiness_check() {}
+
+/// Persistent derived-index readiness probe
+///
+/// This is intentionally separate from `/ready`: protocol traffic can remain
+/// available while the rebuildable persistent index is still warming or its
+/// writer is unavailable.
+#[utoipa::path(
+    get,
+    path = "/ready/index",
+    tag = "health",
+    responses(
+        (status = 200, description = "Persistent derived index is ready for indexed UI and query operations"),
+        (status = 503, description = "Persistent derived index is warming or unavailable; protocol traffic readiness is reported separately by /ready")
+    )
+)]
+pub async fn index_readiness_check() {}
 
 // -------------------- Metrics --------------------
 
@@ -511,11 +542,13 @@ pub async fn docker_blob_upload_put() {}
 
 // -------------------- Maven --------------------
 
-/// Get Maven artifact
+/// Get a Maven artifact through the compatibility alias
 #[utoipa::path(
     get,
     path = "/maven2/{path}",
     tag = "maven",
+    summary = "Get Maven artifact through the legacy compatibility alias",
+    description = "Uses maven.default_repository when configured; otherwise serves the isolated legacy Maven namespace. New clients should use /repository/{repository}/{path} so the repository is explicit.",
     params(
         ("path" = String, Path, description = "Artifact path (e.g., org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar)")
     ),
@@ -526,13 +559,21 @@ pub async fn docker_blob_upload_put() {}
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
+#[deprecated(note = "use /repository/{repository}/{path}")]
 pub async fn maven_artifact_get() {}
 
-/// Upload Maven artifact
+/// Upload a Maven artifact through the compatibility alias
 #[utoipa::path(
     put,
     path = "/maven2/{path}",
     tag = "maven",
+    summary = "Upload Maven artifact through the legacy compatibility alias",
+    description = "Uses maven.default_repository when configured; otherwise writes the isolated legacy Maven namespace. A configured target must be hosted and its write policy still applies. New clients should use /repository/{repository}/{path}.",
+    request_body(
+        content = inline(BinaryArtifactBody),
+        description = "Raw Maven artifact bytes",
+        content_type = "application/octet-stream"
+    ),
     params(
         ("path" = String, Path, description = "Artifact path")
     ),
@@ -544,15 +585,126 @@ pub async fn maven_artifact_get() {}
         (status = 500, description = "Storage error")
     )
 )]
+#[deprecated(note = "use /repository/{repository}/{path}")]
 pub async fn maven_artifact_put() {}
+
+/// Read from a named Maven or npm repository
+///
+/// Maven and npm hosted repositories read local content, proxies read or fill
+/// their upstream cache, and groups resolve members in configured order. Group
+/// repositories do not own authoritative objects.
+#[utoipa::path(
+    get,
+    path = "/repository/{repository}/{path}",
+    tags = ["maven", "npm"],
+    summary = "Read from a named Maven or npm repository",
+    description = "Primary read endpoint for named Maven and npm hosted, proxy and group repositories. Dispatch is determined by the configured format of `repository`.",
+    params(
+        ("repository" = String, Path, description = "Hosted, proxy or group repository name"),
+        ("path" = String, Path, description = "Slash-preserving Maven artifact path or npm package/tarball endpoint")
+    ),
+    responses(
+        (status = 200, description = "Maven artifact bytes or npm registry response"),
+        (status = 400, description = "Invalid protocol path", body = ErrorResponse),
+        (status = 404, description = "Repository, artifact or package not found"),
+        (status = 502, description = "Upstream proxy unavailable")
+    )
+)]
+pub async fn named_repository_get() {}
+
+/// Mutate a named Maven or npm repository
+///
+/// Maven accepts artifact uploads only into hosted repositories. npm publish
+/// and deprecation payloads may target a hosted repository or a group; group
+/// routing uses the configured writable member. npm dist-tag add/update
+/// mutations are direct-hosted only, and group endpoints return 400. Proxy
+/// repositories are read-only.
+#[utoipa::path(
+    put,
+    path = "/repository/{repository}/{path}",
+    tags = ["maven", "npm"],
+    summary = "Write to a named Maven or npm hosted repository",
+    request_body(
+        description = "Payload format is selected by the configured repository format: raw artifact bytes for Maven, or an npm JSON mutation payload for npm",
+        content(
+            (inline(BinaryArtifactBody) = "application/octet-stream"),
+            (serde_json::Value = "application/json")
+        )
+    ),
+    params(
+        ("repository" = String, Path, description = "Hosted repository; an npm group is writable only for publish/deprecate"),
+        ("path" = String, Path, description = "Slash-preserving Maven artifact path or npm publish/deprecation/dist-tag endpoint; npm dist-tag mutations require a direct hosted repository")
+    ),
+    responses(
+        (status = 200, description = "npm mutation completed"),
+        (status = 201, description = "Maven artifact or npm package created"),
+        (status = 400, description = "Payload or repository policy rejected the mutation; npm group dist-tag mutations return 400", body = ErrorResponse),
+        (status = 405, description = "Method is not supported for this repository or endpoint"),
+        (status = 409, description = "Immutable coordinate exists with different content"),
+        (status = 500, description = "Storage error")
+    )
+)]
+pub async fn named_repository_put() {}
+
+/// Submit an npm read-semantics POST endpoint
+///
+/// npm security audit requests are forwarded through named npm proxy/group
+/// repositories. Named Maven repositories reject POST with 405.
+#[utoipa::path(
+    post,
+    path = "/repository/{repository}/{path}",
+    tag = "npm",
+    summary = "Submit an npm POST endpoint through a named repository",
+    request_body(
+        content = serde_json::Value,
+        description = "npm endpoint request payload",
+        content_type = "application/json"
+    ),
+    params(
+        ("repository" = String, Path, description = "npm hosted, proxy or group repository name"),
+        ("path" = String, Path, description = "Slash-preserving npm POST endpoint, such as -/npm/v1/security/advisories/bulk")
+    ),
+    responses(
+        (status = 200, description = "npm upstream response"),
+        (status = 400, description = "Invalid npm request", body = ErrorResponse),
+        (status = 404, description = "Repository not found"),
+        (status = 405, description = "POST is not supported for this repository format"),
+        (status = 502, description = "Upstream proxy unavailable")
+    )
+)]
+pub async fn named_repository_post() {}
+
+/// Delete a mutable npm dist-tag in a named hosted repository
+///
+/// Dist-tag deletion is direct-hosted only; group endpoints return 400.
+#[utoipa::path(
+    delete,
+    path = "/repository/{repository}/{path}",
+    tag = "npm",
+    summary = "Delete a mutable npm dist-tag in a named hosted repository",
+    params(
+        ("repository" = String, Path, description = "Direct named npm hosted repository; group endpoints return 400"),
+        ("path" = String, Path, description = "npm dist-tag endpoint: -/package/{package}/dist-tags/{tag}")
+    ),
+    responses(
+        (status = 204, description = "Dist-tag deleted or already absent"),
+        (status = 400, description = "Invalid package/tag, protected latest tag, or group endpoint"),
+        (status = 404, description = "Repository not found"),
+        (status = 405, description = "DELETE is not supported for this path or repository format"),
+        (status = 500, description = "Storage error")
+    )
+)]
+pub async fn named_repository_delete() {}
 
 // -------------------- npm --------------------
 
-/// Get npm package metadata
+/// Get npm package metadata through the compatibility alias
 #[utoipa::path(
     get,
     path = "/npm/{name}",
     tag = "npm",
+    summary = "Get npm package through the legacy compatibility alias",
+    description = "Uses npm.default_repository when configured; otherwise resolves through isolated synthetic hosted/proxy namespaces. New clients should use /repository/{repository}/{path} so the repository is explicit.",
     params(
         ("name" = String, Path, description = "Package name (e.g., 'lodash' or '@scope/package')")
     ),
@@ -562,15 +714,23 @@ pub async fn maven_artifact_put() {}
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
+#[deprecated(note = "use /repository/{repository}/{path}")]
 pub async fn npm_package() {}
 
-/// Publish npm package
+/// Publish an npm package through the compatibility alias
 ///
 /// Accepts a full npm publish payload (packument with attachments).
 #[utoipa::path(
     put,
     path = "/npm/{name}",
     tag = "npm",
+    summary = "Publish npm package through the legacy compatibility alias",
+    description = "Uses npm.default_repository when configured; otherwise writes the isolated synthetic hosted namespace. A configured target must be writable and its write policy still applies. New clients should use /repository/{repository}/{path}.",
+    request_body(
+        content = serde_json::Value,
+        description = "npm publish packument with attachments",
+        content_type = "application/json"
+    ),
     params(
         ("name" = String, Path, description = "Package name (e.g., 'lodash' or '@scope/package')")
     ),
@@ -581,6 +741,7 @@ pub async fn npm_package() {}
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
     )
 )]
+#[deprecated(note = "use /repository/{repository}/{path}")]
 pub async fn npm_publish() {}
 
 // -------------------- Cargo --------------------
@@ -1337,6 +1498,175 @@ pub async fn admin_reindex() {}
 // ============ Routes ============
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .merge(SwaggerUi::new("/api-docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
+    Router::new().merge(
+        SwaggerUi::new("/api-docs")
+            .url("/api-docs/openapi.json", ApiDoc::openapi())
+            .config(swagger_config()),
+    )
+}
+
+fn swagger_config() -> Config<'static> {
+    Config::default().validator_url("none")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_named_repository_path_is_discoverable_by_each_supported_protocol() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let path = &document["paths"]["/repository/{repository}/{path}"];
+        for method in ["get", "put", "post", "delete"] {
+            assert!(
+                path.get(method).is_some(),
+                "shared named repository path must document {method}"
+            );
+            let tags = path[method]["tags"].as_array().unwrap();
+            assert!(tags.iter().any(|tag| tag == "npm"));
+            assert_eq!(
+                tags.iter().any(|tag| tag == "maven"),
+                matches!(method, "get" | "put"),
+                "only methods implemented for Maven may appear in its Swagger section"
+            );
+            assert!(
+                !tags.iter().any(|tag| tag == "repository"),
+                "shared operations must not be repeated in a generic repository section"
+            );
+        }
+
+        assert!(document["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tag| tag["name"] != "repository"));
+    }
+
+    #[test]
+    fn legacy_maven_and_npm_routes_describe_configured_and_synthetic_targets() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (path, methods) in [
+            ("/maven2/{path}", ["get", "put"]),
+            ("/npm/{name}", ["get", "put"]),
+        ] {
+            for method in methods {
+                let operation = &document["paths"][path][method];
+                assert!(operation["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("legacy compatibility alias"));
+                let description = operation["description"].as_str().unwrap();
+                assert!(description.contains("default_repository when configured"));
+                assert!(description.contains("isolated"));
+                assert!(description.contains("/repository/{repository}/{path}"));
+                assert_eq!(operation["deprecated"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn maven_and_npm_upload_bodies_are_required_and_typed() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        let legacy_maven = &document["paths"]["/maven2/{path}"]["put"]["requestBody"];
+        assert_eq!(legacy_maven["required"], true);
+        assert_eq!(
+            legacy_maven["content"]["application/octet-stream"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            legacy_maven["content"]["application/octet-stream"]["schema"]["format"],
+            "binary"
+        );
+
+        let legacy_npm = &document["paths"]["/npm/{name}"]["put"]["requestBody"];
+        assert_eq!(legacy_npm["required"], true);
+        assert!(legacy_npm["content"]["application/json"].is_object());
+        assert_eq!(legacy_npm["content"].as_object().unwrap().len(), 1);
+
+        let named = &document["paths"]["/repository/{repository}/{path}"]["put"]["requestBody"];
+        assert_eq!(named["required"], true);
+        assert_eq!(named["content"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            named["content"]["application/octet-stream"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            named["content"]["application/octet-stream"]["schema"]["format"],
+            "binary"
+        );
+        assert!(named["content"]["application/json"].is_object());
+        assert!(named["description"]
+            .as_str()
+            .unwrap()
+            .contains("configured repository format"));
+
+        let named_post =
+            &document["paths"]["/repository/{repository}/{path}"]["post"]["requestBody"];
+        assert_eq!(named_post["required"], true);
+        assert!(named_post["content"]["application/json"].is_object());
+        assert_eq!(named_post["content"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persistent_index_readiness_is_documented_separately() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let index_ready = &document["paths"]["/ready/index"]["get"];
+        assert_eq!(index_ready["tags"], serde_json::json!(["health"]));
+        assert!(index_ready["responses"].get("200").is_some());
+        assert!(index_ready["responses"].get("503").is_some());
+        assert!(index_ready["responses"]["503"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("/ready"));
+
+        assert!(document["paths"]["/health"]["get"].is_object());
+        assert!(document["paths"]["/ready"]["get"].is_object());
+    }
+
+    #[test]
+    fn swagger_ui_does_not_call_the_public_validator() {
+        let config = serde_json::to_value(swagger_config()).unwrap();
+        assert_eq!(config["validatorUrl"], "none");
+    }
+
+    #[test]
+    fn named_npm_group_write_contract_limits_routing_to_publish_and_deprecate() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let path = &document["paths"]["/repository/{repository}/{path}"];
+
+        let put_description = path["put"]["description"].as_str().unwrap();
+        assert!(put_description.contains(
+            "npm publish\nand deprecation payloads may target a hosted repository or a group"
+        ));
+        assert!(put_description.contains(
+            "npm dist-tag add/update\nmutations are direct-hosted only, and group endpoints return 400"
+        ));
+
+        let delete_description = path["delete"]["description"].as_str().unwrap();
+        assert!(delete_description
+            .contains("Dist-tag deletion is direct-hosted only; group endpoints return 400"));
+        assert_eq!(
+            path["delete"]["responses"]["400"]["description"],
+            "Invalid package/tag, protected latest tag, or group endpoint"
+        );
+    }
+
+    #[test]
+    fn size_fields_document_availability_instead_of_ambiguous_zero() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for schema in [
+            "StorageHealth",
+            "GlobalStats",
+            "RegistryCardStats",
+            "RepoInfo",
+        ] {
+            assert!(
+                document["components"]["schemas"][schema]["properties"]
+                    .get("size_available")
+                    .is_some(),
+                "{schema} must document size_available"
+            );
+        }
+    }
 }

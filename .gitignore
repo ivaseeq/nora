@@ -17,7 +17,8 @@ package-lock.json
 /tmp/
 
 # Local build config (machine-specific)
-.cargo/
+.cargo/*
+!.cargo/config.toml
 
 # Working files (never commit)
 SESSION_*.md

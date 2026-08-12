@@ -202,7 +202,18 @@ async fn recipe_latest(
     // Eager cache read — preserve data for serve-stale fallback
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "conan",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
@@ -257,7 +268,18 @@ async fn recipe_revisions(
 
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "conan",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
@@ -591,7 +613,18 @@ async fn package_latest(
 
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "conan",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");
@@ -664,7 +697,18 @@ async fn package_revisions(
 
     let cached_data = state.storage.get(&storage_key).await.ok();
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "conan",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
                 state.metrics.record_download("conan");
                 state.metrics.record_cache_hit("conan");

@@ -3,12 +3,16 @@
 
 use crate::secrets::ProtectedString;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpmConfig {
     #[serde(default = "super::super::default_true")]
     pub enabled: bool,
+
+    // Kept as the compatibility source for the `/npm` alias. New installations
+    // should declare named repositories and a default_repository.
     #[serde(default = "default_npm_proxy")]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
@@ -19,17 +23,79 @@ pub struct NpmConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
-    /// Revalidate stale metadata with a conditional request (`If-None-Match`)
-    /// instead of always re-downloading the full body (#596). Fail-open: any
-    /// error falls back to a full fetch.
     #[serde(default = "super::super::default_true")]
     pub revalidate: bool,
+    /// Maximum age of an upstream validator envelope before Nora forces one
+    /// unconditional packument fetch. This bounds stale 304 state across
+    /// restarts even when the cached body is repeatedly touched. Zero disables
+    /// conditional revalidation while preserving ordinary cache reads.
+    #[serde(default = "default_validator_max_age_secs")]
+    pub validator_max_age_secs: u64,
+
+    #[serde(default)]
+    pub repositories: Vec<NpmRepository>,
+    #[serde(default)]
+    pub default_repository: Option<String>,
 }
 
-/// Default npm upstream. Single source for both the serde field-default and the
-/// `Default` impl, so the "table present without `proxy`" path and the "table
-/// omitted" path produce the same upstream (they diverged before — `#[serde(default)]`
-/// on an `Option` yields `None`, silently disabling proxying when `[npm]` is present).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NpmRepository {
+    Hosted {
+        name: String,
+        #[serde(default)]
+        write_policy: NpmWritePolicy,
+    },
+    Proxy {
+        name: String,
+        url: String,
+        #[serde(default, skip_serializing)]
+        auth: Option<ProtectedString>,
+        #[serde(default)]
+        metadata_ttl: Option<i64>,
+        #[serde(default = "default_negative_ttl")]
+        negative_ttl: i64,
+    },
+    Group {
+        name: String,
+        members: Vec<String>,
+        writable_member: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NpmWritePolicy {
+    Allow,
+    #[default]
+    AllowOnce,
+    Deny,
+}
+
+impl NpmRepository {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Hosted { name, .. } | Self::Proxy { name, .. } | Self::Group { name, .. } => name,
+        }
+    }
+}
+
+fn default_negative_ttl() -> i64 {
+    300
+}
+
+fn default_validator_max_age_secs() -> u64 {
+    3_600
+}
+
+fn parse_validator_max_age_secs(value: &str) -> Result<u64, String> {
+    value.parse::<u64>().map_err(|_| {
+        format!("NORA_NPM_VALIDATOR_MAX_AGE_SECS={value:?} must be an unsigned integer")
+    })
+}
+
+/// Default npm upstream. This remains the source for the compatibility `/npm`
+/// alias; named proxies carry their own URL.
 fn default_npm_proxy() -> Option<String> {
     Some("https://registry.npmjs.org".to_string())
 }
@@ -44,12 +110,122 @@ impl Default for NpmConfig {
             metadata_ttl: 300,
             serve_stale: true,
             revalidate: true,
+            validator_max_age_secs: default_validator_max_age_secs(),
+            repositories: Vec::new(),
+            default_repository: None,
         }
     }
 }
 
 impl NpmConfig {
-    pub(in crate::config) fn apply_env_overrides(&mut self) {
+    pub fn repository(&self, name: &str) -> Option<&NpmRepository> {
+        self.repositories.iter().find(|repo| repo.name() == name)
+    }
+
+    pub fn validate_repositories(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut names = HashSet::new();
+
+        for repo in &self.repositories {
+            let name = repo.name();
+            if name.is_empty()
+                || name == "."
+                || name.contains("..")
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                errors.push(format!(
+                    "npm repository name {name:?} must contain only ASCII letters, digits, '.', '_' or '-'"
+                ));
+            } else if !names.insert(name.to_string()) {
+                errors.push(format!("duplicate npm repository name {name:?}"));
+            }
+
+            match repo {
+                NpmRepository::Proxy { url, .. } => match reqwest::Url::parse(url) {
+                    Ok(parsed)
+                        if matches!(parsed.scheme(), "http" | "https")
+                            && parsed.username().is_empty()
+                            && parsed.password().is_none()
+                            && parsed.query().is_none()
+                            && parsed.fragment().is_none() =>
+                    {
+                    }
+                    _ => errors.push(format!(
+                        "npm proxy repository {name:?} must use an HTTP(S) URL without userinfo, query or fragment"
+                    )),
+                },
+                NpmRepository::Group { members, .. } if members.is_empty() => errors.push(format!(
+                    "npm group repository {name:?} must have at least one member"
+                )),
+                _ => {}
+            }
+        }
+
+        let by_name: HashMap<&str, &NpmRepository> = self
+            .repositories
+            .iter()
+            .map(|repo| (repo.name(), repo))
+            .collect();
+        for repo in &self.repositories {
+            if let NpmRepository::Group {
+                name,
+                members,
+                writable_member,
+            } = repo
+            {
+                let mut group_members = HashSet::new();
+                for member in members {
+                    if !group_members.insert(member) {
+                        errors.push(format!(
+                            "npm group repository {name:?} contains duplicate member {member:?}"
+                        ));
+                    }
+                    match by_name.get(member.as_str()) {
+                        None => errors.push(format!(
+                            "npm group repository {name:?} references unknown member {member:?}"
+                        )),
+                        Some(NpmRepository::Group { .. }) => errors.push(format!(
+                            "npm group repository {name:?} cannot contain group member {member:?}"
+                        )),
+                        Some(_) => {}
+                    }
+                }
+                if let Some(writable) = writable_member {
+                    if !members.contains(writable) {
+                        errors.push(format!(
+                            "npm group repository {name:?} writable_member {writable:?} is not a group member"
+                        ));
+                    } else if !matches!(
+                        by_name.get(writable.as_str()),
+                        Some(NpmRepository::Hosted { .. })
+                    ) {
+                        errors.push(format!(
+                            "npm group repository {name:?} writable_member {writable:?} must reference a hosted repository"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(default) = &self.default_repository {
+            if !by_name.contains_key(default.as_str()) {
+                errors.push(format!(
+                    "npm.default_repository references unknown repository {default:?}"
+                ));
+            }
+        } else if !self.repositories.is_empty() {
+            errors.push(
+                "npm.default_repository is required when named npm repositories are configured"
+                    .to_string(),
+            );
+        }
+
+        errors
+    }
+
+    pub(in crate::config) fn apply_env_overrides(&mut self) -> Result<(), String> {
         if let Ok(val) = env::var("NORA_NPM_ENABLED") {
             self.enabled = val.to_lowercase() == "true" || val == "1";
         }
@@ -75,5 +251,182 @@ impl NpmConfig {
         if let Ok(val) = env::var("NORA_NPM_REVALIDATE") {
             self.revalidate = !matches!(val.as_str(), "false" | "0");
         }
+        if let Ok(val) = env::var("NORA_NPM_VALIDATOR_MAX_AGE_SECS") {
+            self.validator_max_age_secs = parse_validator_max_age_secs(&val)?;
+        }
+        if let Ok(val) = env::var("NORA_NPM_REPOSITORIES_JSON") {
+            self.repositories = serde_json::from_str(&val)
+                .map_err(|error| format!("NORA_NPM_REPOSITORIES_JSON is invalid: {error}"))?;
+        }
+        if let Ok(val) = env::var("NORA_NPM_DEFAULT_REPOSITORY") {
+            self.default_repository = if val.trim().is_empty() {
+                None
+            } else {
+                Some(val)
+            };
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_repository_validation_accepts_hosted_proxy_group() {
+        let config = NpmConfig {
+            repositories: vec![
+                NpmRepository::Hosted {
+                    name: "npm-private".into(),
+                    write_policy: NpmWritePolicy::AllowOnce,
+                },
+                NpmRepository::Proxy {
+                    name: "npm-registry".into(),
+                    url: "https://registry.npmjs.org".into(),
+                    auth: None,
+                    metadata_ttl: None,
+                    negative_ttl: 300,
+                },
+                NpmRepository::Group {
+                    name: "npm-group".into(),
+                    members: vec!["npm-private".into(), "npm-registry".into()],
+                    writable_member: Some("npm-private".into()),
+                },
+            ],
+            default_repository: Some("npm-group".into()),
+            ..NpmConfig::default()
+        };
+        assert!(config.validate_repositories().is_empty());
+    }
+
+    #[test]
+    fn proxy_repository_url_accepts_base_paths_but_rejects_credential_bearing_components() {
+        let validate = |url: &str| {
+            NpmConfig {
+                repositories: vec![NpmRepository::Proxy {
+                    name: "proxy".into(),
+                    url: url.into(),
+                    auth: None,
+                    metadata_ttl: None,
+                    negative_ttl: 300,
+                }],
+                default_repository: Some("proxy".into()),
+                ..NpmConfig::default()
+            }
+            .validate_repositories()
+        };
+
+        assert!(validate("https://registry.example.invalid/npm/").is_empty());
+        for url in [
+            "https://user:password@registry.example.invalid/npm/",
+            "https://registry.example.invalid/npm/?tenant=private",
+            "https://registry.example.invalid/npm/#private",
+        ] {
+            assert!(
+                validate(url)
+                    .iter()
+                    .any(|error| error.contains("without userinfo, query or fragment")),
+                "unsafe proxy URL must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_max_age_parser_rejects_non_numeric_values() {
+        assert_eq!(parse_validator_max_age_secs("7200").unwrap(), 7_200);
+        assert!(parse_validator_max_age_secs("forever")
+            .unwrap_err()
+            .contains("NORA_NPM_VALIDATOR_MAX_AGE_SECS"));
+    }
+
+    #[test]
+    fn hosted_write_policy_defaults_to_allow_once_and_accepts_allow() {
+        let default: NpmRepository =
+            serde_json::from_str(r#"{"kind":"hosted","name":"private"}"#).unwrap();
+        assert!(matches!(
+            default,
+            NpmRepository::Hosted {
+                write_policy: NpmWritePolicy::AllowOnce,
+                ..
+            }
+        ));
+
+        let allow: NpmRepository =
+            serde_json::from_str(r#"{"kind":"hosted","name":"private","write_policy":"allow"}"#)
+                .unwrap();
+        assert!(matches!(
+            allow,
+            NpmRepository::Hosted {
+                write_policy: NpmWritePolicy::Allow,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn writable_member_must_be_a_hosted_group_member() {
+        let config = NpmConfig {
+            repositories: vec![
+                NpmRepository::Proxy {
+                    name: "proxy".into(),
+                    url: "https://registry.npmjs.org".into(),
+                    auth: None,
+                    metadata_ttl: None,
+                    negative_ttl: 300,
+                },
+                NpmRepository::Group {
+                    name: "group".into(),
+                    members: vec!["proxy".into()],
+                    writable_member: Some("proxy".into()),
+                },
+            ],
+            default_repository: Some("group".into()),
+            ..NpmConfig::default()
+        };
+        assert!(config
+            .validate_repositories()
+            .iter()
+            .any(|error| error.contains("must reference a hosted repository")));
+    }
+
+    #[test]
+    fn repository_names_reject_path_traversal_but_allow_single_dots() {
+        for name in [".", "..", "repo..private"] {
+            let config = NpmConfig {
+                repositories: vec![NpmRepository::Hosted {
+                    name: name.to_string(),
+                    write_policy: NpmWritePolicy::AllowOnce,
+                }],
+                default_repository: Some(name.to_string()),
+                ..NpmConfig::default()
+            };
+            assert!(!config.validate_repositories().is_empty(), "{name}");
+        }
+        let config = NpmConfig {
+            repositories: vec![NpmRepository::Hosted {
+                name: "repo.private".to_string(),
+                write_policy: NpmWritePolicy::AllowOnce,
+            }],
+            default_repository: Some("repo.private".to_string()),
+            ..NpmConfig::default()
+        };
+        assert!(config.validate_repositories().is_empty());
+    }
+
+    #[test]
+    fn named_repositories_require_a_default_alias_target() {
+        let config = NpmConfig {
+            repositories: vec![NpmRepository::Hosted {
+                name: "packages".to_string(),
+                write_policy: NpmWritePolicy::AllowOnce,
+            }],
+            default_repository: None,
+            ..NpmConfig::default()
+        };
+        assert!(config
+            .validate_repositories()
+            .iter()
+            .any(|error| error.contains("default_repository is required")));
     }
 }

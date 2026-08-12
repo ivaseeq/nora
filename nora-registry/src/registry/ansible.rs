@@ -520,7 +520,15 @@ async fn proxy_json(
 
     // TTL check — serve fresh cache without hitting upstream.
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(cache_key).await {
+        let meta = match state.storage.stat(cache_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "ansible", "stat", cache_key, &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
                 state.metrics.record_download("ansible");
                 state.metrics.record_cache_hit("ansible");

@@ -143,7 +143,18 @@ async fn provider_versions(
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "terraform",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
@@ -279,7 +290,18 @@ async fn provider_download_meta(
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "terraform",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
@@ -370,7 +392,17 @@ async fn provider_download_binary(
     // binary path is {ns}/{ptype}/{ver}/{file}, so reuse the cached provider
     // metadata date (gated internally on trust_upstream_dates; None → NORA's clock).
     // #754: skip the /v2 round-trip on a cache hit (the digest is already recorded).
-    let already_cached = state.storage.stat(&storage_key).await.is_some();
+    let already_cached = match state.storage.stat(&storage_key).await {
+        Ok(meta) => meta.is_some(),
+        Err(error) => {
+            return crate::registry::storage_error_response(
+                "terraform",
+                "stat",
+                &storage_key,
+                &error,
+            );
+        }
+    };
     let bin_coords: Vec<&str> = path.split('/').collect();
     let publish_date = if bin_coords.len() >= 3 {
         extract_terraform_publish_date(
@@ -533,7 +565,18 @@ async fn module_versions(
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response(
+                    "terraform",
+                    "stat",
+                    &storage_key,
+                    &error,
+                );
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_download("terraform");
                 state.metrics.record_cache_hit("terraform");
@@ -999,7 +1042,18 @@ async fn mirror_fetch_versions(
 
     // TTL cache — serve fresh if within TTL.
     if let Some(ref data) = cached_data {
-        if let Some(meta) = state.storage.stat(&storage_key).await {
+        let meta = match state.storage.stat(&storage_key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return Err(Box::new(crate::registry::storage_error_response(
+                    "terraform",
+                    "stat",
+                    &storage_key,
+                    &error,
+                )));
+            }
+        };
+        if let Some(meta) = meta {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_cache_hit("terraform");
                 return parse_json(data);

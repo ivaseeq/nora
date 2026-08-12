@@ -328,7 +328,13 @@ async fn download_file(
     if headers.contains_key(header::RANGE)
         && matches!(q_mode, crate::digest_quarantine::QuarantineMode::Off)
     {
-        if let Some(meta) = state.storage.stat(&key).await {
+        let meta = match state.storage.stat(&key).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                return crate::registry::storage_error_response("pypi", "stat", &key, &error);
+            }
+        };
+        if let Some(meta) = meta {
             if let Some(response) = crate::registry::range::range_response(
                 &state.storage,
                 &[&key],
@@ -633,7 +639,13 @@ async fn upload(
     let _guard = lock.lock().await;
 
     // Check immutability (same filename = already exists)
-    if state.storage.stat(&file_key).await.is_some() {
+    let file_exists = match state.storage.stat(&file_key).await {
+        Ok(meta) => meta.is_some(),
+        Err(error) => {
+            return crate::registry::storage_error_response("pypi", "stat", &file_key, &error);
+        }
+    };
+    if file_exists {
         return (
             StatusCode::CONFLICT,
             format!("File {} already exists", filename),

@@ -18,6 +18,8 @@ jobs:
       hash: ${{ steps.hash.outputs.hash }}
       version: ${{ steps.sha.outputs.version }}
       short: ${{ steps.sha.outputs.short }}
+      source_tree: ${{ steps.sha.outputs.source_tree }}
+      cargo_lock_sha256: ${{ steps.sha.outputs.cargo_lock_sha256 }}
     permissions:
       contents: read
       packages: write
@@ -31,11 +33,30 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Block public image rebuilds for exact-git redb
+        run: scripts/verify-public-release-redb-policy.sh
+
+      - name: Install ORAS for immutable redb evidence verification
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: 1.3.1
+
+      - name: Test redb production release gate
+        run: scripts/test-redb-production-release-gate.sh
+
+      - name: Test redb production entrypoint
+        run: scripts/redb-production-gate-test.sh
+
+      - name: Block unreviewed redb engine releases
+        run: scripts/verify-redb-production-release.sh
+
       - name: Get short SHA and version
         id: sha
         run: |
           echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          echo "source_tree=$(git rev-parse 'HEAD^{tree}')" >> $GITHUB_OUTPUT
+          echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')" >> $GITHUB_OUTPUT
 
       - name: Verify Cargo.toml version matches tag
         run: |
@@ -111,6 +132,9 @@ jobs:
           context: .
           file: deploy/Dockerfile.release
           platforms: linux/amd64
+          build-args: |
+            NORA_SOURCE_TREE=${{ steps.sha.outputs.source_tree }}
+            NORA_CARGO_LOCK_SHA256=${{ steps.sha.outputs.cargo_lock_sha256 }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export amd64 digest
@@ -148,6 +172,9 @@ jobs:
           target: redos
           platforms: linux/amd64
           push: true
+          build-args: |
+            NORA_SOURCE_TREE=${{ steps.sha.outputs.source_tree }}
+            NORA_CARGO_LOCK_SHA256=${{ steps.sha.outputs.cargo_lock_sha256 }}
           tags: ${{ steps.meta-redos.outputs.tags }}
           labels: ${{ steps.meta-redos.outputs.labels }}
 
@@ -173,6 +200,9 @@ jobs:
           target: astra
           platforms: linux/amd64
           push: true
+          build-args: |
+            NORA_SOURCE_TREE=${{ steps.sha.outputs.source_tree }}
+            NORA_CARGO_LOCK_SHA256=${{ steps.sha.outputs.cargo_lock_sha256 }}
           tags: ${{ steps.meta-astra.outputs.tags }}
           labels: ${{ steps.meta-astra.outputs.labels }}
 
@@ -225,6 +255,9 @@ jobs:
           context: .
           file: deploy/Dockerfile.release
           platforms: linux/arm64
+          build-args: |
+            NORA_SOURCE_TREE=${{ needs.build.outputs.source_tree }}
+            NORA_CARGO_LOCK_SHA256=${{ needs.build.outputs.cargo_lock_sha256 }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export arm64 digest

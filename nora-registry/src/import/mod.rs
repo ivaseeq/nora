@@ -242,21 +242,29 @@ async fn assess(
     println!("nora import assess — source: {host}");
     println!("{:<32} {:<12} {:<12} notes", "REPO", "FORMAT", "COMPAT");
     let mut full = 0usize;
-    let mut partial = 0usize;
     let mut unsupported = 0usize;
     for repo in &repos {
         let (compat, note) = match layout::normalize_format(&repo.format) {
             Some(rt) => {
-                let c = layout::compat(rt);
+                let c = configured_import_compat(rt, config);
                 match c {
                     layout::Compat::Full => full += 1,
-                    layout::Compat::Partial => partial += 1,
                     layout::Compat::Unsupported => unsupported += 1,
                 }
                 let note = match c {
                     layout::Compat::Full => "",
-                    layout::Compat::Partial => "tarballs only; metadata regenerated",
-                    layout::Compat::Unsupported => "no NORA import layout — will be skipped",
+                    layout::Compat::Unsupported
+                        if rt == crate::registry_type::RegistryType::Npm =>
+                    {
+                        "use the protocol-aware Nexus npm migrator"
+                    }
+                    layout::Compat::Unsupported
+                        if rt == crate::registry_type::RegistryType::Maven
+                            && !config.maven.repositories.is_empty() =>
+                    {
+                        "named Maven requires metadata-aware Nexus migration"
+                    }
+                    layout::Compat::Unsupported => "no safe NORA import layout — will be skipped",
                 };
                 (format!("{c:?}"), note)
             }
@@ -277,7 +285,7 @@ async fn assess(
         );
     }
     println!(
-        "\n{} repo(s): {full} full, {partial} partial, {unsupported} unsupported",
+        "\n{} repo(s): {full} full, {unsupported} unsupported",
         repos.len()
     );
 
@@ -357,6 +365,18 @@ async fn run_import(
             tracing::info!(repo = %repo.name, format = %repo.format, "skipping repo (unsupported source format)");
             continue;
         };
+        if configured_import_compat(rt, config) == layout::Compat::Unsupported {
+            // Do not enumerate or mark the repository complete. A future
+            // protocol-aware importer must be able to revisit it, and writing
+            // legacy/incomplete keys would make the new named handlers either
+            // ignore the data or expose a partial package.
+            tracing::warn!(
+                repo = %repo.name,
+                format = %repo.format,
+                "skipping repository: no safe import path for the configured named registry; use the protocol-aware Nexus migration workflow"
+            );
+            continue;
+        }
         // Per-repo isolation: a repo that fails to even start (e.g. journal open
         // error) is logged and counted, never aborting the remaining repos of a
         // multi-day migration (review: single-error-aborts-job).
@@ -390,6 +410,26 @@ async fn run_import(
 
     report_result(&result, args.dry_run, args.json);
     Ok(())
+}
+
+/// Direct-storage import is safe only when its key layout and metadata
+/// authority match the serving handler.
+///
+/// npm always requires a protocol-aware publish so the immutable version
+/// manifest, tags and deprecations are committed together. Maven's legacy
+/// direct-storage importer remains available only for the legacy single
+/// repository layout; named Maven migration must reconcile per-repository
+/// metadata through the HTTP handler.
+fn configured_import_compat(
+    rt: crate::registry_type::RegistryType,
+    config: &crate::config::Config,
+) -> layout::Compat {
+    match rt {
+        crate::registry_type::RegistryType::Maven if !config.maven.repositories.is_empty() => {
+            layout::Compat::Unsupported
+        }
+        _ => layout::compat(rt),
+    }
 }
 
 /// Import a single repo with bounded concurrency and strict resume ordering.
@@ -442,8 +482,16 @@ async fn import_repo(
                     return Item::ResumeSkip;
                 }
                 // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5).
-                if !on_s3 && storage.stat(&key).await.is_some() {
-                    return Item::CasSkip { key };
+                if !on_s3 {
+                    match storage.stat(&key).await {
+                        Ok(Some(_)) => return Item::CasSkip { key },
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Item::StreamErr(format!(
+                                "failed to stat destination key {key}: {error}"
+                            ));
+                        }
+                    }
                 }
                 let cname = curation_name(rt, &art);
                 let outcome = transfer::transfer_artifact(
@@ -742,6 +790,32 @@ mod integration_tests {
         assert_eq!(truncate("🚀🚀🚀🚀🚀", 3), "🚀🚀…"); // emoji (4-byte) boundaries
     }
 
+    #[test]
+    fn direct_storage_import_is_disabled_for_named_maven_and_all_npm() {
+        use crate::config::{MavenRepository, MavenVersionPolicy, MavenWritePolicy};
+        use crate::registry_type::RegistryType;
+
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            configured_import_compat(RegistryType::Maven, &config),
+            layout::Compat::Full
+        );
+        assert_eq!(
+            configured_import_compat(RegistryType::Npm, &config),
+            layout::Compat::Unsupported
+        );
+
+        config.maven.repositories = vec![MavenRepository::Hosted {
+            name: "maven-releases".to_string(),
+            version_policy: MavenVersionPolicy::Release,
+            write_policy: MavenWritePolicy::AllowOnce,
+        }];
+        assert_eq!(
+            configured_import_compat(RegistryType::Maven, &config),
+            layout::Compat::Unsupported
+        );
+    }
+
     const MAVEN_KEY: &str = "maven/com/example/foo/1.0/foo-1.0.jar";
 
     #[tokio::test]
@@ -784,7 +858,7 @@ mod integration_tests {
         assert_eq!(res.failed, 0);
         // Committed under the handler-format key, with the pin recorded (local).
         assert!(
-            h.storage.stat(MAVEN_KEY).await.is_some(),
+            h.storage.stat(MAVEN_KEY).await.unwrap().is_some(),
             "artifact at handler key"
         );
         assert_eq!(h.storage.get(MAVEN_KEY).await.unwrap().as_ref(), body);
@@ -853,7 +927,7 @@ mod integration_tests {
         assert_eq!(res.failed, 1, "checksum mismatch → failed");
         // Fail-closed: nothing in storage, repo NOT marked done (so it retries).
         assert!(
-            h.storage.stat(MAVEN_KEY).await.is_none(),
+            h.storage.stat(MAVEN_KEY).await.unwrap().is_none(),
             "nothing committed on mismatch"
         );
         assert!(!h.resume.is_repo_done("libs-release-local"));
@@ -896,7 +970,7 @@ mod integration_tests {
 
         assert_eq!(res.imported, 1, "dry-run counts a would-import");
         assert!(
-            h.storage.stat(MAVEN_KEY).await.is_none(),
+            h.storage.stat(MAVEN_KEY).await.unwrap().is_none(),
             "dry-run commits nothing"
         );
         assert!(
@@ -971,7 +1045,7 @@ mod integration_tests {
 
         assert_eq!(res.imported, 1);
         let key = "maven/com/acme/lib/2.0/lib-2.0.jar";
-        assert!(h.storage.stat(key).await.is_some());
+        assert!(h.storage.stat(key).await.unwrap().is_some());
         assert_eq!(h.storage.get(key).await.unwrap().as_ref(), body);
     }
 
@@ -1049,7 +1123,7 @@ mod integration_tests {
         .unwrap();
         assert_eq!(res.imported, 0);
         assert_eq!(res.skipped, 1, "sha1-only skipped without --allow-sha1");
-        assert!(h.storage.stat(MAVEN_KEY).await.is_none());
+        assert!(h.storage.stat(MAVEN_KEY).await.unwrap().is_none());
 
         // With --allow-sha1: the sha1 is verified and the artifact imports.
         let h2 = harness("art-sha1-on").await;
@@ -1080,7 +1154,7 @@ mod integration_tests {
         .await
         .unwrap();
         assert_eq!(res2.imported, 1, "sha1-only imports with --allow-sha1");
-        assert!(h2.storage.stat(MAVEN_KEY).await.is_some());
+        assert!(h2.storage.stat(MAVEN_KEY).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1304,7 +1378,12 @@ mod integration_tests {
         let res = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, false).await;
         assert_eq!(res.imported, 2);
         assert_eq!(res.failed, 0);
-        assert!(h.storage.stat("maven/com/a/1.0/a-1.0.jar").await.is_some());
+        assert!(h
+            .storage
+            .stat("maven/com/a/1.0/a-1.0.jar")
+            .await
+            .unwrap()
+            .is_some());
         assert!(h.resume.is_repo_done("r"));
         let res2 = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, false).await;
         assert_eq!(res2.imported, 0);
@@ -1356,7 +1435,12 @@ mod integration_tests {
         };
         let res = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, true).await;
         assert_eq!(res.imported, 1);
-        assert!(h.storage.stat("maven/com/a/1.0/a.jar").await.is_none());
+        assert!(h
+            .storage
+            .stat("maven/com/a/1.0/a.jar")
+            .await
+            .unwrap()
+            .is_none());
         assert!(!h.resume.is_repo_done("r"));
     }
 

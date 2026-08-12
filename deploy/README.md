@@ -120,6 +120,11 @@ trusted-host = registry.example.com
 | `NORA_PORT` | 4000 | Port |
 | `NORA_STORAGE_PATH` | data/storage | Storage path |
 | `NORA_AUTH_ENABLED` | false | Enable auth |
+| `NORA_PROXY_CACHE_CLEANUP_ENABLED` | false | Enable access-aware Maven/npm proxy-cache cleanup |
+| `NORA_PROXY_CACHE_CLEANUP_DRY_RUN` | false | Report eligible payloads without deleting them; hidden access tracking remains active |
+| `NORA_PROXY_CACHE_CLEANUP_INTERVAL_SECS` | 86400 | Delay between completed cleanup passes |
+| `NORA_PROXY_CACHE_CLEANUP_MIN_CACHE_AGE_SECS` | 2592000 | Minimum payload age (30 days) |
+| `NORA_PROXY_CACHE_CLEANUP_MIN_IDLE_SECS` | 7776000 | Minimum tracked idle time (90 days) |
 
 ---
 
@@ -238,6 +243,11 @@ trusted-host = registry.example.com
 | `NORA_HOST` | 127.0.0.1 | Адрес привязки |
 | `NORA_PORT` | 4000 | Порт |
 | `NORA_STORAGE_PATH` | data/storage | Путь хранилища |
+| `NORA_PROXY_CACHE_CLEANUP_ENABLED` | false | Включить access-aware очистку Maven/npm proxy cache |
+| `NORA_PROXY_CACHE_CLEANUP_DRY_RUN` | false | Только отчёт без удаления; скрытые access markers продолжают обновляться |
+| `NORA_PROXY_CACHE_CLEANUP_INTERVAL_SECS` | 86400 | Задержка между завершёнными проходами |
+| `NORA_PROXY_CACHE_CLEANUP_MIN_CACHE_AGE_SECS` | 2592000 | Минимальный возраст payload (30 дней) |
+| `NORA_PROXY_CACHE_CLEANUP_MIN_IDLE_SECS` | 7776000 | Минимальный период без обращений (90 дней) |
 | `NORA_AUTH_ENABLED` | false | Включить авторизацию |
 
 ---

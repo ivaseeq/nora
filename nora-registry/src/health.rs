@@ -4,6 +4,7 @@
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use utoipa::ToSchema;
 
 use crate::circuit_breaker::UpstreamHealth;
@@ -27,18 +28,22 @@ pub struct HealthStatus {
 pub struct StorageHealth {
     pub backend: String,
     pub reachable: bool,
+    /// Retained for API compatibility. Physical bucket-size scanning is not
+    /// performed, so this is zero whenever `size_available` is false.
     pub total_size_bytes: u64,
+    /// Whether `total_size_bytes` contains a measured physical storage size.
+    pub size_available: bool,
 }
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
+        .route("/ready/index", get(index_readiness_check))
 }
 
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
     let storage_reachable = check_storage_reachable(&state).await;
-    let total_size = state.storage.total_size().await;
 
     let status = if storage_reachable {
         "healthy"
@@ -63,7 +68,8 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         storage: StorageHealth {
             backend: state.storage.backend_name().to_string(),
             reachable: storage_reachable,
-            total_size_bytes: total_size,
+            total_size_bytes: 0,
+            size_available: false,
         },
         registries,
         upstreams,
@@ -78,7 +84,15 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
 }
 
 async fn readiness_check(State(state): State<AppState>) -> StatusCode {
-    if check_storage_reachable(&state).await {
+    if !state.draining.load(Ordering::Acquire) && check_storage_reachable(&state).await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn index_readiness_check(State(state): State<AppState>) -> StatusCode {
+    if state.repo_index.persistent_protocol_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -154,15 +168,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_json_has_storage_size() {
+    async fn test_health_json_marks_physical_size_unavailable() {
         let ctx = create_test_context();
-
-        // Put some data to have non-zero size
-        ctx.state
-            .storage
-            .put("test/artifact", b"hello world")
-            .await
-            .unwrap();
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -171,10 +178,8 @@ mod tests {
 
         let storage = json.get("storage").unwrap();
         let size = storage.get("total_size_bytes").unwrap().as_u64().unwrap();
-        assert!(
-            size > 0,
-            "total_size_bytes should be > 0 after storing data"
-        );
+        assert_eq!(size, 0);
+        assert_eq!(storage.get("size_available").unwrap(), false);
     }
 
     #[tokio::test]
@@ -186,6 +191,7 @@ mod tests {
 
         let size = json["storage"]["total_size_bytes"].as_u64().unwrap();
         assert_eq!(size, 0, "empty storage should report 0 bytes");
+        assert_eq!(json["storage"]["size_available"], false);
     }
 
     /// Storage unreachable → `/health` stays 200 (liveness = process up) and reports
@@ -219,6 +225,84 @@ mod tests {
         let ctx = create_test_context();
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn draining_fails_readiness_without_affecting_liveness() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = create_test_context();
+        ctx.state.draining.store(true, Ordering::Release);
+
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/ready", "").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/health", "").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn index_readiness_is_separate_from_storage_readiness() {
+        let index_dir = tempfile::tempdir().unwrap();
+        let ctx = create_test_context_with_config(|config| {
+            config.index.path = index_dir
+                .path()
+                .join("index.redb")
+                .to_string_lossy()
+                .into_owned();
+        });
+        let index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &ctx.state.config,
+            ctx.state.enabled_registries.as_ref(),
+            ctx.state.storage.clone(),
+        )
+        .await
+        .unwrap();
+        let mut state = ctx.state.clone();
+        state.repo_index = index.clone();
+        let app = super::routes().with_state(state);
+
+        assert_eq!(
+            send(&app, Method::GET, "/ready", "").await.status(),
+            StatusCode::OK,
+            "artifact storage can be ready while the derived index warms"
+        );
+        assert_eq!(
+            send(&app, Method::GET, "/ready/index", "").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert_eq!(
+            send(&app, Method::GET, "/ready/index", "").await.status(),
+            StatusCode::OK
+        );
+        index.stop_persistent_writer_for_test().await.unwrap();
+        assert_eq!(
+            send(&app, Method::GET, "/ready", "").await.status(),
+            StatusCode::OK,
+            "a failed derived-index writer must not withdraw S3 protocol traffic"
+        );
+        assert_eq!(
+            send(&app, Method::GET, "/ready/index", "").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let metric_names = prometheus::gather()
+            .into_iter()
+            .map(|family| family.name().to_string())
+            .collect::<std::collections::HashSet<_>>();
+        for expected in [
+            "nora_index_state",
+            "nora_index_generation",
+            "nora_index_pending_changes",
+            "nora_index_database_bytes",
+        ] {
+            assert!(metric_names.contains(expected), "missing metric {expected}");
+        }
+        index.shutdown_persistent().await;
     }
 
     #[tokio::test]

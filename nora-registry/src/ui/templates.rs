@@ -3,10 +3,180 @@
 
 use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata};
 use super::components::*;
-use super::i18n::{get_translations, Lang};
-use crate::repo_index::RepoInfo;
+use super::i18n::{get_translations, Lang, Translations};
+use crate::repo_index::{PersistentIndexPhase, PersistentIndexProgress, RepoInfo};
 use crate::tokens::TokenListEntry;
 use std::fmt::Write;
+
+/// Renders a friendly, self-refreshing shell while the persistent Maven/npm
+/// projection has no usable generation yet. Artifact protocol routes remain
+/// independent; only the browse/search projection is warming.
+pub fn render_index_loading(
+    registry_type: &str,
+    registry_title: &str,
+    lang: Lang,
+    auth_enabled: bool,
+    progress: PersistentIndexProgress,
+) -> String {
+    let t = get_translations(lang);
+    let title = t.index_loading_title.replace("{registry}", registry_title);
+    let phase = index_phase_text(t, progress.phase);
+    let fragment = render_index_loading_fragment(registry_type, registry_title, lang, progress);
+    let content = format!(
+        r##"
+        <style>
+            @keyframes nora-index-spin {{ to {{ transform: rotate(360deg); }} }}
+            .nora-index-spinner {{ animation: nora-index-spin 1s linear infinite; }}
+            .nora-index-shell {{ min-height: 60vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }}
+            .nora-index-card {{ width: 100%; max-width: 42rem; padding: 3rem; text-align: center; background: #1e293b; border: 1px solid #334155; border-radius: .75rem; box-shadow: 0 10px 25px rgba(0, 0, 0, .18); }}
+            .nora-index-spinner {{ width: 3.5rem; height: 3.5rem; margin: 0 auto 1.5rem; border: 4px solid #334155; border-top-color: #60a5fa; border-radius: 9999px; }}
+            .nora-index-title {{ margin: 0 0 .75rem; color: #f1f5f9; font-size: 1.5rem; font-weight: 700; }}
+            .nora-index-message {{ margin: 0; color: #cbd5e1; line-height: 1.625; }}
+            .nora-index-hint {{ margin: 1rem 0 0; color: #94a3b8; font-size: .875rem; }}
+            .nora-index-phase {{ margin: 1.5rem 0 0; color: #e2e8f0; font-size: 1rem; }}
+            .nora-index-phase-label {{ display: block; margin-bottom: .25rem; color: #94a3b8; font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }}
+            .nora-index-counters {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; margin-top: 1.5rem; text-align: left; }}
+            .nora-index-counter {{ min-width: 0; padding: 1rem; background: #0f172a; border: 1px solid #334155; border-radius: .5rem; }}
+            .nora-index-counter dt {{ color: #94a3b8; font-size: .75rem; line-height: 1.35; }}
+            .nora-index-counter dd {{ margin: .4rem 0 0; color: #f8fafc; font-size: 1.5rem; font-variant-numeric: tabular-nums; font-weight: 700; }}
+            .nora-index-commit-hint {{ margin: .75rem 0 0; color: #94a3b8; font-size: .75rem; }}
+            .nora-index-skeleton {{ margin-top: 2rem; }}
+            .nora-index-skeleton span {{ display: block; height: .75rem; margin: .75rem auto 0; border-radius: .25rem; background: #334155; }}
+            .nora-index-skeleton span:nth-child(1) {{ width: 100%; }}
+            .nora-index-skeleton span:nth-child(2) {{ width: 83.333%; }}
+            .nora-index-skeleton span:nth-child(3) {{ width: 66.667%; }}
+            .nora-index-noscript {{ margin: 1.5rem 0 0; color: #94a3b8; font-size: .875rem; }}
+            @media (prefers-reduced-motion: reduce) {{
+                .nora-index-spinner {{ animation: none; }}
+            }}
+            @media (max-width: 640px) {{
+                .nora-index-card {{ padding: 2rem 1.25rem; }}
+                .nora-index-counters {{ grid-template-columns: 1fr; }}
+            }}
+        </style>
+        <div class="nora-index-shell">
+            <section id="index-loading-status" class="nora-index-card" aria-busy="false">
+                <p id="index-loading-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true">{phase}</p>
+                {fragment}
+            </section>
+        </div>
+        "##,
+        fragment = fragment,
+        phase = phase,
+    );
+
+    layout_dark(
+        &title,
+        &content,
+        Some(registry_type),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
+/// Browser-facing recovery page for a transient persistent-index read failure.
+/// Protocol endpoints remain independent; this response replaces the JSON API
+/// error that would otherwise strand a user on a raw 503 document.
+pub fn render_index_unavailable(
+    registry_type: &str,
+    registry_title: &str,
+    retry_url: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let content = format!(
+        r#"<section role="alert" class="mx-auto max-w-2xl rounded-lg border border-amber-700 bg-amber-900/20 p-4 md:p-6">
+            <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            <p class="mt-3 text-slate-300">{message}</p>
+            <a href="{retry_url}" class="mt-4 inline-block rounded bg-slate-700 px-4 py-2 text-slate-100 hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500">{reload}</a>
+        </section>"#,
+        title = html_escape(registry_title),
+        message = t.index_view_temporarily_unavailable,
+        retry_url = html_escape(retry_url),
+        reload = t.reload_page,
+    );
+    layout_dark(
+        registry_title,
+        &content,
+        Some(registry_type),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
+/// Render only the polling region so HTMX can replace it without rebuilding
+/// the full page. Counts are exact completed redb batches, not estimates.
+fn index_phase_text(t: &Translations, phase: PersistentIndexPhase) -> &'static str {
+    match phase {
+        PersistentIndexPhase::Idle => t.index_phase_idle,
+        PersistentIndexPhase::Preparing => t.index_phase_preparing,
+        PersistentIndexPhase::Recovering => t.index_phase_recovering,
+        PersistentIndexPhase::MavenInventory => t.index_phase_maven_inventory,
+        PersistentIndexPhase::NpmInventory => t.index_phase_npm_inventory,
+        PersistentIndexPhase::NpmAuthority => t.index_phase_npm_authority,
+        PersistentIndexPhase::Publishing => t.index_phase_publishing,
+        PersistentIndexPhase::RetryWaiting => t.index_phase_retry_waiting,
+    }
+}
+
+pub fn render_index_loading_fragment(
+    registry_type: &str,
+    registry_title: &str,
+    lang: Lang,
+    progress: PersistentIndexProgress,
+) -> String {
+    let t = get_translations(lang);
+    let title = t.index_loading_title.replace("{registry}", registry_title);
+    let phase = index_phase_text(t, progress.phase);
+    format!(
+        r#"<div id="index-loading-content" data-index-announcement="{phase}"
+            hx-get="/api/ui/index-status?registry={registry_type}&amp;lang={lang}"
+            hx-trigger="every 2s" hx-target="this" hx-swap="outerHTML">
+            <div class="nora-index-spinner" aria-hidden="true"></div>
+            <h1 class="nora-index-title">{title}</h1>
+            <p class="nora-index-message">{message}</p>
+            <p class="nora-index-hint">{hint}</p>
+            <p class="nora-index-phase">
+                <span class="nora-index-phase-label">{phase_label}</span>
+                <span>{phase}</span>
+            </p>
+            <dl class="nora-index-counters">
+                <div class="nora-index-counter">
+                    <dt>{maven_label}</dt><dd>{maven_objects}</dd>
+                </div>
+                <div class="nora-index-counter">
+                    <dt>{npm_objects_label}</dt><dd>{npm_objects}</dd>
+                </div>
+                <div class="nora-index-counter">
+                    <dt>{npm_packages_label}</dt><dd>{npm_packages}</dd>
+                </div>
+            </dl>
+            <p class="nora-index-commit-hint">{commit_hint}</p>
+            <div class="nora-index-skeleton" aria-hidden="true">
+                <span></span><span></span><span></span>
+            </div>
+            <noscript><p class="nora-index-noscript">{no_js}</p></noscript>
+        </div>"#,
+        registry_type = html_escape(registry_type),
+        lang = lang.code(),
+        title = html_escape(&title),
+        message = t.index_loading_message,
+        hint = t.index_loading_hint,
+        phase_label = t.index_progress_phase,
+        phase = html_escape(phase),
+        maven_label = t.index_progress_maven_objects,
+        maven_objects = progress.maven_objects,
+        npm_objects_label = t.index_progress_npm_objects,
+        npm_objects = progress.npm_objects,
+        npm_packages_label = t.index_progress_npm_packages,
+        npm_packages = progress.npm_packages,
+        commit_hint = t.index_progress_commit_hint,
+        no_js = t.index_loading_no_js,
+    )
+}
 
 /// Renders the main dashboard page with dark theme
 pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool) -> String {
@@ -17,7 +187,6 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         data.global_stats.uploads,
         data.global_stats.artifacts,
         data.global_stats.cache_hit_percent,
-        data.global_stats.storage_bytes,
         lang,
     );
 
@@ -35,6 +204,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                 r.downloads,
                 r.uploads,
                 r.size_bytes,
+                r.size_available,
                 &format!("/ui/{}", r.name),
                 t,
             )
@@ -58,7 +228,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {
         format!(
-            r##"<tr><td colspan="5" class="py-8 text-center text-slate-500">{}</td></tr>"##,
+            r##"<tr><td colspan="5" class="py-8 text-center text-slate-400">{}</td></tr>"##,
             t.no_activity
         )
     } else {
@@ -141,7 +311,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                     <p class="text-slate-400">{}</p>
                 </div>
                 <div class="text-right">
-                    <div class="text-sm text-slate-500">{}</div>
+                    <div class="text-sm text-slate-400">{}</div>
                     <div id="uptime" class="text-lg font-semibold text-slate-300">{}</div>
                 </div>
             </div>
@@ -218,7 +388,7 @@ pub fn render_registry_list_paginated(
 
     let table_rows = if repos.is_empty() && page == 1 {
         format!(
-            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-400">
             <div class="text-4xl mb-2">📭</div>
             <div>{}</div>
             <div class="text-sm mt-1">{}</div>
@@ -227,7 +397,7 @@ pub fn render_registry_list_paginated(
         )
     } else if repos.is_empty() {
         format!(
-            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-500">
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-400">
             <div class="text-4xl mb-2">📭</div>
             <div>{}</div>
         </td></tr>"##,
@@ -266,7 +436,7 @@ pub fn render_registry_list_paginated(
                     detail_url,
                     html_escape(&repo.name),
                     versions_display,
-                    format_size(repo.size),
+                    format_available_size(repo.size, repo.size_available),
                     &repo.updated
                 )
             })
@@ -446,6 +616,250 @@ pub fn render_registry_list_paginated(
     layout_dark(title, &content, Some(registry_type), "", lang, auth_enabled)
 }
 
+/// Render one keyset-paginated registry page. Continuation tokens are bound to
+/// the redb generation; browser Back supplies previous-page navigation without
+/// embedding an ever-growing cursor stack in the token.
+fn friendly_repository_name(registry_type: &str, name: &str) -> (String, Option<String>) {
+    let Some(rest) = name.strip_prefix("repositories/") else {
+        return (name.to_string(), None);
+    };
+    let Some((repository, logical_name)) = rest.split_once('/') else {
+        return (rest.to_string(), None);
+    };
+    if registry_type == "npm" {
+        (logical_name.to_string(), Some(repository.to_string()))
+    } else {
+        (format!("{repository}/{logical_name}"), None)
+    }
+}
+
+fn repository_item_count(registry_type: &str, repo: &RepoInfo) -> String {
+    if registry_type == "maven"
+        && repo.versions == 0
+        && !repo.size_available
+        && repo.updated == "N/A"
+    {
+        "\u{2014}".to_string()
+    } else {
+        repo.versions.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_results_announcement(t: &Translations, count: usize, query: &str) -> String {
+    let template = match (count, query.is_empty()) {
+        (1, true) => t.one_result_on_page,
+        (_, true) => t.results_on_page,
+        (1, false) => t.one_result_for_query,
+        (_, false) => t.results_for_query,
+    };
+    template
+        .replace("{count}", &count.to_string())
+        .replace("{query}", query)
+}
+
+pub fn render_registry_search_results(
+    registry_type: &str,
+    title: &str,
+    repos: &[RepoInfo],
+    limit: usize,
+    continuation_token: Option<&str>,
+    query: &str,
+    lang: Lang,
+) -> String {
+    let t = get_translations(lang);
+    let rows = if repos.is_empty() {
+        let (icon, message) = if query.is_empty() {
+            ("📦", t.no_repos_found)
+        } else {
+            ("🔍", t.no_search_results)
+        };
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-400">
+                <div class="text-4xl mb-2" aria-hidden="true">{}</div><div>{}</div>
+            </td></tr>"##,
+            icon, message
+        )
+    } else {
+        repos
+            .iter()
+            .map(|repo| {
+                let detail_url =
+                    format!("/ui/{}/{}", registry_type, encode_uri_component(&repo.name));
+                let (display_name, repository) =
+                    friendly_repository_name(registry_type, &repo.name);
+                let repository_badge = repository.map_or_else(String::new, |repository| {
+                    format!(
+                        r#"<span class="text-xs text-slate-400">{}</span>"#,
+                        html_escape(&repository)
+                    )
+                });
+                let item_count = repository_item_count(registry_type, repo);
+                format!(
+                    r##"<tr class="hover:bg-slate-700/50">
+                    <td class="px-3 md:px-6 py-3 md:py-4 min-w-0"><div class="flex flex-col min-w-0"><a href="{}" class="text-blue-400 hover:text-blue-300 font-medium break-all">{}</a>{}</div></td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 text-sm hidden md:table-cell">{}</td>
+                </tr>"##,
+                    detail_url,
+                    html_escape(&display_name),
+                    repository_badge,
+                    item_count,
+                    format_available_size(repo.size, repo.size_available),
+                    html_escape(&repo.updated),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    let next = continuation_token.map_or_else(String::new, |token| {
+        let encoded_query = encode_uri_component(query);
+        let page_url = format!(
+            "/ui/{}?q={}&amp;limit={}&amp;continuation_token={}&amp;lang={}",
+            encode_uri_component(registry_type),
+            encoded_query,
+            limit.clamp(1, 100),
+            html_escape(token),
+            lang.code(),
+        );
+        format!(
+            r##"<a href="{page_url}" class="flex-shrink-0 px-3 py-2 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500">{label} →</a>"##,
+            label = t.next_results,
+        )
+    });
+    let status = search_results_announcement(t, repos.len(), query);
+    format!(
+        r##"<div id="repo-results" data-search-announcement="{status}" aria-busy="false">
+            <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto" role="region" aria-label="{title}" tabindex="0">
+                <table class="w-full"><caption class="sr-only">{title}</caption><thead class="bg-slate-800 border-b border-slate-700"><tr>
+                    <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase">{name}</th>
+                    <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase">{versions}</th>
+                    <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase hidden md:table-cell">{size}</th>
+                    <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase hidden md:table-cell">{updated}</th>
+                </tr></thead><tbody class="divide-y divide-slate-700">{rows}</tbody></table>
+            </div>
+            <div class="mt-4 flex items-center justify-between gap-4 text-sm text-slate-400">
+                <span id="repo-search-status" class="min-w-0 break-all">{status}</span>{next}
+            </div>
+        </div>"##,
+        title = html_escape(title),
+        name = t.name,
+        versions = if registry_type == "maven" {
+            t.maven_items
+        } else {
+            t.versions
+        },
+        size = t.size,
+        updated = t.updated,
+        status = html_escape(&status),
+    )
+}
+
+pub fn render_registry_search_error(
+    registry_type: &str,
+    query: &str,
+    limit: usize,
+    lang: Lang,
+    unavailable: bool,
+) -> String {
+    let t = get_translations(lang);
+    let message = if unavailable {
+        t.search_temporarily_unavailable
+    } else {
+        t.search_results_changed
+    };
+    let page_url = format!(
+        "/ui/{}?q={}&amp;limit={}&amp;lang={}",
+        encode_uri_component(registry_type),
+        encode_uri_component(query),
+        limit.clamp(1, 100),
+        lang.code(),
+    );
+    format!(
+        r#"<div id="repo-results" data-search-announcement="{message}" aria-busy="false">
+            <div role="alert" class="rounded-lg border border-red-700 bg-red-900/20 p-4 text-red-400">
+                <p id="repo-search-status">{message}</p>
+                <a href="{page_url}" class="mt-3 inline-block rounded bg-slate-700 px-3 py-2 text-slate-200 hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500">{reload}</a>
+            </div>
+        </div>"#,
+        message = html_escape(message),
+        reload = t.reload_results,
+    )
+}
+
+fn persistent_search_form(
+    registry_type: &str,
+    placeholder: &str,
+    query: &str,
+    limit: usize,
+    lang: Lang,
+) -> String {
+    format!(
+        r##"<form action="/ui/{registry_type}" method="get" class="relative w-full md:w-auto" role="search">
+            <label for="repository-search" class="sr-only">{placeholder}</label>
+            <input type="hidden" name="limit" value="{limit}">
+            <input type="hidden" name="lang" value="{lang}">
+            <input type="search" id="repository-search" name="q" value="{query}" placeholder="{placeholder}" autocomplete="off"
+                class="w-full md:w-80 pl-10 pr-4 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder-slate-400"
+                aria-controls="repo-results" aria-describedby="repo-search-status"
+                hx-get="/api/ui/{registry_type}/search?limit={limit}&amp;lang={lang}"
+                hx-trigger="input changed delay:300ms, search" hx-sync="this:replace"
+                hx-target="#repo-results" hx-swap="outerHTML">
+            <svg aria-hidden="true" class="absolute left-3 top-2.5 h-5 w-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+        </form>"##,
+        registry_type = encode_uri_component(registry_type),
+        placeholder = html_escape(placeholder),
+        query = html_escape(query),
+        limit = limit.clamp(1, 100),
+        lang = lang.code(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_registry_list_cursor(
+    registry_type: &str,
+    title: &str,
+    repos: &[RepoInfo],
+    limit: usize,
+    continuation_token: Option<&str>,
+    query: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let placeholder = match registry_type {
+        "maven" => t.search_maven,
+        "npm" => t.search_packages,
+        _ => t.search_placeholder,
+    };
+    let search = persistent_search_form(registry_type, placeholder, query, limit, lang);
+    let results = render_registry_search_results(
+        registry_type,
+        title,
+        repos,
+        limit,
+        continuation_token,
+        query,
+        lang,
+    );
+    let status = search_results_announcement(t, repos.len(), query);
+    let content = format!(
+        r##"<div class="mb-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div><h1 class="text-xl md:text-2xl font-bold text-slate-200">{}</h1></div>
+            {search}
+        </div>
+        <p id="repo-search-announcement" role="status" aria-live="polite" aria-atomic="true" class="sr-only">{status}</p>
+        {results}"##,
+        html_escape(title),
+        search = search,
+        status = html_escape(&status),
+        results = results,
+    );
+    layout_dark(title, &content, Some(registry_type), "", lang, auth_enabled)
+}
+
 /// Renders Docker image detail page
 pub fn render_docker_detail(
     name: &str,
@@ -586,9 +1000,15 @@ pub fn render_raw_dir(
         }
     }
 
-    let rows: String = entries
-        .iter()
-        .map(|entry| {
+    let rows: String = if entries.is_empty() {
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-12 text-center text-slate-400">{}</td></tr>"##,
+            t.no_repos_found
+        )
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
             let icon = if entry.is_file {
                 r#"<svg class="w-4 h-4 flex-shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>"#
             } else {
@@ -617,10 +1037,13 @@ pub fn render_raw_dir(
                 </tr>
             "##,
                 href, icon, href, html_escape(&entry.name),
-                versions_display, format_size(entry.size), &entry.updated
+                versions_display,
+                format_available_size(entry.size, entry.size_available),
+                &entry.updated
             )
-        })
-        .collect();
+            })
+            .collect()
+    };
 
     let showing = t.showing_all.replace("{count}", &total.to_string());
 
@@ -690,10 +1113,56 @@ fn registry_search_bar(registry: &str, placeholder: &str) -> String {
 }
 
 /// Renders a Maven namespace directory browser with breadcrumbs
+#[cfg(test)]
 pub fn render_maven_dir(
     path: &str,
     entries: &[RepoInfo],
     total: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    render_maven_dir_inner(path, entries, total, "", 50, lang, auth_enabled)
+}
+
+pub fn render_maven_dir_cursor(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    continuation_token: Option<&str>,
+    limit: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let encoded_path = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let pagination = continuation_token.map_or_else(String::new, |token| {
+        let target = if encoded_path.is_empty() {
+            "/ui/maven".to_string()
+        } else {
+            format!("/ui/maven/{encoded_path}")
+        };
+        format!(
+            r##"<a href="{target}?limit={}&amp;continuation_token={}&amp;lang={}" class="px-3 py-2 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-500">{} →</a>"##,
+            limit.clamp(1, 100),
+            html_escape(token),
+            lang.code(),
+            t.next_results,
+        )
+    });
+    render_maven_dir_inner(path, entries, total, &pagination, limit, lang, auth_enabled)
+}
+
+fn render_maven_dir_inner(
+    path: &str,
+    entries: &[RepoInfo],
+    total: usize,
+    pagination: &str,
+    limit: usize,
     lang: Lang,
     auth_enabled: bool,
 ) -> String {
@@ -705,17 +1174,21 @@ pub fn render_maven_dir(
     if !path.is_empty() {
         let segments: Vec<&str> = path.split('/').collect();
         for (i, seg) in segments.iter().enumerate() {
-            let crumb_path = segments[..=i].join("/");
             if i == segments.len() - 1 {
                 let _ = write!(
                     breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    r#"<span class="mx-2 text-slate-400">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                     html_escape(seg)
                 );
             } else {
+                let crumb_path = segments[..=i]
+                    .iter()
+                    .map(|segment| encode_uri_component(segment))
+                    .collect::<Vec<_>>()
+                    .join("/");
                 let _ = write!(
                     breadcrumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                    r#"<span class="mx-2 text-slate-400">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                     crumb_path,
                     html_escape(seg)
                 );
@@ -728,29 +1201,39 @@ pub fn render_maven_dir(
     let rows: String = entries
         .iter()
         .map(|entry| {
+            let encoded_parent = path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(encode_uri_component)
+                .collect::<Vec<_>>()
+                .join("/");
             let href = if path.is_empty() {
                 format!("/ui/maven/{}", encode_uri_component(&entry.name))
             } else {
-                format!("/ui/maven/{}/{}", path, encode_uri_component(&entry.name))
+                format!(
+                    "/ui/maven/{}/{}",
+                    encoded_parent,
+                    encode_uri_component(&entry.name)
+                )
             };
+            let item_count = repository_item_count("maven", entry);
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700/50">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 hidden md:table-cell">{}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
-                href,
                 folder_icon,
                 href,
                 html_escape(&entry.name),
-                entry.versions,
-                format_size(entry.size),
-                &entry.updated,
+                item_count,
+                format_available_size(entry.size, entry.size_available),
+                html_escape(&entry.updated),
             )
         })
         .collect();
@@ -760,39 +1243,51 @@ pub fn render_maven_dir(
     } else {
         html_escape(path.rsplit('/').next().unwrap_or(path))
     };
-    let showing = t.showing_all.replace("{count}", &total.to_string());
+    let showing = if pagination.is_empty() {
+        t.showing_all.replace("{count}", &total.to_string())
+    } else {
+        t.results_on_page.replace("{count}", &total.to_string())
+    };
+    let search_bar = if path.is_empty() {
+        persistent_search_form("maven", t.search_maven, "", limit, lang)
+    } else {
+        String::new()
+    };
 
     let content = format!(
         r##"
         <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
+            <div class="flex flex-wrap items-center gap-y-1 mb-4 text-sm break-words">{breadcrumbs}</div>
+            <div class="flex items-start min-w-0">
                 <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+                <h1 class="min-w-0 break-all text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
             </div>
         </div>
 
         {search_bar}
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <table class="w-full">
+        <p id="repo-search-announcement" role="status" aria-live="polite" aria-atomic="true" class="sr-only">{showing}</p>
+        <div id="repo-results" data-search-announcement="{showing}" aria-busy="false">
+          <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto" role="region" aria-label="{title}" tabindex="0">
+            <table class="w-full"><caption class="sr-only">{title}</caption>
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
+                        <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_name}</th>
+                        <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_items}</th>
+                        <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_size}</th>
+                        <th scope="col" class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_updated}</th>
                     </tr>
                 </thead>
-                <tbody id="repo-table-body" class="divide-y divide-slate-700">
+                <tbody class="divide-y divide-slate-700">
                     {rows}
                 </tbody>
             </table>
-            <div class="mt-4 mb-4 ml-4 text-sm text-slate-500">{showing}</div>
+          </div>
+          <div class="mt-4 flex items-center justify-between gap-4 text-sm text-slate-400"><span id="repo-search-status">{showing}</span>{pagination}</div>
         </div>
     "##,
         breadcrumbs = breadcrumbs,
-        search_bar = registry_search_bar("maven", "Search Maven artifacts…"),
+        search_bar = search_bar,
         icon = icons::MAVEN,
         title = title_display,
         col_name = t.name,
@@ -801,6 +1296,7 @@ pub fn render_maven_dir(
         col_updated = t.updated,
         rows = rows,
         showing = showing,
+        pagination = pagination,
     );
 
     layout_dark(
@@ -877,7 +1373,7 @@ pub fn render_go_dir(
                 href,
                 html_escape(&entry.name),
                 entry.versions,
-                format_size(entry.size),
+                format_available_size(entry.size, entry.size_available),
                 &entry.updated,
             )
         })
@@ -1078,6 +1574,73 @@ pub fn render_package_detail(
     base_url: &str,
     auth_enabled: bool,
 ) -> String {
+    render_package_detail_inner(
+        registry_type,
+        name,
+        detail,
+        false,
+        false,
+        50,
+        lang,
+        base_url,
+        auth_enabled,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_package_detail_cursor(
+    registry_type: &str,
+    name: &str,
+    detail: &PackageDetail,
+    continuation_token: Option<&str>,
+    limit: usize,
+    show_prerelease: bool,
+    lang: Lang,
+    base_url: &str,
+    auth_enabled: bool,
+) -> String {
+    let pagination = continuation_token.map_or_else(String::new, |token| {
+        let prerelease = if show_prerelease { "&amp;prerelease=true" } else { "" };
+        let label = get_translations(lang).next_versions;
+        format!(
+            r##"<a href="/ui/{}/{}?limit={}&amp;continuation_token={}{}&amp;lang={}" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-blue-500">{} →</a>"##,
+            encode_uri_component(registry_type),
+            encode_uri_component(name),
+            limit.clamp(1, 100),
+            html_escape(token),
+            prerelease,
+            lang.code(),
+            label,
+        )
+    });
+    render_package_detail_inner(
+        registry_type,
+        name,
+        detail,
+        show_prerelease,
+        true,
+        limit,
+        lang,
+        base_url,
+        auth_enabled,
+        &pagination,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_package_detail_inner(
+    registry_type: &str,
+    name: &str,
+    detail: &PackageDetail,
+    show_prerelease: bool,
+    cursor_mode: bool,
+    limit: usize,
+    lang: Lang,
+    base_url: &str,
+    auth_enabled: bool,
+    pagination: &str,
+) -> String {
     let _t = get_translations(lang);
     let icon = get_registry_icon(registry_type);
     let registry_title = get_registry_title(registry_type);
@@ -1090,8 +1653,8 @@ pub fn render_package_detail(
 
     let versions_rows = if detail.versions.is_empty() {
         format!(
-            r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">{}</td></tr>"##,
-            _t.no_repos_found
+            r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-400">{}</td></tr>"##,
+            _t.no_versions_found
         )
     } else {
         detail
@@ -1104,56 +1667,91 @@ pub fn render_package_detail(
                     "\u{2014}".to_string() // em dash
                 };
                 let cached_badge = if v.cached {
-                    r#"<span class="ml-2 px-1.5 py-0.5 text-xs font-medium text-green-400 bg-green-900/30 border border-green-800 rounded">cached</span>"#
+                    format!(
+                        r#"<span class="ml-2 px-1.5 py-0.5 text-xs font-medium text-green-400 bg-green-900/30 border border-green-800 rounded">{}</span>"#,
+                        _t.cached
+                    )
                 } else {
-                    ""
+                    String::new()
+                };
+                let row_class = match registry_type {
+                    "nuget" => "hover:bg-slate-700 cursor-pointer version-row",
+                    "npm" => "hover:bg-slate-700/50 version-row",
+                    _ => "hover:bg-slate-700 version-row",
                 };
                 format!(
                     r##"
-                <tr class="hover:bg-slate-700 cursor-pointer version-row" data-version="{ver}">
+                <tr class="{row_class}" data-version="{ver}">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-2">{icon}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{ver}</span>{badge}</div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{size}</td>
-                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{pub_date}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400 text-sm hidden md:table-cell">{pub_date}</td>
                 </tr>
             "##,
                     ver = html_escape(&v.version),
+                    row_class = row_class,
                     icon = file_icon,
                     badge = cached_badge,
                     size = size_display,
-                    pub_date = &v.published
+                    pub_date = html_escape(&v.published)
                 )
             })
             .collect::<Vec<_>>()
             .join("")
     };
 
-    let prerelease_toggle = if detail.prerelease_count > 0 {
+    let prerelease_toggle = if detail.prerelease_count > 0 && show_prerelease {
         format!(
-            r##"<a href="/ui/{}/{}?prerelease=true" class="text-sm text-blue-400 hover:text-blue-300">+ {} pre-release</a>"##,
-            registry_type,
+            r##"<a href="/ui/{}/{}?limit={}&amp;lang={}" class="text-sm text-blue-400 hover:text-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded">{}</a>"##,
+            encode_uri_component(registry_type),
             encode_uri_component(name),
-            detail.prerelease_count
+            limit.clamp(1, 100),
+            lang.code(),
+            _t.stable_versions,
+        )
+    } else if detail.prerelease_count > 0 {
+        format!(
+            r##"<a href="/ui/{}/{}?prerelease=true&amp;limit={}&amp;lang={}" class="text-sm text-blue-400 hover:text-blue-300 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded">+ {} {}</a>"##,
+            encode_uri_component(registry_type),
+            encode_uri_component(name),
+            limit.clamp(1, 100),
+            lang.code(),
+            detail.prerelease_count,
+            _t.prerelease_versions,
         )
     } else {
         String::new()
     };
 
     // "Show all N stable versions" link when list is truncated
-    let show_all_link = if detail.total_stable > detail.versions.len() {
+    let show_all_link = if !pagination.is_empty() {
+        pagination.to_string()
+    } else if !cursor_mode && detail.total_stable > detail.versions.len() {
         format!(
-            r##"<a href="/ui/{}/{}?all=true" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700">Show all {} stable versions</a>"##,
+            r##"<a href="/ui/{}/{}?all=true" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700">{}</a>"##,
             registry_type,
             encode_uri_component(name),
-            detail.total_stable
+            _t.show_all_stable_versions
+                .replace("{count}", &detail.total_stable.to_string()),
         )
     } else {
         String::new()
     };
 
     let install_cmd = match registry_type {
-        "npm" => format!("npm install {} --registry {}/npm", name, base_url),
+        "npm" => name
+            .strip_prefix("repositories/")
+            .and_then(|rest| rest.split_once('/'))
+            .map_or_else(
+                || format!("npm install {} --registry {}/npm", name, base_url),
+                |(repository, package)| {
+                    format!(
+                        "npm install {} --registry {}/repository/{}",
+                        package, base_url, repository
+                    )
+                },
+            ),
         "cargo" => format!("cargo add {}", name),
         "pypi" => format!("pip install {} --index-url {}/simple", name, base_url),
         "go" => format!("GOPROXY={}/go go get {}", base_url, name),
@@ -1195,7 +1793,18 @@ pub fn render_package_detail(
     };
 
     // Build breadcrumbs — make each path segment clickable for hierarchical names
-    let breadcrumb_html = if registry_type == "ansible" && name.contains('.') {
+    let named_npm = (registry_type == "npm")
+        .then(|| name.strip_prefix("repositories/"))
+        .flatten()
+        .and_then(|rest| rest.split_once('/'));
+    let breadcrumb_html = if let Some((repository, package)) = named_npm {
+        format!(
+            r#"<a href="/ui/npm" class="text-blue-400 hover:text-blue-300">{title}</a><span class="mx-2 text-slate-400">/</span><span class="text-slate-300 break-all">{repository}</span><span class="mx-2 text-slate-400">/</span><span class="text-slate-200 font-medium break-all">{package}</span>"#,
+            title = registry_title,
+            repository = html_escape(repository),
+            package = html_escape(package),
+        )
+    } else if registry_type == "ansible" && name.contains('.') {
         // Ansible: community.general → Ansible Galaxy / community / general
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         let mut crumbs = format!(
@@ -1255,14 +1864,20 @@ pub fn render_package_detail(
         )
     };
 
-    let detail_title = if registry_type == "raw" && name.contains('/') {
+    let detail_title = if registry_type == "npm" {
+        named_npm
+            .map(|(_, package)| html_escape(package))
+            .unwrap_or_else(|| html_escape(name))
+    } else if registry_type == "raw" && name.contains('/') {
         html_escape(name.rsplit('/').next().unwrap_or(name))
     } else {
         html_escape(name)
     };
 
     // Total versions displayed in header
-    let display_total = if detail.total_stable > 0 {
+    let display_total = if show_prerelease {
+        detail.total_stable.saturating_add(detail.prerelease_count)
+    } else if detail.total_stable > 0 {
         detail.total_stable
     } else {
         detail.versions.len()
@@ -1284,10 +1899,6 @@ document.querySelectorAll('.version-row').forEach(function(row) {{
         this.classList.add('bg-slate-700/50');
     }});
 }});
-var copyBtn = document.getElementById('copy-btn');
-if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
-    navigator.clipboard.writeText(this.getAttribute('data-cmd') || this.closest('.bg-\\[\\#1e293b\\]').querySelector('code').textContent);
-}}); }}
 </script>"##,
             name = html_escape(name),
             base = html_escape(base_url),
@@ -1296,37 +1907,67 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         String::new()
     };
 
-    let metadata_panel = render_metadata_panel(&detail.metadata);
+    let copied_message = serde_json::to_string(_t.copied).unwrap_or_else(|_| "\"Copied\"".into());
+    let copy_failed_message =
+        serde_json::to_string(_t.copy_failed).unwrap_or_else(|_| "\"Copy failed\"".into());
+    let copy_js = format!(
+        r##"<script>
+(function() {{
+    var copyBtn = document.getElementById('copy-btn');
+    var copyStatus = document.getElementById('copy-status');
+    var command = document.getElementById('install-cmd');
+    if (!copyBtn || !copyStatus || !command) return;
+    copyBtn.addEventListener('click', async function() {{
+        try {{
+            await navigator.clipboard.writeText(this.getAttribute('data-cmd') || command.textContent || '');
+            copyStatus.textContent = {copied_message};
+        }} catch (_error) {{
+            copyStatus.textContent = {copy_failed_message};
+            var selection = window.getSelection();
+            if (selection) {{
+                var range = document.createRange();
+                range.selectNodeContents(command);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }}
+        }}
+    }});
+}})();
+</script>"##,
+    );
+
+    let metadata_panel = render_metadata_panel(&detail.metadata, _t);
 
     let content = format!(
         r##"
         <div class="mb-6">
-            <div class="flex items-center mb-2 text-sm">
+            <div class="flex flex-wrap items-center gap-y-1 mb-2 text-sm min-w-0">
                 {breadcrumbs}
             </div>
-            <div class="flex items-center">
+            <div class="flex items-start min-w-0">
                 <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+                <h1 class="min-w-0 break-all text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
             </div>
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
             <h2 class="text-lg font-semibold text-slate-200 mb-3">{install_label}</h2>
-            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
-                <code id="install-cmd" class="flex-1 whitespace-nowrap">{cmd}</code>
-                <button id="copy-btn" data-cmd="{cmd}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
+            <div class="flex items-start gap-3 bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm min-w-0">
+                <code id="install-cmd" class="min-w-0 flex-1 whitespace-pre-wrap break-all select-all">{cmd}</code>
+                <button type="button" id="copy-btn" data-cmd="{cmd}" class="p-2 -m-2 text-slate-400 hover:text-white transition-colors flex-shrink-0 rounded focus:outline-none focus:ring-2 focus:ring-blue-500" title="{copy_label}" aria-label="{copy_label}">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
                     </svg>
                 </button>
             </div>
+            <p id="copy-status" role="status" aria-live="polite" aria-atomic="true" class="mt-2 min-h-5 text-sm text-slate-400"></p>
         </div>
 
         {metadata_panel}
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between">
-                <h2 class="text-lg font-semibold text-slate-200">{versions_label} ({total} {total_word})</h2>
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto" role="region" aria-label="{versions_label}" tabindex="0">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex flex-wrap items-center justify-between gap-3">
+                <h2 class="min-w-0 text-lg font-semibold text-slate-200">{versions_label} ({total} {total_word})</h2>
                 {prerelease}
             </div>
             <table class="w-full">
@@ -1344,12 +1985,14 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
             {show_all}
         </div>
         {js}
+        {copy_js}
     "##,
         breadcrumbs = breadcrumb_html,
         icon = icon,
         title = detail_title,
         install_label = _t.install_command,
         cmd = html_escape(&install_cmd),
+        copy_label = _t.copy_to_clipboard,
         metadata_panel = metadata_panel,
         versions_label = if registry_type == "raw" {
             _t.files
@@ -1373,6 +2016,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         rows = versions_rows,
         show_all = show_all_link,
         js = version_js,
+        copy_js = copy_js,
     );
 
     layout_dark(
@@ -1386,20 +2030,70 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
 }
 
 /// Renders Maven artifact detail page
+#[cfg(test)]
 pub fn render_maven_detail(
     path: &str,
     detail: &MavenDetail,
     lang: Lang,
     auth_enabled: bool,
 ) -> String {
-    let _t = get_translations(lang);
+    render_maven_detail_inner(path, detail, "", lang, auth_enabled)
+}
+
+pub fn render_maven_detail_cursor(
+    path: &str,
+    detail: &MavenDetail,
+    continuation_token: Option<&str>,
+    limit: usize,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let encoded_path = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let pagination = continuation_token.map_or_else(String::new, |token| {
+        format!(
+            r##"<a href="/ui/maven/{encoded_path}?view=files&amp;limit={}&amp;continuation_token={}&amp;lang={}" class="block text-center py-3 text-sm text-blue-400 hover:text-blue-300 border-t border-slate-700">{} →</a>"##,
+            limit.clamp(1, 100),
+            html_escape(token),
+            lang.code(),
+            t.next_files,
+        )
+    });
+    render_maven_detail_inner(path, detail, &pagination, lang, auth_enabled)
+}
+
+fn render_maven_detail_inner(
+    path: &str,
+    detail: &MavenDetail,
+    pagination: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let coordinate_path = if detail.download_base.starts_with("/repository/") {
+        path.split_once('/').map_or(path, |(_, rest)| rest)
+    } else {
+        path
+    };
     let artifact_rows = if detail.artifacts.is_empty() {
-        r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-500">No artifacts found</td></tr>"##.to_string()
+        format!(
+            r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-400">{}</td></tr>"##,
+            t.no_artifacts_found
+        )
     } else {
         detail.artifacts.iter().map(|a| {
-            let download_url = format!("/maven2/{}/{}", path, a.filename);
+            let download_url = format!(
+                "{}/{}",
+                detail.download_base,
+                encode_uri_component(&a.filename)
+            );
             format!(r##"
-                <tr class="hover:bg-slate-700">
+                <tr class="hover:bg-slate-700/50">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <a href="{}" class="text-blue-400 hover:text-blue-300 font-mono text-sm">{}</a>
                     </td>
@@ -1410,7 +2104,7 @@ pub fn render_maven_detail(
     };
 
     // Extract artifact name from path (last component before version)
-    let parts: Vec<&str> = path.split('/').collect();
+    let parts: Vec<&str> = coordinate_path.split('/').collect();
     let artifact_name = if parts.len() >= 2 {
         parts[parts.len() - 2]
     } else {
@@ -1433,17 +2127,21 @@ pub fn render_maven_detail(
         r#"<a href="/ui/maven" class="text-blue-400 hover:text-blue-300">Maven</a>"#.to_string();
     let segments: Vec<&str> = path.split('/').collect();
     for (i, seg) in segments.iter().enumerate() {
-        let crumb_path = segments[..=i].join("/");
         if i == segments.len() - 1 {
             let _ = write!(
                 breadcrumbs,
-                r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                r#"<span class="mx-2 text-slate-400">/</span><span class="text-slate-200 font-medium">{}</span>"#,
                 html_escape(seg)
             );
         } else {
+            let crumb_path = segments[..=i]
+                .iter()
+                .map(|segment| encode_uri_component(segment))
+                .collect::<Vec<_>>()
+                .join("/");
             let _ = write!(
                 breadcrumbs,
-                r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
+                r#"<span class="mx-2 text-slate-400">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
                 crumb_path,
                 html_escape(seg)
             );
@@ -1453,41 +2151,48 @@ pub fn render_maven_detail(
     let content = format!(
         r##"
         <div class="mb-6">
-            <div class="flex items-center mb-4 text-sm">{breadcrumbs}</div>
-            <div class="flex items-center">
+            <div class="flex flex-wrap items-center gap-y-1 mb-4 text-sm break-words">{breadcrumbs}</div>
+            <div class="flex items-start min-w-0">
                 <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
-                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+                <h1 class="min-w-0 break-all text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
             </div>
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
-            <h2 class="text-lg font-semibold text-slate-200 mb-3">Maven Dependency</h2>
-            <pre class="bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">{dep_xml}</pre>
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">{dependency_label}</h2>
+            <pre class="bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm whitespace-pre-wrap break-all">{dep_xml}</pre>
         </div>
 
-        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto" role="region" aria-label="{artifacts_label}" tabindex="0">
             <div class="px-3 md:px-6 py-4 border-b border-slate-700">
-                <h2 class="text-lg font-semibold text-slate-200">Artifacts ({count} files)</h2>
+                <h2 class="text-lg font-semibold text-slate-200">{artifacts_label} ({count} {files_label})</h2>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
                     <tr>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Filename</th>
-                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">Size</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{filename_label}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{size_label}</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-700">
                     {rows}
                 </tbody>
             </table>
+            {pagination}
         </div>
     "##,
         breadcrumbs = breadcrumbs,
         icon = icons::MAVEN,
         title = html_escape(path),
         dep_xml = html_escape(&dep_cmd),
+        dependency_label = t.maven_dependency,
+        artifacts_label = t.maven_artifacts,
+        files_label = t.files,
+        filename_label = t.filename,
+        size_label = t.size,
         count = detail.artifacts.len(),
-        rows = artifact_rows
+        rows = artifact_rows,
+        pagination = pagination,
     );
 
     layout_dark(
@@ -1777,7 +2482,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
 
 /// Renders a metadata panel for package detail pages.
 /// Returns empty string if no metadata fields are populated.
-fn render_metadata_panel(meta: &PackageMetadata) -> String {
+fn render_metadata_panel(meta: &PackageMetadata, t: &Translations) -> String {
     if !meta.has_any() {
         return String::new();
     }
@@ -1786,11 +2491,20 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
 
     // Description
     if let Some(ref desc) = meta.description {
-        let _ = write!(
-            inner,
-            r#"<p class="text-slate-300 mb-3">{}</p>"#,
-            html_escape(desc)
-        );
+        let escaped = html_escape(desc);
+        if desc.chars().count() > 600 {
+            let _ = write!(
+                inner,
+                r#"<details class="mb-4"><summary class="cursor-pointer text-slate-300 font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 rounded">{}</summary><div class="mt-3 text-slate-300 whitespace-pre-wrap break-words">{}</div></details>"#,
+                t.package_description, escaped,
+            );
+        } else {
+            let _ = write!(
+                inner,
+                r#"<p class="text-slate-300 mb-3 whitespace-pre-wrap break-words">{}</p>"#,
+                escaped
+            );
+        }
     }
 
     // Info grid: license, author, homepage, repository
@@ -1798,28 +2512,32 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
 
     if let Some(ref license) = meta.license {
         info_items.push(format!(
-            r#"<span class="text-slate-500">License:</span> <span class="text-slate-300">{}</span>"#,
-            html_escape(license)
+            r#"<span class="text-slate-400">{}:</span> <span class="text-slate-300 break-all">{}</span>"#,
+            t.license_label,
+            html_escape(license),
         ));
     }
 
     if let Some(ref author) = meta.author {
         info_items.push(format!(
-            r#"<span class="text-slate-500">Author:</span> <span class="text-slate-300">{}</span>"#,
-            html_escape(author)
+            r#"<span class="text-slate-400">{}:</span> <span class="text-slate-300 break-all">{}</span>"#,
+            t.author_label,
+            html_escape(author),
         ));
     }
 
     if let Some(ref homepage) = meta.homepage {
         if let Some(safe_url) = sanitize_href(homepage) {
             info_items.push(format!(
-                r#"<span class="text-slate-500">Homepage:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+                r#"<span class="text-slate-400">{}:</span> <a href="{}" class="text-blue-400 hover:text-blue-300 break-all" target="_blank" rel="noopener noreferrer">{}</a>"#,
+                t.homepage,
                 html_escape(safe_url),
                 html_escape(safe_url)
             ));
         } else {
             info_items.push(format!(
-                r#"<span class="text-slate-500">Homepage:</span> <span class="text-slate-300">{}</span>"#,
+                r#"<span class="text-slate-400">{}:</span> <span class="text-slate-300 break-all">{}</span>"#,
+                t.homepage,
                 html_escape(homepage)
             ));
         }
@@ -1828,13 +2546,15 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
     if let Some(ref repo) = meta.repository {
         if let Some(safe_url) = sanitize_href(repo) {
             info_items.push(format!(
-                r#"<span class="text-slate-500">Repository:</span> <a href="{}" class="text-blue-400 hover:text-blue-300" target="_blank" rel="noopener">{}</a>"#,
+                r#"<span class="text-slate-400">{}:</span> <a href="{}" class="text-blue-400 hover:text-blue-300 break-all" target="_blank" rel="noopener noreferrer">{}</a>"#,
+                t.repository_label,
                 html_escape(safe_url),
                 html_escape(safe_url)
             ));
         } else {
             info_items.push(format!(
-                r#"<span class="text-slate-500">Repository:</span> <span class="text-slate-300">{}</span>"#,
+                r#"<span class="text-slate-400">{}:</span> <span class="text-slate-300 break-all">{}</span>"#,
+                t.repository_label,
                 html_escape(repo)
             ));
         }
@@ -1873,7 +2593,7 @@ pub fn encode_uri_component(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::api::PackageDetail;
+    use crate::ui::api::{MavenArtifact, PackageDetail};
 
     fn empty_detail() -> PackageDetail {
         PackageDetail {
@@ -1884,25 +2604,118 @@ mod tests {
         }
     }
 
-    // The hierarchical browsers (Maven/Go) must carry the same search contract
-    // as the flat-list pages: a `name="q"` input wired to the registry's search
-    // endpoint and a `#repo-table-body` target. They previously lacked both,
-    // so HTMX search did not work and the UI contract failed.
     #[test]
-    fn maven_dir_has_search_form_and_table_body() {
+    fn index_loading_shell_is_accessible_localized_and_self_refreshing() {
+        let progress = PersistentIndexProgress {
+            phase: PersistentIndexPhase::NpmAuthority,
+            maven_objects: 12_345,
+            npm_objects: 6_789,
+            npm_packages: 140,
+        };
+        let html = render_index_loading("maven", "Maven", Lang::Ru, false, progress);
+        assert!(html.contains("Подготавливаем индекс Maven"));
+        assert!(html.contains("Проверка метаданных пакетов npm"));
+        assert!(html.contains(">12345</dd>"));
+        assert!(html.contains(">6789</dd>"));
+        assert!(html.contains(">140</dd>"));
+        assert!(html.contains("role=\"status\""));
+        assert!(html.contains("aria-live=\"polite\""));
+        assert!(html.contains("id=\"index-loading-status\""));
+        assert!(html.contains("id=\"index-loading-announcement\" class=\"sr-only\""));
+        assert!(html.contains("id=\"index-loading-content\""));
+        assert!(html.contains("aria-busy=\"false\""));
+        assert!(!html.contains("role=\"status\" aria-live=\"polite\" aria-busy"));
+        assert!(!html.contains("aria-valuenow"));
+        assert!(html.contains("hx-get=\"/api/ui/index-status?registry=maven&amp;lang=ru\""));
+        assert!(html.contains("hx-trigger=\"every 2s\""));
+        assert!(html.contains("hx-target=\"this\""));
+        assert!(html.contains("hx-swap=\"outerHTML\""));
+        assert!(html.contains("href=\"/favicon.svg?v="));
+        assert!(html.contains("sizes=\"any\""));
+        assert!(html.contains("prefers-reduced-motion: reduce"));
+
+        let escaped = render_index_loading(
+            "npm",
+            "<script>alert(1)</script>",
+            Lang::En,
+            false,
+            progress,
+        );
+        assert!(!escaped.contains("<script>alert(1)</script>"));
+        assert!(escaped.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    #[test]
+    fn transient_index_failure_renders_a_localized_browser_recovery_page() {
+        let html = render_index_unavailable(
+            "npm",
+            "npm",
+            "/ui/npm?q=%40scope%2Fpkg&lang=ru",
+            Lang::Ru,
+            false,
+        );
+        assert!(html.contains("role=\"alert\""));
+        assert!(html.contains("локальный индекс восстанавливается"));
+        assert!(html.contains("Обновить страницу"));
+        assert!(html.contains("href=\"/ui/npm?q=%40scope%2Fpkg&amp;lang=ru\""));
+    }
+
+    #[test]
+    fn maven_root_search_replaces_results_atomically_and_nested_browse_is_honest() {
         let html = render_maven_dir("", &[], 0, Lang::En, false);
-        assert!(
-            html.contains("name=\"q\""),
-            "maven page missing search input"
+        assert!(html.contains("type=\"search\""));
+        assert!(html.contains("hx-trigger=\"input changed delay:300ms, search\""));
+        assert!(html.contains("hx-sync=\"this:replace\""));
+        assert!(html.contains("hx-target=\"#repo-results\""));
+        assert!(html.contains("hx-swap=\"outerHTML\""));
+        assert!(html.contains("name=\"limit\" value=\"50\""));
+        assert!(html.contains("name=\"lang\" value=\"en\""));
+        assert!(html.contains("id=\"repo-results\""));
+        assert!(html.contains("id=\"repo-search-status\""));
+        assert!(!html.contains("hx-trigger=\"keyup"));
+
+        let search_page = render_registry_list_cursor(
+            "maven",
+            "Maven Repository",
+            &[],
+            50,
+            None,
+            "acme",
+            Lang::En,
+            false,
         );
-        assert!(
-            html.contains("id=\"repo-table-body\""),
-            "maven page missing #repo-table-body"
+        assert!(search_page.contains("placeholder=\"Search all indexed Maven paths...\""));
+        assert!(search_page.contains(">Items</th>"));
+
+        let nested = render_maven_dir("releases/com/acme", &[], 0, Lang::En, false);
+        assert!(!nested.contains("/api/ui/maven/search"));
+        assert!(!nested.contains("id=\"repository-search\""));
+
+        let nested_with_row = render_maven_dir(
+            "releases/com",
+            &[RepoInfo {
+                name: "acme".to_string(),
+                versions: 1,
+                size: 42,
+                size_available: true,
+                updated: "today".to_string(),
+                is_file: false,
+            }],
+            1,
+            Lang::En,
+            false,
         );
-        assert!(
-            html.contains("/api/ui/maven/search"),
-            "maven search not wired to its endpoint"
-        );
+        assert!(nested_with_row.contains("hover:bg-slate-700/50"));
+
+        let paged = render_maven_dir_cursor("", &[], 50, Some("next-token"), 50, Lang::En, false);
+        assert!(paged.contains("50 results on this page"));
+        assert!(!paged.contains("Showing all 50 items"));
+        assert!(paged.contains("Next results →"));
+        assert!(paged.contains("continuation_token=next-token&amp;lang=en"));
+
+        let encoded = render_maven_dir("releases/a b/leaf", &[], 0, Lang::En, false);
+        assert!(encoded.contains("href=\"/ui/maven/releases/a%20b\""));
+        assert!(!encoded.contains("href=\"/ui/maven/releases/a b\""));
     }
 
     #[test]
@@ -1917,6 +2730,71 @@ mod tests {
             html.contains("/api/ui/go/search"),
             "go search not wired to its endpoint"
         );
+    }
+
+    #[test]
+    fn npm_results_hide_internal_prefix_and_keep_query_in_pagination() {
+        let repos = vec![RepoInfo {
+            name: "repositories/npm-private/@scope/pkg".to_string(),
+            versions: 3,
+            size: 42,
+            size_available: true,
+            updated: "today".to_string(),
+            is_file: false,
+        }];
+        let html = render_registry_search_results(
+            "npm",
+            "npm Registry",
+            &repos,
+            50,
+            Some("next-token"),
+            "scope pkg",
+            Lang::En,
+        );
+        assert!(html.contains(">@scope/pkg</a>"));
+        assert!(html.contains(">npm-private</span>"));
+        assert!(!html.contains(">repositories/npm-private/@scope/pkg</a>"));
+        assert!(html.contains("q=scope%20pkg"));
+        assert!(html.contains("continuation_token=next-token"));
+        assert!(html.contains("continuation_token=next-token&amp;lang=en"));
+        assert!(!html.contains("hx-get="));
+        assert!(html.contains("hover:bg-slate-700/50"));
+        assert!(html.contains("data-search-announcement=\"1 result for “scope pkg” on this page\""));
+        assert!(!html.contains("role=\"status\""));
+
+        let changed_query = render_registry_search_results(
+            "npm",
+            "npm Registry",
+            &repos,
+            50,
+            None,
+            "other\"'><script>",
+            Lang::En,
+        );
+        assert!(changed_query.contains(
+            "data-search-announcement=\"1 result for “other&quot;&#39;&gt;&lt;script&gt;” on this page\""
+        ));
+        assert!(!changed_query.contains("<script>"));
+
+        let unknown_maven = vec![RepoInfo {
+            name: "releases".to_string(),
+            versions: 0,
+            size: 0,
+            size_available: false,
+            updated: "N/A".to_string(),
+            is_file: false,
+        }];
+        let maven = render_registry_search_results(
+            "maven",
+            "Maven Repository",
+            &unknown_maven,
+            50,
+            None,
+            "releases",
+            Lang::En,
+        );
+        assert!(maven.contains("—</td>"));
+        assert!(!maven.contains(">0</td>"));
     }
 
     #[test]
@@ -1945,6 +2823,24 @@ mod tests {
             html.contains("https://registry.example.com/npm"),
             "npm install command must use public_url"
         );
+        let html = render_package_detail(
+            "npm",
+            "repositories/npm-group/@scope/pkg",
+            &empty_detail(),
+            Lang::En,
+            base_url,
+            false,
+        );
+        assert!(
+            html.contains(
+                "npm install @scope/pkg --registry https://registry.example.com/repository/npm-group"
+            ),
+            "named npm install command must use the selected repository and real package name"
+        );
+        assert!(
+            !html.contains("npm install repositories/"),
+            "storage-index qualification must not leak into the npm package argument"
+        );
 
         let html = render_package_detail(
             "go",
@@ -1965,6 +2861,102 @@ mod tests {
             html.contains("https://registry.example.com/raw"),
             "Raw download command must use public_url"
         );
+    }
+
+    #[test]
+    fn npm_detail_has_accessible_copy_feedback_and_truthful_prerelease_total() {
+        let detail = PackageDetail {
+            versions: vec![
+                crate::ui::api::VersionInfo {
+                    version: "2.0.0-beta.1".to_string(),
+                    size: 10,
+                    published: "дата<script>alert(1)</script>".to_string(),
+                    cached: true,
+                },
+                crate::ui::api::VersionInfo {
+                    version: "1.0.0".to_string(),
+                    size: 9,
+                    published: "2026-08-10".to_string(),
+                    cached: true,
+                },
+            ],
+            prerelease_count: 1,
+            total_stable: 1,
+            metadata: PackageMetadata {
+                description: Some("line one\n```text\nline two\n```".repeat(30)),
+                homepage: Some("http:///".to_string()),
+                ..PackageMetadata::default()
+            },
+        };
+        let html = render_package_detail_cursor(
+            "npm",
+            "repositories/npm-private/@scope/pkg",
+            &detail,
+            None,
+            50,
+            true,
+            Lang::Ru,
+            "https://registry.example.com",
+            false,
+        );
+        assert!(html.contains("Версии (2 всего)"));
+        assert!(html.contains("aria-label=\"Копировать в буфер обмена\""));
+        assert!(html.contains("id=\"copy-status\" role=\"status\""));
+        assert!(html.contains("Скопировано"));
+        assert!(html.contains("Показать стабильные версии"));
+        assert!(html.contains("?limit=50&amp;lang=ru"));
+        assert!(html.contains("<details"));
+        assert!(html.contains("whitespace-pre-wrap"));
+        assert!(html.contains("hover:bg-slate-700/50 version-row"));
+        assert!(!html.contains("cursor-pointer version-row"));
+        assert!(!html.contains("href=\"http:///\""));
+        assert!(!html.contains("дата<script>alert(1)</script>"));
+        assert!(html.contains("дата&lt;script&gt;alert(1)&lt;/script&gt;"));
+
+        let cargo_html = render_package_detail_cursor(
+            "cargo",
+            "scope/pkg",
+            &detail,
+            None,
+            50,
+            true,
+            Lang::En,
+            "https://registry.example.com",
+            false,
+        );
+        assert!(cargo_html.contains("hover:bg-slate-700 version-row"));
+        assert!(!cargo_html.contains("hover:bg-slate-700/50 version-row"));
+
+        let empty_html = render_package_detail_cursor(
+            "npm",
+            "repositories/npm-private/@scope/prerelease-only",
+            &empty_detail(),
+            None,
+            50,
+            false,
+            Lang::Ru,
+            "https://registry.example.com",
+            false,
+        );
+        assert!(empty_html.contains("В этом режиме версий нет"));
+        assert!(!empty_html.contains("Репозитории не найдены"));
+
+        let mut paged_detail = detail;
+        paged_detail.total_stable = 100;
+        let stable_only = render_package_detail_cursor(
+            "npm",
+            "repositories/npm-private/@scope/pkg",
+            &paged_detail,
+            Some("next-token"),
+            25,
+            false,
+            Lang::En,
+            "https://registry.example.com",
+            false,
+        );
+        assert!(stable_only.contains("?limit=25&amp;continuation_token=next-token&amp;lang=en"));
+        assert!(stable_only.contains("prerelease=true&amp;limit=25&amp;lang=en"));
+        assert!(!stable_only.contains("?all=true"));
     }
 
     #[test]
@@ -2158,5 +3150,45 @@ mod tests {
             !html.contains("writeText('docker pull"),
             "Docker template must not use inline JS string interpolation"
         );
+    }
+
+    #[test]
+    fn named_maven_detail_uses_repository_route_and_coordinate() {
+        let detail = MavenDetail {
+            artifacts: vec![MavenArtifact {
+                filename: "library-1.2.3.jar".to_string(),
+                size: 42,
+            }],
+            download_base: "/repository/maven-releases/com/example/library/1.2.3".to_string(),
+        };
+
+        let html = render_maven_detail(
+            "maven-releases/com/example/library/1.2.3",
+            &detail,
+            Lang::En,
+            false,
+        );
+
+        assert!(
+            html.contains("/repository/maven-releases/com/example/library/1.2.3/library-1.2.3.jar")
+        );
+        assert!(html.contains("hover:bg-slate-700/50"));
+        assert!(html.contains("&lt;groupId&gt;com.example&lt;/groupId&gt;"));
+        assert!(!html.contains("&lt;groupId&gt;repositories.maven-releases"));
+
+        let encoded =
+            render_maven_detail("maven-releases/a b/library/1.2.3", &detail, Lang::En, false);
+        assert!(encoded.contains("href=\"/ui/maven/maven-releases/a%20b\""));
+        assert!(!encoded.contains("href=\"/ui/maven/maven-releases/a b\""));
+
+        let hostile = render_maven_detail(
+            "maven-releases/x\"'><script>/library/1.2.3",
+            &detail,
+            Lang::En,
+            false,
+        );
+        assert!(hostile.contains("href=\"/ui/maven/maven-releases/x%22%27%3E%3Cscript%3E\""));
+        assert!(hostile.contains("x&quot;&#39;&gt;&lt;script&gt;"));
+        assert!(!hostile.contains("x\"'><script>"));
     }
 }

@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.4
 #
+
+ARG NORA_SOURCE_TREE=unknown
+ARG NORA_CARGO_LOCK_SHA256=unknown
 # Multi-stage build for NORA artifact registry.
 # Compiles inside Alpine — musl version always matches runtime.
 #
@@ -23,6 +26,7 @@ WORKDIR /build
 # image's bundled rustc.
 COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml .cargo/config.toml
 COPY nora-registry/ nora-registry/
 
 # Exclude fuzz workspace member (requires C++ libfuzzer, not needed for binary)
@@ -56,6 +60,7 @@ COPY rust-toolchain.toml ./
 RUN rustup target add aarch64-unknown-linux-musl
 
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo/config.toml .cargo/config.toml
 COPY nora-registry/ nora-registry/
 RUN sed -i '/"fuzz"/d' Cargo.toml
 
@@ -72,6 +77,10 @@ COPY --from=cross-arm64 /nora /nora
 
 # ── RED OS (FSTEC-certified, RPM-based) ───────────────────────────────────
 FROM registry.red-soft.ru/ubi8/ubi-minimal AS redos
+ARG NORA_SOURCE_TREE
+ARG NORA_CARGO_LOCK_SHA256
+LABEL io.nora.source-tree="$NORA_SOURCE_TREE" \
+      io.nora.cargo-lock-sha256="$NORA_CARGO_LOCK_SHA256"
 
 RUN microdnf install -y ca-certificates shadow-utils curl \
     && microdnf clean all \
@@ -102,6 +111,10 @@ CMD ["serve"]
 
 # ── Astra Linux SE (FSTEC-certified, Debian-based) ────────────────────────
 FROM registry.astralinux.ru/library/astra/ubi17:latest AS astra
+ARG NORA_SOURCE_TREE
+ARG NORA_CARGO_LOCK_SHA256
+LABEL io.nora.source-tree="$NORA_SOURCE_TREE" \
+      io.nora.cargo-lock-sha256="$NORA_CARGO_LOCK_SHA256"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -133,6 +146,10 @@ CMD ["serve"]
 
 # ── Alpine (default — must be last) ───────────────────────────────────────
 FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+ARG NORA_SOURCE_TREE
+ARG NORA_CARGO_LOCK_SHA256
+LABEL io.nora.source-tree="$NORA_SOURCE_TREE" \
+      io.nora.cargo-lock-sha256="$NORA_CARGO_LOCK_SHA256"
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates \

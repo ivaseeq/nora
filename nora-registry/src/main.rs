@@ -38,7 +38,9 @@ mod import;
 mod metrics;
 mod migrate;
 mod mirror;
+mod npm_layout;
 mod openapi;
+mod proxy_cache_cleanup;
 mod proxy_coalesce;
 mod rate_limit;
 mod registry;
@@ -57,10 +59,20 @@ mod validation;
 mod test_helpers;
 
 use arc_swap::ArcSwap;
-use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
+use axum::{
+    body::Bytes,
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, Method, StatusCode},
+    middleware,
+    response::{IntoResponse, Response},
+    Router,
+};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Instant;
 use tokio::signal;
 use tracing::{error, info, warn};
@@ -77,7 +89,7 @@ use secrets::{expose_opt, ProtectedString};
 pub use storage::Storage;
 use tokens::TokenStore;
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
@@ -186,6 +198,13 @@ enum Commands {
         #[arg(long, default_value = "5")]
         timeout_secs: u64,
     },
+    /// Internal, resource-limited redb open/schema preflight. A full integrity
+    /// scan is added only after an unclean database shutdown.
+    #[command(hide = true)]
+    IndexPreflight {
+        /// Derived index database to inspect without starting the server.
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -211,12 +230,25 @@ enum CurationCommand {
 /// holding a `publish_lock` (handlers never touch `cleanup_lock`).
 pub type PublishLocks = Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
+const PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD: usize = 16_384;
+const BACKGROUND_MUTATION_CONCURRENCY: usize = 32;
+const HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const POST_HTTP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SHUTDOWN_WATCHDOG_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Get or create a per-key publish lock for TOCTOU protection.
 ///
 /// Used by both `AppState::publish_lock()` and GC metadata cleanup to ensure
 /// all metadata writes to the same key are serialized.
 pub fn acquire_publish_lock(locks: &PublishLocks, key: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = locks.lock();
+    if map.len() >= PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD && !map.contains_key(key) {
+        // A background scan can touch many distinct keys before the periodic
+        // maintenance pass runs. Remove only map-owned idle entries; a lock
+        // held or awaited elsewhere has an additional strong reference and is
+        // never evicted, preserving per-key serialization.
+        map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
@@ -243,9 +275,18 @@ pub struct AppState {
     pub docker_auth: Arc<registry::DockerAuth>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
+    /// Shared outbound client with automatic redirects disabled. npm proxy
+    /// tarballs use it so every `Location` hop can be policy-checked before
+    /// credentials or a request are sent to the next URL.
+    pub no_redirect_http_client: reqwest::Client,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
     /// Per-key publish locks for TOCTOU protection (immutable releases)
     publish_locks: PublishLocks,
+    pub(crate) maven_negative_cache: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Successful byte-identical Maven proxy validations. This process-local,
+    /// bounded cache renews positive metadata TTLs without touching S3 bytes.
+    pub(crate) maven_revalidation_cache:
+        Arc<parking_lot::Mutex<HashMap<String, (std::time::Instant, [u8; 32])>>>,
     /// Hot-reloadable curation config (swapped atomically on SIGHUP).
     pub reloadable: Arc<ArcSwap<ReloadableConfig>>,
     /// Per-IP failed auth attempt tracker for brute-force protection
@@ -253,10 +294,11 @@ pub struct AppState {
     /// OIDC validator for workload identity (CI/CD)
     pub oidc: Option<Arc<auth::OidcValidator>>,
     pub(crate) circuit_breaker: Arc<circuit_breaker::CircuitBreakerRegistry>,
-    /// Single-flight coalescer for the proxy cache-miss path: collapses a
-    /// thundering herd of concurrent requests for the same key into one
-    /// upstream fetch (#595). In-memory and rebuildable (empty after restart).
+    /// Single-flight coalescer for proxy cache misses. In-memory and
+    /// rebuildable; immutable cached bytes remain authoritative in storage.
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
+    /// Durable, bounded access tracking for configured Maven/npm proxy caches.
+    pub(crate) proxy_cache_access: Option<proxy_cache_cleanup::ProxyCacheAccess>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
@@ -265,9 +307,54 @@ pub struct AppState {
     /// Shared shutdown signal so on-demand background tasks (e.g. the admin
     /// reindex warm-up) stop promptly on SIGTERM/SIGINT (#306).
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// On-demand cache materialization can outlive the response that spawned
+    /// it. Track those S3/redb mutation producers independently from periodic
+    /// schedulers so normal shutdown drains them before closing the index.
+    pub background_mutations: tokio_util::task::TaskTracker,
+    /// Abort handles for the fixed-concurrency background mutation set. The
+    /// tracker provides graceful drain; these handles provide a hard async
+    /// cancellation boundary when the shared shutdown deadline expires.
+    pub background_mutation_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Monotonic process-session latch. Any abnormal shutdown boundary or
+    /// background mutation panic can leave an S3 request with an unknown
+    /// outcome, so the persistent derived index must close unclean and run an
+    /// authoritative reconcile on the next startup.
+    pub(crate) startup_reconcile_required: Arc<AtomicBool>,
+    /// Admission control for optional proxy-cache materialization. A waiting
+    /// task per cache miss would merely move the unbounded queue into Tokio.
+    pub(crate) background_mutation_permits: Arc<tokio::sync::Semaphore>,
+    /// Set before graceful HTTP drain begins. Readiness must fail immediately
+    /// so Service endpoints stop admitting new work while in-flight requests
+    /// finish.
+    pub draining: Arc<AtomicBool>,
 }
 
 impl AppState {
+    fn spawn_background_mutation(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let startup_reconcile_required = Arc::clone(&self.startup_reconcile_required);
+        let handle =
+            self.background_mutations
+                .spawn(std::panic::AssertUnwindSafe(task).catch_unwind().map(
+                move |result| {
+                    if let Err(panic) = result {
+                        startup_reconcile_required.store(true, Ordering::Release);
+                        tracing::error!(
+                            panic = ?panic,
+                            "background storage mutation panicked; next startup must reconcile"
+                        );
+                    }
+                },
+            ));
+        let abort = handle.abort_handle();
+        drop(handle);
+        let mut handles = self.background_mutation_aborts.lock();
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(abort);
+    }
+
     /// Load a snapshot of the current curation engine (lock-free read via ArcSwap).
     pub fn curation(&self) -> arc_swap::Guard<Arc<ReloadableConfig>> {
         self.reloadable.load()
@@ -287,46 +374,198 @@ impl AppState {
         acquire_publish_lock(&self.publish_locks, key)
     }
 
-    /// Background-cache proxy data and invalidate the registry index.
+    /// Queue a cache access while the caller holds `publish_lock(key)`.
+    pub async fn record_proxy_cache_access_locked(&self, key: &str) {
+        if let Some(access) = &self.proxy_cache_access {
+            access.record_locked(key).await;
+        }
+    }
+
+    /// Background-cache proxy data and publish the narrowest available index
+    /// invalidation after the storage write completes.
     ///
     /// Use for ALL proxy caching instead of manual `tokio::spawn` + `storage.put`.
-    /// Guarantees that `repo_index.invalidate()` is called AFTER the write completes,
-    /// avoiding the race condition where invalidation fires before the file lands on S3.
+    /// Guarantees that invalidation is called AFTER the write completes,
+    /// avoiding the race where an index repair runs before the file lands on S3.
     pub fn spawn_cache(&self, registry: &'static str, key: String, data: Bytes) {
+        let Ok(permit) = Arc::clone(&self.background_mutation_permits).try_acquire_owned() else {
+            metrics::BACKGROUND_CACHE_DROPPED_TOTAL
+                .with_label_values(&[registry])
+                .inc();
+            tracing::debug!(
+                registry,
+                "background cache writer saturated; cache write skipped"
+            );
+            return;
+        };
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
-        );
+        let publish_locks = self.publish_locks.clone();
+        self.spawn_background_mutation(async move {
+            let _permit = permit;
+            let lock = acquire_publish_lock(&publish_locks, &key);
+            let _guard = lock.lock().await;
+            if storage.put(&key, &data).await.is_ok() {
+                repo_index.invalidate_cached_path(registry, &key);
+            }
+        });
     }
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
     pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
+        let Ok(permit) = Arc::clone(&self.background_mutation_permits).try_acquire_owned() else {
+            metrics::BACKGROUND_CACHE_DROPPED_TOTAL
+                .with_label_values(&[registry])
+                .inc();
+            tracing::debug!(
+                registry,
+                "background cache writer saturated; cache write skipped"
+            );
+            return;
+        };
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
+        let publish_locks = self.publish_locks.clone();
+        self.spawn_background_mutation(async move {
+            let _permit = permit;
+            let lock = acquire_publish_lock(&publish_locks, &key);
+            let _guard = lock.lock().await;
+            cache_immutable(&storage, &repo_index, registry, &key, &data).await;
+        });
+    }
+}
+
+/// Atomically populate an immutable cache entry. A separate existence check
+/// would leave a stat-then-put race in which two cold misses can both win and
+/// the later ordinary PUT overwrites the first response.
+async fn cache_immutable(
+    storage: &Storage,
+    repo_index: &RepoIndex,
+    registry: &'static str,
+    key: &str,
+    data: &[u8],
+) {
+    match storage.put_if_absent(key, data).await {
+        Ok(()) | Err(storage::StorageError::AlreadyExists) => {
+            // An exact retry after S3 committed but redb did not must repair
+            // the existing object's derived row too. The semantic update
+            // rereads S3, so it indexes the winner rather than trusting the
+            // retry candidate bytes.
+            repo_index.invalidate_cached_path(registry, key);
+        }
+        Err(error) => tracing::warn!(%key, %error, "immutable cache create failed"),
+    }
+}
+
+#[cfg(test)]
+mod immutable_cache_tests {
+    use super::{cache_immutable, BACKGROUND_MUTATION_CONCURRENCY};
+    use crate::storage::Storage;
+    use crate::test_helpers::{create_test_context, FaultInjectBackend};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn concurrent_cold_misses_cannot_overwrite_immutable_cache_bytes() {
+        let ctx = create_test_context();
+        let key = "go/cache/example/@v/v1.0.0.zip";
+        let backend = FaultInjectBackend::new(ctx.state.storage.clone())
+            .barrier_writes(key, Arc::new(tokio::sync::Barrier::new(2)));
+        let successful_writes = backend.successful_writes();
+        let storage = Storage::from_backend(Arc::new(backend));
+
+        tokio::join!(
+            cache_immutable(
+                &storage,
+                &ctx.state.repo_index,
+                "go",
+                key,
+                b"first candidate"
+            ),
+            cache_immutable(
+                &storage,
+                &ctx.state.repo_index,
+                "go",
+                key,
+                b"second candidate"
+            )
         );
+
+        assert_eq!(
+            successful_writes.lock().as_slice(),
+            &[format!("create:{key}")],
+            "exactly one conditional create may publish immutable bytes"
+        );
+        let stored = storage.get(key).await.unwrap();
+        assert!(
+            stored.as_ref() == b"first candidate" || stored.as_ref() == b"second candidate",
+            "stored bytes must equal one contender and must never be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_cache_admission_does_not_create_unbounded_waiters() {
+        let ctx = create_test_context();
+        let all_permits = Arc::clone(&ctx.state.background_mutation_permits)
+            .acquire_many_owned(BACKGROUND_MUTATION_CONCURRENCY as u32)
+            .await
+            .unwrap();
+
+        for index in 0..(BACKGROUND_MUTATION_CONCURRENCY * 4) {
+            ctx.state.spawn_cache(
+                "maven",
+                format!("maven/cache/saturated-{index}.pom"),
+                axum::body::Bytes::from_static(b"optional"),
+            );
+        }
+        assert_eq!(
+            ctx.state.background_mutations.len(),
+            0,
+            "saturated admission must reject before spawning waiting tasks"
+        );
+
+        drop(all_permits);
+        let admitted_key = "maven/cache/admitted.pom";
+        ctx.state.spawn_cache(
+            "maven",
+            admitted_key.to_string(),
+            axum::body::Bytes::from_static(b"cached"),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if ctx.state.storage.get(admitted_key).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one released permit must admit a cache task");
+        assert_eq!(
+            ctx.state.storage.get(admitted_key).await.unwrap(),
+            b"cached"[..]
+        );
+    }
+}
+
+#[cfg(test)]
+mod publish_lock_tests {
+    use super::{acquire_publish_lock, PublishLocks, PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn opportunistic_prune_removes_only_idle_lock_entries() {
+        let locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        for index in 0..PUBLISH_LOCK_IDLE_PRUNE_THRESHOLD {
+            drop(acquire_publish_lock(&locks, &format!("idle-{index}")));
+        }
+        let active = acquire_publish_lock(&locks, "idle-0");
+        let inserted = acquire_publish_lock(&locks, "new-key");
+
+        let map = locks.lock();
+        assert_eq!(map.len(), 2);
+        assert!(Arc::ptr_eq(map.get("idle-0").unwrap(), &active));
+        assert!(Arc::ptr_eq(map.get("new-key").unwrap(), &inserted));
     }
 }
 
@@ -386,8 +625,13 @@ fn build_http_client(
     tls: &TlsConfig,
     timeout: Option<std::time::Duration>,
     no_proxy: bool,
+    follow_redirects: bool,
 ) -> reqwest::Client {
     let mut builder = reqwest::ClientBuilder::new().user_agent(USER_AGENT);
+
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
 
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -459,6 +703,7 @@ async fn run_healthcheck(timeout_secs: u64) -> i32 {
     let client = build_http_client(
         &TlsConfig::default(),
         Some(std::time::Duration::from_secs(timeout_secs)),
+        true,
         true,
     );
     match client.get(&url).send().await {
@@ -587,7 +832,28 @@ async fn main() {
         std::process::exit(run_healthcheck(*timeout_secs).await);
     }
 
+    if let Some(Commands::IndexPreflight { path }) = &cli.command {
+        // The parent treats inability to establish the sandbox as an
+        // unclassified failure and preserves the database. Both limits are
+        // intentionally independent of the server pod's much larger limit.
+        let address_space = rustix::process::Rlimit {
+            current: Some(1024 * 1024 * 1024),
+            maximum: Some(1024 * 1024 * 1024),
+        };
+        let stack = rustix::process::Rlimit {
+            current: Some(16 * 1024 * 1024),
+            maximum: Some(16 * 1024 * 1024),
+        };
+        if rustix::process::setrlimit(rustix::process::Resource::As, address_space).is_err()
+            || rustix::process::setrlimit(rustix::process::Resource::Stack, stack).is_err()
+        {
+            std::process::exit(repo_index::ChildPreflight::Failed.exit_code());
+        }
+        std::process::exit(repo_index::preflight_database(path).exit_code());
+    }
+
     let config = Config::load();
+    let object_store_options = config.storage.object_store_options();
 
     // Initialize storage based on mode
     let storage = match config.storage.mode {
@@ -608,13 +874,14 @@ async fn main() {
                     "Using S3 storage"
                 );
             }
-            Storage::new_s3(
+            Storage::new_s3_with_options(
                 &config.storage.s3_url,
                 &config.storage.bucket,
                 &config.storage.s3_region,
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
                 config.storage.s3_virtual_hosted,
+                object_store_options,
             )
         }
         StorageMode::Gcs => {
@@ -626,10 +893,11 @@ async fn main() {
                     "Using Google Cloud Storage"
                 );
             }
-            Storage::new_gcs(
+            Storage::new_gcs_with_options(
                 &config.storage.bucket,
                 config.storage.gcs_service_account_path.as_deref(),
                 config.storage.gcs_base_url.as_deref(),
+                object_store_options,
             )
         }
     };
@@ -696,12 +964,14 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Dry-run: plans only, no deletions and no index regeneration —
             // no signer needed.
-            let result = retention::run_retention(
+            let result = retention::run_retention_configured(
                 &storage,
                 &cli_publish_locks,
                 None,
                 &config.retention.rules,
                 true,
+                &config.maven,
+                None,
             )
             .await;
             println!("Retention Plan (dry-run):");
@@ -726,12 +996,14 @@ async fn main() {
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             if !yes {
                 // Show plan first, require --yes to execute
-                let result = retention::run_retention(
+                let result = retention::run_retention_configured(
                     &storage,
                     &cli_publish_locks,
                     None,
                     &config.retention.rules,
                     true,
+                    &config.maven,
+                    None,
                 )
                 .await;
                 println!("Retention Plan:");
@@ -759,12 +1031,14 @@ async fn main() {
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
                 let signer = build_signer(&config, &config.enabled_registries());
-                let result = retention::run_retention(
+                let result = retention::run_retention_configured(
                     &storage,
                     &cli_publish_locks,
                     signer.as_deref(),
                     &config.retention.rules,
                     false,
+                    &config.maven,
+                    None,
                 )
                 .await;
                 println!("Retention Applied:");
@@ -798,6 +1072,7 @@ async fn main() {
                 &config.tls,
                 Some(std::time::Duration::from_secs(300)),
                 false,
+                true,
             );
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
@@ -808,18 +1083,20 @@ async fn main() {
         Some(Commands::Migrate { from, to, dry_run }) => {
             let source = match from.as_str() {
                 "local" => Storage::new_local(&config.storage.path),
-                "s3" => Storage::new_s3(
+                "s3" => Storage::new_s3_with_options(
                     &config.storage.s3_url,
                     &config.storage.bucket,
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    object_store_options,
                 ),
-                "gcs" => Storage::new_gcs(
+                "gcs" => Storage::new_gcs_with_options(
                     &config.storage.bucket,
                     config.storage.gcs_service_account_path.as_deref(),
                     config.storage.gcs_base_url.as_deref(),
+                    object_store_options,
                 ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local', 's3', or 'gcs'", from);
@@ -829,18 +1106,20 @@ async fn main() {
 
             let dest = match to.as_str() {
                 "local" => Storage::new_local(&config.storage.path),
-                "s3" => Storage::new_s3(
+                "s3" => Storage::new_s3_with_options(
                     &config.storage.s3_url,
                     &config.storage.bucket,
                     &config.storage.s3_region,
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    object_store_options,
                 ),
-                "gcs" => Storage::new_gcs(
+                "gcs" => Storage::new_gcs_with_options(
                     &config.storage.bucket,
                     config.storage.gcs_service_account_path.as_deref(),
                     config.storage.gcs_base_url.as_deref(),
+                    object_store_options,
                 ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local', 's3', or 'gcs'", to);
@@ -959,6 +1238,7 @@ async fn main() {
         // Handled before storage init by the early dispatch above; the process
         // has already exited by the time control would reach here.
         Some(Commands::Healthcheck { .. }) => unreachable!(),
+        Some(Commands::IndexPreflight { .. }) => unreachable!(),
     }
 }
 
@@ -1431,7 +1711,8 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Warn about plaintext credentials in config.toml
     config.warn_plaintext_credentials();
 
-    let http_client = build_http_client(&config.tls, None, false);
+    let http_client = build_http_client(&config.tls, None, false, true);
+    let no_redirect_http_client = build_http_client(&config.tls, None, false, false);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -1463,6 +1744,14 @@ async fn run_server(mut config: Config, storage: Storage) {
     // NORA_REGISTRIES_ENABLE / [registries].enable mounts the routes but leaves
     // the flags at their defaults, so rpm/deb 404. (#856)
     config.apply_enabled_registries(&enabled_registries);
+
+    let repo_index = RepoIndex::open_persistent(&config, &enabled_registries, storage.clone())
+        .await
+        .unwrap_or_else(|error| {
+            error!(%error, "Cannot open the persistent Maven/npm index");
+            std::process::exit(1);
+        });
+    storage.set_mutation_observer(repo_index.clone());
 
     // Make the enabled set available to the UI sidebar so its nav lists exactly
     // the enabled registries (matching the dashboard body). Set once, immutable.
@@ -1506,6 +1795,11 @@ async fn run_server(mut config: Config, storage: Storage) {
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
         }
+    }
+    if enabled_registries.contains(&RegistryType::Maven)
+        || enabled_registries.contains(&RegistryType::Npm)
+    {
+        registry_routes = registry_routes.merge(registry::named_repository_routes());
     }
 
     // Routes WITHOUT rate limiting (health, metrics, UI)
@@ -1580,6 +1874,23 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let proxy_cache_access = if config.proxy_cache_cleanup.enabled {
+        Some(
+            proxy_cache_cleanup::ProxyCacheAccess::start_session(
+                storage.clone(),
+                publish_locks.clone(),
+            )
+            .await
+            .expect("Failed to start durable proxy-cache access session"),
+        )
+    } else {
+        proxy_cache_cleanup::ProxyCacheAccess::mark_tracking_disabled(&storage)
+            .await
+            .expect("Failed to invalidate disabled proxy-cache access tracking state");
+        None
+    };
+
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -1592,35 +1903,61 @@ async fn run_server(mut config: Config, storage: Storage) {
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
-        repo_index: Arc::new(RepoIndex::new()),
+        repo_index,
         http_client,
+        no_redirect_http_client,
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
-        publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        publish_locks,
+        maven_negative_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        maven_revalidation_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         reloadable,
         auth_failures: Arc::new(auth::AuthFailureTracker::new(5, 900)),
         oidc: oidc_validator.map(Arc::new),
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
+        proxy_cache_access,
         digest_store,
         signer,
         leak_finders,
         cancel_token: cancel_token.clone(),
+        background_mutations: tokio_util::task::TaskTracker::new(),
+        background_mutation_aborts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        startup_reconcile_required: Arc::new(AtomicBool::new(false)),
+        background_mutation_permits: Arc::new(tokio::sync::Semaphore::new(
+            BACKGROUND_MUTATION_CONCURRENCY,
+        )),
+        draining: Arc::new(AtomicBool::new(false)),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for all registries (#441)
     let registry_names: Vec<&str> = RegistryType::all().iter().map(|rt| rt.as_str()).collect();
     state.circuit_breaker.init_gauges(&registry_names);
 
-    // Shared lock: GC and Retention must not run concurrently (both call storage.delete)
+    // Shared lock: GC, retention and proxy-cache cleanup must not run concurrently.
     let cleanup_lock = Arc::new(tokio::sync::Mutex::new(()));
 
     let mut scheduler_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    if let Some(handle) = state.repo_index.start_background(
+        state.storage.clone(),
+        state.enabled_registries.iter().copied(),
+        cancel_token.clone(),
+    ) {
+        scheduler_handles.push(handle);
+    }
+    if let Some(handle) = state
+        .repo_index
+        .start_persistent_background(state.storage.clone(), cancel_token.clone())
+    {
+        scheduler_handles.push(handle);
+    }
 
     // Spawn background GC scheduler if enabled
     if state.config.gc.enabled {
         let handle = gc::spawn_gc_scheduler(
             state.storage.clone(),
             state.publish_locks.clone(),
+            state.repo_index.clone(),
             state.config.gc.interval,
             state.config.gc.dry_run,
             state.config.gc.grace_secs,
@@ -1636,11 +1973,17 @@ async fn run_server(mut config: Config, storage: Storage) {
     }
 
     // Spawn background retention scheduler if enabled
-    if state.config.retention.enabled && !state.config.retention.rules.is_empty() {
+    // An enabled retention scheduler must also recover durable npm
+    // maintenance operations left by an interrupted earlier run. Recovery is
+    // independent of the current rule set, so an empty/changed rule list must
+    // not prevent the boot pass from resuming those operations.
+    if state.config.retention.enabled {
         let handle = retention::spawn_retention_scheduler(
             state.storage.clone(),
             state.publish_locks.clone(),
             state.signer.clone(),
+            state.config.maven.clone(),
+            state.repo_index.clone(),
             state.config.retention.rules.clone(),
             state.config.retention.interval,
             state.config.retention.dry_run,
@@ -1654,6 +1997,26 @@ async fn run_server(mut config: Config, storage: Storage) {
             rules = state.config.retention.rules.len(),
             dry_run = state.config.retention.dry_run,
             "Retention scheduler started"
+        );
+    }
+
+    if let Some(access) = state.proxy_cache_access.clone() {
+        scheduler_handles.push(access.spawn_worker(cancel_token.clone()));
+        scheduler_handles.push(proxy_cache_cleanup::spawn_proxy_cache_cleanup_scheduler(
+            state.storage.clone(),
+            state.publish_locks.clone(),
+            state.repo_index.clone(),
+            state.config.clone(),
+            access,
+            cleanup_lock.clone(),
+            cancel_token.clone(),
+        ));
+        info!(
+            interval_secs = state.config.proxy_cache_cleanup.interval_secs,
+            min_cache_age_secs = state.config.proxy_cache_cleanup.min_cache_age_secs,
+            min_idle_secs = state.config.proxy_cache_cleanup.min_idle_secs,
+            dry_run = state.config.proxy_cache_cleanup.dry_run,
+            "Proxy-cache cleanup scheduler started"
         );
     }
 
@@ -1686,7 +2049,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         // Middleware layer order — LOAD-BEARING, do not reorder (#542).
         //
         // In axum, last .layer() = outermost (runs first). Execution order:
-        //   reject_null_bytes → metrics → auth → leak_detection → request_id → handler
+        //   reject_null_bytes → metrics → drain gate → auth → leak_detection
+        //   → request_id → handler
         //
         // reject_null_bytes MUST be outermost to block null-byte path attacks
         // before any processing occurs.
@@ -1709,7 +2073,14 @@ async fn run_server(mut config: Config, storage: Storage) {
             state.clone(),
             auth::auth_middleware,
         ))
-        .layer(middleware::from_fn(metrics::metrics_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            reject_new_mutations_while_draining,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::metrics_middleware,
+        ))
         .layer(middleware::from_fn(validation::reject_null_bytes_middleware))
         .with_state(state.clone());
 
@@ -1760,11 +2131,15 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Background task: flush token last_used + periodic maintenance every 30 seconds
     let metrics_state = state.clone();
-    tokio::spawn(async move {
+    let metrics_cancel = cancel_token.clone();
+    let metrics_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut tick_count: u64 = 0;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = metrics_cancel.cancelled() => return,
+                _ = interval.tick() => {}
+            }
             tick_count += 1;
             if let Some(ref token_store) = metrics_state.tokens {
                 token_store.flush_last_used().await;
@@ -1773,16 +2148,13 @@ async fn run_server(mut config: Config, storage: Storage) {
             metrics_state.auth_failures.cleanup();
 
             // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-            // boot pass runs right away: object-store reachability (#869) and the storage
-            // gauge are populated before the first readiness probe, not 30s in).
+            // boot pass runs right away). Reachability is a one-result probe with
+            // its own short wall-time bound.
             if !tick_count.is_multiple_of(2) {
-                metrics_state.storage.refresh_total_size_cache().await;
-                metrics::STORAGE_BYTES
-                    .with_label_values(&["total"])
-                    .set(metrics_state.storage.total_size().await as i64);
+                metrics_state.storage.refresh_reachability_cache().await;
                 // Per-registry artifact counts + logical bytes from the cached index,
-                // plus process uptime (#446). The "total" storage_bytes label above is
-                // the full physical footprint; per-registry is summed artifact size.
+                // plus process uptime (#446). Per-registry values come only from
+                // published background snapshots.
                 for (rt, count) in metrics_state.repo_index.counts() {
                     metrics::ARTIFACTS_TOTAL
                         .with_label_values(&[rt.as_str()])
@@ -1815,16 +2187,21 @@ async fn run_server(mut config: Config, storage: Storage) {
             }
         }
     });
+    scheduler_handles.push(metrics_handle);
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
     {
         let reload_state = state.clone();
-        tokio::spawn(async move {
+        let reload_cancel = cancel_token.clone();
+        let reload_handle = tokio::spawn(async move {
             let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
                 .expect("Failed to install SIGHUP handler");
             loop {
-                sighup.recv().await;
+                tokio::select! {
+                    _ = reload_cancel.cancelled() => return,
+                    _ = sighup.recv() => {}
+                }
                 info!("SIGHUP received — reloading curation policy");
                 match reload_curation(&reload_state) {
                     Ok(()) => info!("Curation policy reloaded successfully"),
@@ -1834,39 +2211,156 @@ async fn run_server(mut config: Config, storage: Storage) {
                 }
             }
         });
+        scheduler_handles.push(reload_handle);
     }
 
-    // Graceful shutdown on SIGTERM/SIGINT
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .expect("Server error");
+    // Graceful shutdown on SIGTERM/SIGINT. Bound the HTTP drain separately
+    // from post-request index/audit cleanup so a slow client cannot consume the
+    // entire Kubernetes termination grace period.
+    let shutdown_started = tokio_util::sync::CancellationToken::new();
+    let signal_handle = tokio::spawn(shutdown_signal(
+        Arc::clone(&state.draining),
+        shutdown_started.clone(),
+    ));
+    let graceful_token = shutdown_started.clone();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_token.cancelled_owned()),
+    );
+    tokio::pin!(server);
+    let server_result = tokio::select! {
+        result = &mut server => Some(result),
+        _ = shutdown_started.cancelled() => {
+            match tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut server).await {
+                Ok(result) => Some(result),
+                Err(_) => {
+                    state
+                        .startup_reconcile_required
+                        .store(true, Ordering::Release);
+                    warn!(timeout_secs = HTTP_DRAIN_TIMEOUT.as_secs(), "HTTP drain timed out; closing remaining connections");
+                    None
+                }
+            }
+        }
+    };
+    if !shutdown_started.is_cancelled() {
+        state
+            .startup_reconcile_required
+            .store(true, Ordering::Release);
+        warn!("HTTP server stopped outside the normal drain path; next startup must reconcile");
+    }
+    if !signal_handle.is_finished() {
+        signal_handle.abort();
+    }
+    let _ = signal_handle.await;
+    if let Some(result) = server_result {
+        result.expect("Server error");
+    }
+
+    let post_shutdown_deadline = tokio::time::Instant::now() + POST_HTTP_SHUTDOWN_TIMEOUT;
+    // Tokio cannot cancel a filesystem syscall already running in
+    // spawn_blocking, and a wedged PVC can therefore also wedge runtime drop.
+    // Leave the process-level watchdog unacknowledged: a normal process exits
+    // before it fires, while a stuck runtime is terminated before Kubernetes'
+    // larger termination grace period expires. The next boot reconciles the
+    // derived index from authoritative S3 state.
+    arm_shutdown_watchdog(POST_HTTP_SHUTDOWN_TIMEOUT + SHUTDOWN_WATCHDOG_MARGIN);
 
     // Signal background schedulers to stop and wait for them (#306)
     cancel_token.cancel();
+    let mut schedulers_stopped_cleanly = true;
     if !scheduler_handles.is_empty() {
         info!("Waiting for background schedulers to finish (10s timeout)...");
-        let join_all = futures::future::join_all(scheduler_handles);
-        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout,
-        // the JoinHandles are dropped which cancels the spawned tasks — this is
-        // intentional since we're shutting down and don't need their results.
-        if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
-            .await
-            .is_err()
-        {
-            warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
+        schedulers_stopped_cleanly = stop_background_schedulers(
+            scheduler_handles,
+            shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(10)),
+        )
+        .await;
+        if !schedulers_stopped_cleanly {
+            state
+                .startup_reconcile_required
+                .store(true, Ordering::Release);
+            warn!("Background schedulers did not stop cleanly; next startup must reconcile");
         }
     }
 
+    if schedulers_stopped_cleanly {
+        if let Some(access) = &state.proxy_cache_access {
+            if tokio::time::timeout(
+                shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(10)),
+                access.close_clean_session(),
+            )
+            .await
+            .is_err()
+            {
+                warn!("Proxy-cache clean-session close timed out; next boot will recover conservatively");
+            }
+        }
+    }
+
+    // Axum has drained request handlers, so close admission and wait for cache
+    // writes that outlive their response. A timeout is recoverable: S3 remains
+    // authoritative and the next startup reconciliation closes the gap.
+    state.background_mutations.close();
+    if tokio::time::timeout(
+        shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(30)),
+        state.background_mutations.wait(),
+    )
+    .await
+    .is_err()
+    {
+        state
+            .startup_reconcile_required
+            .store(true, Ordering::Release);
+        warn!(
+            active = state.background_mutations.len(),
+            "Background storage mutations did not drain within 30s; next startup must reconcile"
+        );
+        let handles = std::mem::take(&mut *state.background_mutation_aborts.lock());
+        for handle in handles {
+            handle.abort();
+        }
+        let _ = tokio::time::timeout(
+            shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(2)),
+            state.background_mutations.wait(),
+        )
+        .await;
+    }
+
+    // Break the observer edge before stopping the writer so a late best-effort
+    // cache task cannot enqueue onto a stopped redb actor.
+    state.storage.clear_mutation_observer();
+    let allow_clean_index_shutdown = !state.startup_reconcile_required.load(Ordering::Acquire);
+    state
+        .repo_index
+        .shutdown_persistent_until(post_shutdown_deadline, allow_clean_index_shutdown)
+        .await;
+
     // Drain audit log — AFTER schedulers finish so their final entries are captured (#543)
-    state.audit.shutdown().await;
+    if tokio::time::timeout(
+        shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(10)),
+        state.audit.shutdown(),
+    )
+    .await
+    .is_err()
+    {
+        warn!("Audit writer did not drain before the shared shutdown deadline");
+    }
 
     // Flush token last_used timestamps to disk
     if let Some(ref token_store) = state.tokens {
-        token_store.flush_last_used().await;
+        if tokio::time::timeout(
+            shutdown_stage_timeout(post_shutdown_deadline, std::time::Duration::from_secs(10)),
+            token_store.flush_last_used(),
+        )
+        .await
+        .is_err()
+        {
+            warn!("Token last-used flush did not finish before the shared shutdown deadline");
+        }
     }
 
     info!(
@@ -1875,8 +2369,149 @@ async fn run_server(mut config: Config, storage: Storage) {
     );
 }
 
+/// Wait for cooperative scheduler shutdown, then explicitly abort and join any
+/// task that misses the deadline. Dropping a Tokio JoinHandle detaches its task;
+/// awaiting after abort is required before audit/token teardown can safely run.
+async fn stop_background_schedulers(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    timeout: std::time::Duration,
+) -> bool {
+    // FuturesUnordered removes each completed JoinHandle as it yields. Keeping
+    // completed handles in a Vec and awaiting the whole Vec again after a
+    // timeout would poll an already-completed Tokio JoinHandle and panic.
+    let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
+    let graceful = tokio::time::timeout(timeout, async {
+        let mut stopped_cleanly = true;
+        while let Some(result) = pending.next().await {
+            if let Err(error) = result {
+                stopped_cleanly = false;
+                warn!(%error, "Background scheduler failed while shutting down");
+            }
+        }
+        stopped_cleanly
+    })
+    .await;
+    if let Ok(stopped_cleanly) = graceful {
+        return stopped_cleanly;
+    }
+
+    for handle in pending.iter() {
+        handle.abort();
+    }
+    let abort_timeout = timeout.min(std::time::Duration::from_secs(2));
+    if tokio::time::timeout(abort_timeout, async {
+        while let Some(result) = pending.next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    warn!(%error, "Background scheduler failed while shutting down");
+                }
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        warn!(
+            active = pending.len(),
+            "Aborted background schedulers did not join before the bounded abort deadline"
+        );
+    }
+    false
+}
+
+fn arm_shutdown_watchdog(timeout: std::time::Duration) {
+    if let Err(error) = std::thread::Builder::new()
+        .name("nora-shutdown-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(timeout);
+            eprintln!(
+                "NORA shutdown watchdog expired after {}s; terminating stuck process",
+                timeout.as_secs()
+            );
+            std::process::exit(1);
+        })
+    {
+        warn!(%error, "Failed to arm process shutdown watchdog");
+    }
+}
+
+fn shutdown_stage_timeout(
+    deadline: tokio::time::Instant,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(cap)
+}
+
+fn is_registry_mutation_request(method: &Method, path: &str) -> bool {
+    let registry_route = path.starts_with("/maven2/")
+        || path.starts_with("/npm/")
+        || path.starts_with("/repository/");
+    if !registry_route || matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+
+    // npm audit uses POST but only proxies a read-only security query. Keep it
+    // available while draining; all publish, tag, import and delete methods are
+    // rejected before their handler can start a storage mutation.
+    if *method == Method::POST {
+        return ![
+            "/-/npm/v1/security/advisories/bulk",
+            "/-/npm/v1/security/audits/quick",
+            "/-/npm/v1/security/audits",
+        ]
+        .iter()
+        .any(|suffix| path.ends_with(suffix));
+    }
+
+    true
+}
+
+async fn reject_new_mutations_while_draining(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if state.draining.load(Ordering::Acquire)
+        && is_registry_mutation_request(request.method(), request.uri().path())
+    {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NORA is draining; retry the mutation on a ready instance",
+        )
+            .into_response();
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("30"),
+        );
+        return response;
+    }
+    next.run(request).await
+}
+
 /// Wait for shutdown signal (SIGTERM or SIGINT)
-async fn shutdown_signal() {
+async fn shutdown_signal(
+    draining: Arc<AtomicBool>,
+    shutdown_started: tokio_util::sync::CancellationToken,
+) {
+    // Kubernetes preStop sends SIGUSR1 before its endpoint-propagation wait.
+    // This only withdraws readiness; SIGTERM still owns the actual bounded
+    // HTTP/application shutdown sequence.
+    #[cfg(unix)]
+    let drain_handle = {
+        let draining = Arc::clone(&draining);
+        tokio::spawn(async move {
+            let mut drain = signal::unix::signal(signal::unix::SignalKind::user_defined1())
+                .expect("Failed to install SIGUSR1 drain handler");
+            while drain.recv().await.is_some() {
+                if !draining.swap(true, Ordering::AcqRel) {
+                    info!("Received SIGUSR1, withdrawing readiness before shutdown");
+                }
+            }
+        })
+    };
+
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -1905,6 +2540,10 @@ async fn shutdown_signal() {
             info!("Received SIGTERM, starting graceful shutdown...");
         }
     }
+    #[cfg(unix)]
+    drain_handle.abort();
+    draining.store(true, Ordering::Release);
+    shutdown_started.cancel();
 }
 
 /// Reload curation policy from disk (triggered by SIGHUP).
@@ -2020,6 +2659,203 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     }
     if !uncovered.is_empty() {
         println!("\nNote: No retention rules for: {}", uncovered.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod scheduler_shutdown_tests {
+    use super::stop_background_schedulers;
+    use crate::test_helpers::create_test_context;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_aborts_and_joins_uncooperative_scheduler() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let handle = tokio::spawn(async move {
+            let _guard = Dropped(dropped_in_task);
+            std::future::pending::<()>().await;
+        });
+
+        let graceful = stop_background_schedulers(vec![handle], Duration::from_millis(10)).await;
+
+        assert!(!graceful, "uncooperative task must hit the deadline");
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "task future must be dropped before shutdown continues"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_scheduler_is_not_polled_again_after_peer_times_out() {
+        let completed = tokio::spawn(async {});
+        while !completed.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let pending = tokio::spawn(async move {
+            let _guard = Dropped(dropped_in_task);
+            std::future::pending::<()>().await;
+        });
+
+        let graceful =
+            stop_background_schedulers(vec![completed, pending], Duration::from_millis(10)).await;
+
+        assert!(!graceful, "uncooperative peer must hit the deadline");
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "unfinished peer must be aborted and joined without re-polling the completed handle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_join_is_bounded_when_blocking_work_cannot_be_cancelled() {
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let started_in_task = Arc::clone(&started);
+        let handle = tokio::task::spawn_blocking(move || {
+            started_in_task.wait();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        started.wait();
+
+        let before = std::time::Instant::now();
+        let graceful = stop_background_schedulers(vec![handle], Duration::from_millis(10)).await;
+
+        assert!(
+            !graceful,
+            "blocking work must miss the cooperative deadline"
+        );
+        assert!(
+            before.elapsed() < Duration::from_millis(100),
+            "abort join must not wait for an uninterruptible blocking operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_panic_is_not_reported_as_a_clean_stop() {
+        let handle = tokio::spawn(async {
+            panic!("injected scheduler panic");
+        });
+
+        assert!(
+            !stop_background_schedulers(vec![handle], Duration::from_secs(1)).await,
+            "a scheduler JoinError must forbid a clean persistent-index close"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_mutation_panic_sets_the_startup_reconcile_latch() {
+        let ctx = create_test_context();
+        ctx.state.spawn_background_mutation(async {
+            panic!("injected background mutation panic");
+        });
+        ctx.state.background_mutations.close();
+        ctx.state.background_mutations.wait().await;
+
+        assert!(
+            ctx.state
+                .startup_reconcile_required
+                .load(Ordering::Acquire),
+            "an unknown background mutation outcome must survive until shutdown eligibility is evaluated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_gate_tests {
+    use super::is_registry_mutation_request;
+    use crate::test_helpers::{create_test_context, send};
+    use axum::http::{header, Method, StatusCode};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn drain_gate_rejects_maven_and_npm_mutations_but_keeps_reads() {
+        for (method, path) in [
+            (Method::PUT, "/maven2/com/acme/app/1/app-1.jar"),
+            (
+                Method::PUT,
+                "/repository/maven-hosted/com/acme/app/1/app-1.jar",
+            ),
+            (Method::PUT, "/repository/npm-hosted/pkg"),
+            (
+                Method::DELETE,
+                "/repository/npm-hosted/-/package/pkg/dist-tags/next",
+            ),
+            (Method::PATCH, "/npm/pkg"),
+        ] {
+            assert!(
+                is_registry_mutation_request(&method, path),
+                "{method} {path} must be rejected while draining"
+            );
+        }
+
+        for (method, path) in [
+            (
+                Method::GET,
+                "/repository/maven-hosted/com/acme/app/1/app-1.jar",
+            ),
+            (Method::HEAD, "/repository/npm-hosted/pkg"),
+            (Method::OPTIONS, "/repository/npm-hosted/pkg"),
+            (
+                Method::POST,
+                "/repository/npm-proxy/-/npm/v1/security/audits",
+            ),
+            (Method::POST, "/npm/-/npm/v1/security/advisories/bulk"),
+        ] {
+            assert!(
+                !is_registry_mutation_request(&method, path),
+                "{method} {path} must remain available while draining"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_gate_rejects_new_mutations_after_drain_starts() {
+        let ctx = create_test_context();
+        ctx.state.draining.store(true, Ordering::Release);
+
+        let rejected = send(
+            &ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/app/1.0/app-1.0.jar",
+            "artifact",
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rejected.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("30"))
+        );
+
+        let read = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/acme/app/1.0/app-1.0.jar",
+            "",
+        )
+        .await;
+        assert_ne!(read.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let audit = send(
+            &ctx.app,
+            Method::POST,
+            "/npm/-/npm/v1/security/advisories/bulk",
+            "{}",
+        )
+        .await;
+        assert_ne!(audit.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 

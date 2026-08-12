@@ -122,30 +122,9 @@ async fn reindex(
         "admin reindex triggered"
     );
 
-    // Eager warm-up so the full-storage scan happens off the critical path of the
-    // next GUI reader (key for DR, where the operator validates the restore). The
-    // index is rebuildable from disk, so losing this task on shutdown is safe —
-    // it just rebuilds lazily on the next read after restart.
-    let repo_index = state.repo_index.clone();
-    let storage = state.storage.clone();
-    // `state` is unused past this point, so move the token instead of cloning.
-    let cancel = state.cancel_token;
-    let targets: Vec<RegistryType> = match target {
-        Some(rt) => vec![rt],
-        None => RegistryType::all().to_vec(),
-    };
-    tokio::spawn(async move {
-        // CANCEL-SAFETY: both arms are cancel-safe. On shutdown we drop the
-        // in-progress rebuild; the index stays dirty and rebuilds on next read.
-        tokio::select! {
-            _ = cancel.cancelled() => {}
-            _ = async {
-                for rt in targets {
-                    let _ = repo_index.get(rt.as_str(), &storage).await;
-                }
-            } => {}
-        }
-    });
+    // Invalidation wakes the single generation-safe background worker. The
+    // handler never starts a storage scan, so reindex remains bounded even if
+    // the HTTP rate limiter is disabled.
 
     (
         StatusCode::ACCEPTED,

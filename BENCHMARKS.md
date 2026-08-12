@@ -5,8 +5,9 @@ Reproducible performance figures for NORA.
 > **Scope.** The figures below cover what CI measures today on each release:
 > binary size, cold-start time, and idle memory, plus Criterion micro-benchmarks.
 > Load-test figures — throughput, request latency, and memory under concurrent
-> load — are **not yet measured**: the k6 load harness is not implemented (tracked
-> in #693). The rows under "Targets" are goals, not measurements, until then.
+> load — are **not yet measured**. A read-only Maven/npm k6 harness is available,
+> but no accepted run establishes those figures; Docker/raw coverage and CI
+> integration remain pending in #693. The rows under "Targets" are goals only.
 
 ## Measured (v0.9.0)
 
@@ -21,7 +22,8 @@ Reproducible performance figures for NORA.
 
 ## Targets (not yet measured — see #693)
 
-These need the k6 load harness, which does not exist yet:
+These remain unverified. The Maven/npm harness does not by itself establish that
+any target has been met, and Docker coverage is still pending:
 
 | Metric | Target |
 |--------|--------|
@@ -41,19 +43,20 @@ On each release, the `benchmarks.yml` workflow measures:
 Hardware: 2 vCPU, 4 GB RAM (GitHub Actions `ubuntu-latest` or equivalent). Results
 are attached as release artifacts.
 
-### Throughput and latency (planned — #693)
+### Throughput and latency (partial harness — #693)
 
-The intended k6 request distribution, once the harness lands:
+Current harness coverage:
 
-| Operation | Scenario |
-|-----------|----------|
-| Docker pull (manifest) | GET `/v2/{name}/manifests/{tag}` — cached images |
-| Docker pull (blob) | GET `/v2/{name}/blobs/{digest}` — 10 MB layer |
-| npm install | GET `/npm/{package}` — metadata + tarball download |
-| Maven resolve | GET `/maven2/.../{artifact}.jar` — cached artifacts |
-| Raw upload | PUT `/raw/{file}` — 1–100 KB files |
+| Operation | Scenario | Status |
+|-----------|----------|--------|
+| Docker pull (manifest) | GET `/v2/{name}/manifests/{tag}` — cached images | Pending |
+| Docker pull (blob) | GET `/v2/{name}/blobs/{digest}` — 10 MB layer | Pending |
+| npm install | GET packument + requested-version tarball through the ingress | Implemented |
+| Maven resolve | GET an artifact path through the ingress | Implemented |
+| Raw upload | PUT `/raw/{file}` — 1–100 KB files | Pending |
 
-Planned reported metrics: total req/s, p50, p95, p99 latency.
+The Maven/npm harness reports request rate plus p50, p95, and p99 latency. It has
+correctness thresholds only; it intentionally defines no latency SLO.
 
 ### Storage overhead
 
@@ -88,9 +91,24 @@ Runs parsing and validation benchmarks. Results in `target/criterion/`.
 
 ### Load tests
 
-The k6 load harness (`scripts/load-test.sh` scenarios and `scripts/bench-regression.sh`
-regression check) is **not yet implemented** — see #693. Until it lands, there is no
-local load-test command.
+The current harness performs GET requests only. It uses a digest-pinned k6 image,
+defaults to 10 Maven VUs × 20 iterations and 10 npm VUs × 10 iterations, and sets
+each scenario's `maxDuration` to five minutes:
+
+```bash
+BASE_URL=https://nora.example.test \
+MAVEN_PATH=/repository/maven-group/com/example/app/1.0/app-1.0.jar \
+NPM_PACKAGE_PATH=/repository/npm-group/example-package \
+NPM_VERSION=1.0.0 \
+./scripts/load-test.sh
+```
+
+Override the finite workload with `MAVEN_VUS`, `MAVEN_ITERATIONS`, `NPM_VUS`,
+and `NPM_ITERATIONS`. Optional `EXPECTED_MAVEN_SHA256`,
+`EXPECTED_NPM_PACKUMENT_SHA256`, and `EXPECTED_NPM_TARBALL_SHA256` values verify
+the three response bodies; the artifact and tarball checks are binary-safe.
+
+Docker/raw scenarios and baseline regression comparison are not implemented yet.
 
 ## CI integration
 
@@ -101,8 +119,9 @@ The `benchmarks.yml` workflow runs on each release:
 3. Runs the Criterion micro-benchmarks
 4. Uploads a JSON report as a release artifact
 
-Load testing, throughput/latency measurement, and baseline regression comparison are
-pending the harness in #693.
+Load testing is not part of this workflow. Maven/npm can be exercised manually with
+the read-only harness above; Docker/raw coverage and baseline regression comparison
+remain pending in #693. No performance target is currently recorded as met.
 
 ## Historical results
 

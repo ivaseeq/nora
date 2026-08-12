@@ -32,8 +32,8 @@ All endpoints require authentication. Anonymous read is opt-in via `anonymous_re
 | Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
 |--------|:---:|:---:|---|---|
 | Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
-| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
-| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | named hosted/proxy/group at `/repository/{name}/`; `/maven2/` alias |
+| npm | ✅ | ✅ | `registry.npmjs.org` | named hosted/proxy/group at `/repository/{name}/`; `/npm/` alias |
 | Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
 | PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
 | Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
@@ -99,15 +99,24 @@ nora
 docker tag myapp:latest localhost:4000/myapp:latest
 docker push localhost:4000/myapp:latest
 
-# npm
-npm config set registry http://localhost:4000/npm/
-npm publish
+# Nexus-compatible npm topology: publish to hosted, install through the group
+export NORA_NPM_REPOSITORIES_JSON='[{"kind":"hosted","name":"npm-private","write_policy":"allow"},{"kind":"proxy","name":"npm-registry","url":"https://registry.npmjs.org"},{"kind":"group","name":"npm-group","members":["npm-private","npm-registry"]}]'
+export NORA_NPM_DEFAULT_REPOSITORY=npm-group
+npm config set registry http://localhost:4000/repository/npm-group/
+npm publish --registry http://localhost:4000/repository/npm-private/
 
 # Go
 GOPROXY=http://localhost:4000/go go get golang.org/x/text@latest
 ```
 
 See [full documentation](https://getnora.dev) for all registries.
+
+For production, Maven and npm use Nexus-style named `hosted`, `proxy`, and
+`group` repositories under one `/repository/{name}/` namespace. Repository
+names are globally unique across both formats, groups own no storage, and one
+NORA process is the supported writer topology. The legacy `/maven2/` and
+`/npm/` routes remain compatibility aliases, not the recommended deployment
+model.
 
 ## Features
 
@@ -118,12 +127,87 @@ See [full documentation](https://getnora.dev) for all registries.
 - **Mirror CLI** — offline sync for air-gapped environments (`nora mirror`)
 - **Backup & Restore** — `nora backup` / `nora restore`
 - **S3 Storage** — AWS S3, Ceph RGW, any S3-compatible backend
+- **Persistent Maven/npm index** — bounded redb-backed browse/search pages,
+  incremental repair after NORA writes, and background S3 reconciliation
 - **Prometheus Metrics** — `/metrics` endpoint, [Grafana dashboard](MONITORING.md)
 - **Rate Limiting** — configurable per-endpoint rate limits
 
 ## Configuration
 
 NORA works out of the box. For advanced setup — auth, S3, retention, curation — see [getnora.dev/configuration](https://getnora.dev/configuration/settings/).
+
+For Maven/npm on S3, keep the derived index on persistent local storage:
+
+```toml
+[index]
+path = "/var/lib/nora/index/nora.redb"
+reconcile_interval_secs = 3600
+```
+
+S3 remains authoritative; deleting the redb file only forces a background
+rebuild. Run exactly one NORA process. A PVC improves warm restart and UI/search
+availability but is not an HA or distributed-locking mechanism. `/ready` is the
+storage gate and `/ready/index` is the independent Maven/npm projection gate.
+Until the first usable generation is published, Maven/npm browser pages show
+the current indexing phase and exact committed object/package counts; this
+progress display does not issue additional storage requests, and artifact API
+reads remain independent.
+After a durably clean shutdown, an exact-topology generation whose accepted
+changes are fully covered by its active watermark is published immediately;
+dirty or unclean state still reconciles from S3 before `/ready/index` becomes
+ready. The clean-proof contract is versioned: a database last closed by a
+binary without that proof performs one fail-closed S3 reconciliation before
+warm reuse. Periodic reconciliation remains the anti-entropy path for
+out-of-band changes.
+Local and GCS storage keep their existing in-memory index path. The current
+implementation pins one full upstream redb revision containing required
+post-4.1 crash/recovery fixes. Production promotion accepts only that canonical
+repository and revision after it is bound to a new application schema and a
+saved crash/recovery evidence manifest. The qualification path is deliberately
+split: `redb-production-matrix.sh` tests one immutable Harbor image;
+`publish-redb-production-evidence.sh` publishes the resulting tar plus matrix
+as an OCI artifact and reads it back by the registry manifest digest; the
+checked-in approval records that OCI digest separately from the tar SHA-256.
+The matrix re-executes from an immutable archive and independently recomputes
+the reviewed Git tree inside that snapshot. It uses the dependency-complete
+redb runner only by its read-back Harbor digest, enforces bounded deadlines,
+and archives only a canonical, hash-enumerated evidence member set. The
+publisher derives a content-addressed staging tag from the tree and bundle
+hash; the approval always names the immutable OCI manifest digest.
+The production source gate then pulls and hashes the actual artifact, verifies
+the embedded matrix, dependency, Cargo.lock, canonical load-bearing source and
+all four exact harnesses, and binds the tested Harbor image digest. The Helm
+chart package/render has its own later digest gate because it does not exist at
+application build time.
+
+Use `scripts/redb-production-gate.sh` as the app-side entrypoint. `qualify`
+accepts the exact clean staged Git tree, archives that tree itself, builds and
+pushes the amd64 Harbor image by digest, runs the matrix, publishes and reads
+back OCI evidence, then emits one reviewable patch replacing exactly the
+approval JSON and its unique allowlist row. It never accepts a caller-supplied
+image. After that two-file patch is reviewed and checked in, argument-free
+`verify` derives the image and source tree only from the checked-in approval,
+re-fetches both immutable evidence and image, and fails closed on any source,
+lock, harness, label, digest, duplicate row or locator drift. It does not
+publish a chart or deploy Helm. The connected downstream command is
+`scripts/redb-production-promotion.sh preflight <chart-directory>` (or `apply`).
+The read-only `preflight` first runs argument-free app verification, requires
+the chart source annotation and default image digest to equal that approval,
+rejects an existing chart version, packages privately, renders locally and runs
+a server dry-run without pushing or applying. `apply` repeats those checks,
+pushes and reads back the chart manifest, repeats render and dry-run only by the
+immutable chart digest, then upgrades `testcloud-k8s/nora/nora` and verifies the
+running Pod's `status.containerStatuses[].imageID` against the same approved
+image digest. Both modes fail closed unless Harbor already has one enabled
+all-tags immutability rule scoped exactly to `helm-charts/nora`; the gate reads
+that policy with inline Docker auth but never creates or changes it.
+The hard CSI selector override explicitly deletes any reused
+`kubernetes.io/hostname` key from a private copy of the current user values,
+sets `storage.just-ai.com/linstor-csi-node=true`, and uses that complete copy
+with `--reset-values` so Helm cannot deep-merge the old hostname back. While
+redb is pinned to an exact Git revision, the public tag workflow is deliberately
+fail-closed so it cannot rebuild or publish an artifact different from the
+qualified Harbor image.
 
 ```bash
 # Auth

@@ -79,7 +79,12 @@ pub async fn migrate(
 
     for key in &keys {
         // Check if already exists in destination
-        if to.stat(key).await.is_some() {
+        if to
+            .stat(key)
+            .await
+            .map_err(|e| format!("failed to stat destination key {key}: {e}"))?
+            .is_some()
+        {
             stats.skipped += 1;
             pb.inc(1);
             continue;
@@ -87,7 +92,11 @@ pub async fn migrate(
 
         if options.dry_run {
             // Just count what would be migrated
-            if let Some(meta) = from.stat(key).await {
+            if let Some(meta) = from
+                .stat(key)
+                .await
+                .map_err(|e| format!("failed to stat source key {key}: {e}"))?
+            {
                 stats.total_bytes += meta.size;
             }
             stats.migrated += 1;

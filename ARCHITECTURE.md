@@ -16,10 +16,11 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
    one data directory. No sidecar processes, no external databases, no package
    managers at runtime. A `cp -r /data/ backup/` is a complete backup.
 
-2. **Filesystem is the database.** All state lives on disk (or S3) as files.
-   In-memory indexes are rebuilt on startup. There are no schema migrations,
-   no WAL corruption risks, no `VACUUM` commands. Docker Distribution serves
-   Docker Hub with the same approach.
+2. **Artifact storage is authoritative.** All repository and protocol state
+   lives as files on local storage or objects in S3. An S3 deployment may keep
+   a disposable local redb projection for Maven/npm browse and search, but
+   deleting or rebuilding it cannot change artifact semantics. Derived schema
+   changes invalidate and reseed the projection instead of migrating authority.
 
 3. **Security is free.** Blocklists, allowlists, namespace isolation, integrity
    verification — all included in the open-source release. Security features
@@ -54,8 +55,8 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           ┌───────────────────────────┼───────────────────────────┐
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
-   │   Docker    │           │     Maven     │   ...    │    Debian     │
-   │  /v2/*      │           │  /maven2/*    │  (x15)   │    /deb/*     │
+   │   Docker    │           │ Maven / npm   │   ...    │    Debian     │
+   │  /v2/*      │           │/repository/*  │  (x15)   │    /deb/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -72,9 +73,26 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
                            └─────────────────────┘
 ```
 
-Every HTTP request follows this path top-to-bottom. The registry handler is
-selected by URL prefix (`/v2/` = Docker, `/maven2/` = Maven, etc.). Curation
-runs only on proxy downloads — hosted artifacts are trusted at publish time.
+Every HTTP request follows this path top-to-bottom. Most registry handlers are
+selected by URL prefix. Maven and npm share `/repository/{name}/...`; a named
+dispatcher selects the protocol from validated configuration, not from a name
+heuristic. Their repository names therefore occupy one global namespace.
+`/maven2/` and `/npm/` remain compatibility aliases only when a default named
+repository is configured. Curation runs only on proxy downloads — hosted
+artifacts are trusted at publish time.
+
+Named Maven and npm each support hosted, proxy, and ordered group repositories.
+Groups own no storage. Maven hosted/proxy objects are isolated under
+`maven/repositories/{name}/...`. npm keeps hosted version manifests,
+content-addressed tarball blobs, dist-tags, and deprecation overlays under
+`npm/repositories/{hosted}/...`, while proxy packuments and tarballs use
+`npm/repositories/{proxy}/proxy/...`. An npm group synthesizes a response from
+its members in configured order.
+
+This topology has a single-writer contract on local and object storage.
+Conditional create protects one immutable key, but mutable Maven/npm metadata
+updates span multiple keys and use an in-process lock. S3 or Ceph exact-key CAS
+therefore does not provide multi-replica write coordination or HA.
 
 ### Trust Boundaries
 
@@ -244,8 +262,10 @@ by Cargo features for compile-time exclusion if needed.
 
 ### ADR-2: Filesystem as Source of Truth
 
-**Decision:** All persistent state is stored as files on disk (or S3 objects).
-There is no embedded database in the open-source release.
+**Decision:** All authoritative state is stored as files on disk (or S3
+objects). There is no embedded authoritative database. The S3-only Maven/npm
+redb index in ADR-10 is a rebuildable query projection, never a second source
+of truth.
 
 **Context:** Nexus migrated from filesystem to OrientDB for metadata. The
 migration took 2+ years and introduced corruption bugs that persist today.
@@ -254,9 +274,11 @@ that can diverge from the actual files on disk.
 
 **Rationale:**
 - `cp -r /data/ backup/` is a complete, consistent backup
-- No schema migrations, no WAL corruption, no `VACUUM`
+- No schema migration can rewrite authoritative repository content; an
+  incompatible derived-index schema is quarantined and rebuilt from S3
 - Retention uses file mtime (publish date) — no metadata DB needed
-- Search uses in-memory HashMap rebuilt on startup (~5ms for 10k packages)
+- Non-S3 formats keep the in-memory startup index; S3 Maven/npm use the bounded
+  persistent projection described in ADR-10
 - Token storage uses `tokens.json` — same pattern as htpasswd
 - Docker Distribution serves Docker Hub at scale with pure filesystem storage
 
@@ -272,9 +294,17 @@ in front of other registries.
 **Rationale:** Each storage backend is a maintenance surface. S3 covers
 every cloud provider and on-prem S3-compatible stores. Local covers single-node and
 development. A third backend (e.g., GCS-native, Azure Blob) adds testing
-burden without meaningful capability gain — both are S3-compatible. For
-migrating away from other registries, the `nora migrate` CLI copies
-artifacts directly rather than proxying through the old system.
+burden without meaningful capability gain — both are S3-compatible.
+`nora migrate` copies an existing NORA storage layout between local and S3; it
+is not a Nexus-to-named-repository migrator.
+
+Named Maven/npm are a fresh-install contract. For Nexus replacement, keep the
+source read-only and copy only hosted content through the protocol-aware named
+hosted endpoints, then verify reads through the configured groups. Do not copy
+Nexus group state or proxy caches. Direct-storage import remains a legacy/local
+layout tool and is not supported for named npm or for Maven when named
+repositories are configured. No in-place migration from older NORA Maven/npm
+layouts is provided.
 
 ### ADR-4: Explicit Handlers over Plugin Traits
 
@@ -391,9 +421,10 @@ are implemented per-registry following each format's upstream specification.
 There is no shared conditional-request middleware.
 
 **Context:** RFC 9110 defines conditional requests for HTTP. Each registry
-protocol has its own immutability model: Docker uses content-addressable
-digests, Maven/npm/Cargo/PyPI enforce version immutability at publish time,
-Raw has no upstream spec. Implementing a generic conditional-request layer
+protocol has its own coordinate model: Docker uses content-addressable
+digests, Maven/npm apply repository-specific write policy, Cargo/PyPI enforce
+version immutability at publish time, and Raw has no upstream spec.
+Implementing a generic conditional-request layer
 would either be too narrow (not matching protocol-specific semantics) or too
 broad (imposing HTTP semantics on protocols that don't need them).
 
@@ -402,6 +433,132 @@ PUT because it's a plain file store with no versioning scheme. Other formats
 already have protocol-defined immutability. Adding ETag/If-Match to Maven or
 npm would conflict with their publish APIs. The per-protocol approach follows
 ADR-4: each handler owns its full request lifecycle.
+
+### ADR-10: S3-Authoritative Persistent Maven/npm Index
+
+**Decision:** Maven/npm browse, search, logical-size and package-detail
+projections are stored in a persistent redb database. S3 objects and the
+protocol-native Maven/npm metadata remain authoritative. The database is a
+rebuildable projection and must never be the only record of an artifact,
+publish, delete, retention decision, credential or access policy.
+
+**Context:** Rebuilding a million-object browse snapshot into RAM after every
+restart makes startup and UI availability depend on a full S3 traversal. It
+also makes request-path pagination artificial: the server first materializes a
+large vector and only then slices it. Persisting the ordered projection lets
+the UI page and search by key range with bounded memory while a background
+reconciliation validates the last-good generation.
+
+**Rationale and invariants:**
+
+- One blocking owner thread holds the only writable redb handle. Async request
+  tasks communicate through a bounded queue; the low-level storage observer
+  only uses non-blocking admission to that FIFO and creates no per-mutation
+  Tokio task. It deliberately does not delay an authoritative S3 response while
+  waiting for a derived-index receipt. One bounded mutation-fence coordinator
+  retains only the newest FIFO receipt, accounts for all concurrent semantic
+  repairs, and alone publishes `Ready` after an ordered metadata barrier.
+  Admission, writer replacement and publication share one short lock, so an
+  older completion cannot update a reseeded generation. Every committed
+  derived write uses `Immediate` durability and two-phase commit.
+- A complete S3 traversal is built into an invisible A/B table slot. One
+  metadata transaction flips the active slot, generation, configuration digest,
+  completeness and mutation watermark, so readers see all-old or all-new data.
+  Objects omitted by a successful LIST are exact-HEADed before removal; an
+  uncertain HEAD aborts publication and retains the last-good generation.
+- Successful NORA Maven/npm mutations enqueue both a low-level physical dirty
+  record and a protocol-level semantic repair. The semantic repair re-reads the
+  authoritative S3 entity and normally avoids a full scan. Unknown outcomes,
+  queue overload and out-of-band writes remain fail-closed and schedule a full
+  reconciliation. Periodic reconciliation is anti-entropy, not a new source of
+  truth.
+- npm hosted visibility comes only from `current.json` and its active immutable
+  generation. Split version documents may outlive a removal and are never used
+  as the package-visibility oracle. A strong S3 ETag/version identity allows an
+  unchanged package projection to be reused without per-package GETs; weak
+  size/mtime identity falls back to rebuilding it. Maven generated metadata
+  continues to use its protocol-specific authoritative path.
+- `/ready` reports storage reachability. `/ready/index` reports whether the
+  Maven/npm projection is complete and caught up to accepted local changes. A
+  durably clean, exact-topology generation with no dirty state and an active
+  watermark equal to its accepted sequence publishes immediately on restart;
+  its next full S3 traversal is normal periodic anti-entropy. An unclean,
+  incomplete or dirty last-good projection may serve browse pages while
+  `/ready/index` is 503 and startup reconciliation runs. An incompatible
+  projection stays hidden. The topology contract versions the clean proof, so
+  a PVC closed by an older binary performs one authoritative S2 instead of
+  inheriting legacy marker semantics. Artifact protocol reads remain S3-backed.
+- SIGUSR1 starts drain by withdrawing readiness and rejecting new Maven/npm
+  mutations with 503 while reads and npm audit queries remain available.
+  SIGTERM then owns bounded HTTP, scheduler, background-mutation and redb
+  shutdown stages. A final process watchdog terminates a syscall stuck on the
+  index PVC before the larger Kubernetes termination grace period expires;
+  startup reconciliation repairs any unacknowledged derived-index gap. HTTP
+  drain failure, scheduler failure and background mutation panic/timeout set a
+  monotonic process-session latch that forbids a clean marker even when the
+  redb watermark itself appears caught up.
+- Missing or incompatible local state is rebuilt from S3. A resource-limited
+  child process opens and validates an existing file before the server opens it.
+  A durably clean shutdown takes the bounded open + schema/meta path; an
+  unclean shutdown additionally runs redb's isolated full integrity scan. The
+  long-lived writer marks the database active before accepting changes and
+  clean only after its command queue drains. Only proven corruption or
+  schema/engine incompatibility is quarantined. A child that exceeds the
+  bounded preflight window is explicitly killed and reaped, then its derived
+  DB is atomically preserved under a distinct `.preflight-timeout.*` name before
+  a fresh S3 reseed. Disk admission reserves the retained file, a fresh active
+  generation, a later A/B shadow generation and filesystem headroom. At most
+  one timeout-evidence file is retained: after admission a newer timed-out
+  primary replaces the older evidence, and successful S2 publication retires
+  the final evidence. This is an unclassified-cache demotion, never a claim of
+  corruption. Non-timeout I/O, permission,
+  signal/OOM and lock-overlap failures preserve the primary file fail-closed
+  while S3 protocol reads stay available. A second writable owner remains a
+  fatal singleton violation.
+- The persistent projection is enabled only for Maven/npm on S3. Local and GCS
+  retain their existing index behavior in this phase.
+- Exactly one NORA process owns the file. A PVC improves warm-restart time but
+  does not provide distributed locking or make multiple writers safe. Kubernetes
+  deployments remain `replicas: 1` with `Recreate`; production should use a
+  tested `ReadWriteOncePod` claim.
+
+The implementation pins one reviewed full upstream redb commit containing the
+required post-4.1 crash-recovery fixes and raises the declared Rust MSRV to
+1.90. Production uses that exact commit rather than waiting for a later crate
+release, but does not accept an arbitrary git dependency. The pre-build CI gate
+enforces the canonical upstream URL, full revision, resolved Cargo.lock source
+and an approval bound to `ENGINE_REVISION`, `SCHEMA_VERSION`, a canonical
+load-bearing source digest, the exact matrix/minio/runtime/upstream harnesses,
+and an immutable OCI evidence locator. The OCI manifest digest and evidence-tar
+SHA-256 are distinct fields: the verifier fetches the remote descriptor, pulls
+the artifact by digest, hashes both payload files and checks the embedded matrix
+against the exact tested Harbor image digest. The source digest includes tracked
+path, mode and content for the complete staged tree except the approval row and
+evidence manifests themselves, avoiding a self-referential digest while still
+covering application code, workflows, Dockerfiles and gate scripts. The chart
+package digest and rendered image remain a separate post-build Helm gate; the
+application evidence gate does not claim to verify a chart that does not exist
+yet.
+Changing engine contracts therefore forces a fresh DB. Remote Harbor image
+promotion uses `scripts/verify-redb-promotion.sh` with an immutable digest: the
+test channel requires an explicit non-release-engine opt-in and exact current
+tree, while production additionally requires the approved OCI evidence to bind
+that image/tree. Helm chart publication and render verification remain a
+separate gate.
+`scripts/redb-minio-e2e.sh` archives exact image/tree/lock provenance and its
+S3 integration phases. Production qualification additionally runs the
+disk-full protocol-survival phase, focused NORA lifecycle tests, and the exact
+upstream redb torn-write/double-crash/commit-error/ENOSPC regressions through
+`scripts/redb-production-matrix.sh`; no component alone authorizes an allowlist
+row. The matrix executes only a `git archive` snapshot whose complete Git tree
+is independently recomputed inside the worker. The redb test environment is
+the dependency-complete `deploy/Dockerfile.redb-runner` image pinned by its
+read-back Harbor digest; runtime package installation and host execution are
+intentionally unsupported.
+Component deadlines are bounded, MinIO evidence enumerates and hashes every
+inner artifact, and the outer OCI tar accepts one exact member set with no
+duplicates or extra files. Evidence tags are content-addressed staging aliases;
+the security boundary is the read-back OCI manifest digest stored in approval.
 
 ## Adding a New Registry
 
@@ -445,12 +602,14 @@ added rarely — the explicit approach trades one-time boilerplate for
 permanent simplicity, compile-time completeness checks, and full test
 coverage of each format in isolation.
 
-**No high availability.** NORA runs as a single instance with a single
-RWO volume. This is a design decision, not a missing feature. Artifact
+**No high availability.** NORA runs with exactly one writer, including when
+the storage backend is S3 or Ceph. Exact-key conditional create does not
+serialize the multi-key mutable metadata used by named Maven/npm. This is a
+design decision, not a missing feature. Artifact
 registries have a read-heavy, write-light workload — a single instance
-with S3 storage handles thousands of pulls per minute. Kubernetes
-`Recreate` strategy ensures zero-downtime upgrades for reads served from
-client-side caches.
+with S3 storage handles thousands of pulls per minute. Kubernetes `Recreate`
+or an explicit scale-to-zero upgrade prevents overlapping writers, at the cost
+of a short service interruption. High availability requires a separate design.
 
 **DRY violations between handlers.** Registry handlers share structural
 patterns (proxy logic, curation calls, config loading) but differ in
@@ -475,5 +634,6 @@ external tools (Grafana dashboards, git-based rule management).
 - **Not a CDN.** For geo-distributed artifact delivery, put a CDN
   (CloudFront, Cloudflare) in front of NORA.
 - **Not a middleware.** NORA is a standalone registry, not a caching
-  layer in front of Nexus or Artifactory. For migration, use
-  `nora migrate`.
+  layer in front of Nexus or Artifactory. Nexus hosted Maven/npm content is
+  migrated through protocol-aware named endpoints; `nora migrate` only copies
+  existing NORA storage between local and S3.

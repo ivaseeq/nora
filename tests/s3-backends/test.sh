@@ -40,6 +40,10 @@ wait_healthy() {
 test_backend() {
     local name="$1"
     local base="$2"
+    local run_id
+    run_id="provider-${RANDOM}-$(date +%s%N)"
+    local raw_base="${base}/raw/s3test/${run_id}"
+    local scoped_url="${base}/raw/@scope/${run_id}.txt"
 
     echo ""
     echo "=== ${name} (${base}) ==="
@@ -51,11 +55,25 @@ test_backend() {
     fi
     pass "${name}: health check"
 
+    local ready_code="000"
+    for _ in $(seq 1 30); do
+        ready_code=$(curl -s --max-time 2 -o /dev/null -w "%{http_code}" \
+            "${base}/ready" || true)
+        [ "$ready_code" = "200" ] && break
+        sleep 1
+    done
+    if [ "$ready_code" != "200" ]; then
+        fail "${name}: storage readiness returned ${ready_code} after 30s"
+        return
+    fi
+    pass "${name}: storage readiness"
+
     # 2. Raw upload/download — simple key
-    local payload="s3-test-data-$(date +%s)"
+    local payload
+    payload="s3-test-data-$(date +%s)"
     local http_code
     http_code=$(echo "$payload" | curl -s -o /dev/null -w "%{http_code}" \
-        -X PUT --data-binary @- "${base}/raw/s3test/simple.txt")
+        -X PUT --data-binary @- "${raw_base}/simple.txt")
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
         pass "${name}: raw upload (simple key)"
     else
@@ -63,7 +81,7 @@ test_backend() {
     fi
 
     local content
-    content=$(curl -sf "${base}/raw/s3test/simple.txt" 2>/dev/null || echo "")
+    content=$(curl -sf "${raw_base}/simple.txt" 2>/dev/null || echo "")
     if [ "$content" = "$payload" ]; then
         pass "${name}: raw download (simple key)"
     else
@@ -71,16 +89,17 @@ test_backend() {
     fi
 
     # 3. Raw upload/download — key with @ (scoped package path)
-    local at_payload="at-test-data-$(date +%s)"
+    local at_payload
+    at_payload="at-test-data-$(date +%s)"
     http_code=$(echo "$at_payload" | curl -s -o /dev/null -w "%{http_code}" \
-        -X PUT --data-binary @- "${base}/raw/@scope/test.txt")
+        -X PUT --data-binary @- "$scoped_url")
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
         pass "${name}: raw upload (@ key)"
     else
         fail "${name}: raw upload (@ key) returned ${http_code}"
     fi
 
-    content=$(curl -sf "${base}/raw/@scope/test.txt" 2>/dev/null || echo "")
+    content=$(curl -sf "$scoped_url" 2>/dev/null || echo "")
     if [ "$content" = "$at_payload" ]; then
         pass "${name}: raw download (@ key)"
     else
@@ -97,11 +116,51 @@ test_backend() {
     fi
 
     # 5. HEAD on existing object (stat)
-    http_code=$(curl -sf -o /dev/null -w "%{http_code}" --head "${base}/raw/s3test/simple.txt")
+    http_code=$(curl -sf -o /dev/null -w "%{http_code}" --head "${raw_base}/simple.txt")
     if [ "$http_code" = "200" ]; then
         pass "${name}: HEAD existing object"
     else
         fail "${name}: HEAD existing object returned ${http_code}"
+    fi
+
+    # 5a. The public conditional-create contract must reject an existing key
+    # without changing its bytes.
+    http_code=$(echo "replacement" | curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT -H "If-None-Match: *" --data-binary @- \
+        "${raw_base}/simple.txt")
+    if [ "$http_code" = "412" ]; then
+        pass "${name}: conditional create rejects existing object"
+    else
+        fail "${name}: conditional create returned ${http_code}, expected 412"
+    fi
+
+    content=$(curl -sf "${raw_base}/simple.txt" 2>/dev/null || echo "")
+    if [ "$content" = "$payload" ]; then
+        pass "${name}: conditional create preserved existing bytes"
+    else
+        fail "${name}: conditional create overwrote existing bytes"
+    fi
+
+    # 5b. Backend-native ranged reads must preserve HTTP range semantics.
+    local range_file
+    range_file=$(mktemp)
+    local range_body
+    range_body=$(curl -s -o "$range_file" -w "%{http_code}" \
+        -H "Range: bytes=0-2" "${raw_base}/simple.txt")
+    content=$(cat "$range_file")
+    rm -f "$range_file"
+    if [ "$range_body" = "206" ] && [ "$content" = "s3-" ]; then
+        pass "${name}: ranged GET returns requested bytes"
+    else
+        fail "${name}: ranged GET returned HTTP ${range_body} body '${content}'"
+    fi
+
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Range: bytes=999999-" "${raw_base}/simple.txt")
+    if [ "$http_code" = "416" ]; then
+        pass "${name}: unsatisfiable range returns 416"
+    else
+        fail "${name}: unsatisfiable range returned ${http_code}, expected 416"
     fi
 
     # 6. 404 on nonexistent
@@ -113,8 +172,8 @@ test_backend() {
     fi
 
     # 7. Delete
-    curl -sf -X DELETE "${base}/raw/s3test/simple.txt" >/dev/null 2>&1 || true
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "${base}/raw/s3test/simple.txt")
+    curl -sf -X DELETE "${raw_base}/simple.txt" >/dev/null 2>&1 || true
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "${raw_base}/simple.txt")
     if [ "$http_code" = "404" ]; then
         pass "${name}: delete object"
     else
@@ -123,22 +182,59 @@ test_backend() {
 
     # 8. Binary upload
     dd if=/dev/urandom bs=1024 count=8 2>/dev/null | \
-        curl -sf -X PUT --data-binary @- "${base}/raw/s3test/binary.bin" >/dev/null 2>&1
+        curl -sf -X PUT --data-binary @- "${raw_base}/binary.bin" >/dev/null 2>&1
     local bin_size
-    bin_size=$(curl -sf "${base}/raw/s3test/binary.bin" 2>/dev/null | wc -c)
+    bin_size=$(curl -sf "${raw_base}/binary.bin" 2>/dev/null | wc -c)
     if [ "$bin_size" -ge 8000 ]; then
         pass "${name}: binary upload/download (${bin_size} bytes)"
     else
         fail "${name}: binary size expected ~8192, got ${bin_size}"
     fi
 
+    # 8a. Raw uploads use the multipart object-store path. Cross the 8 MiB
+    # part size and verify the complete object digest after a streamed read.
+    local multipart_file
+    multipart_file=$(mktemp)
+    dd if=/dev/zero of="$multipart_file" bs=1M count=10 2>/dev/null
+    local multipart_expected
+    multipart_expected=$(sha256sum "$multipart_file" | awk '{print $1}')
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+        --data-binary @"$multipart_file" "${raw_base}/multipart.bin")
+    rm -f "$multipart_file"
+    local multipart_actual
+    multipart_actual=$(curl -sf "${raw_base}/multipart.bin" | sha256sum | awk '{print $1}')
+    if [ "$http_code" = "201" ] && [ "$multipart_actual" = "$multipart_expected" ]; then
+        pass "${name}: multipart upload/download digest"
+    else
+        fail "${name}: multipart upload returned ${http_code} or digest mismatched"
+    fi
+
+    # 8b. Maven releases call Storage::put_if_absent directly. A conflicting
+    # retry must never overwrite the winning bytes on an S3-compatible backend.
+    local release_id
+    release_id="maven-${run_id}"
+    local release_path="com/example/${release_id}/1.0.0/${release_id}-1.0.0.jar"
+    local first_status
+    first_status=$(printf first | curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT --data-binary @- "${base}/maven2/${release_path}")
+    local conflict_status
+    conflict_status=$(printf second | curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT --data-binary @- "${base}/maven2/${release_path}")
+    content=$(curl -sf "${base}/maven2/${release_path}" 2>/dev/null || echo "")
+    if [ "$first_status" = "201" ] && [ "$conflict_status" = "409" ] \
+        && [ "$content" = "first" ]; then
+        pass "${name}: immutable Maven release preserves winner"
+    else
+        fail "${name}: Maven create/conflict was ${first_status}/${conflict_status}, body '${content}'"
+    fi
+
     # 9. Reindex after direct S3 upload
     # Upload a file directly to S3 (bypassing NORA API), then verify
     # that POST /raw/-/reindex makes it appear in the index listing.
-    # Note: NORA encodes @ → _at_ in S3 keys (SeaweedFS compat), so we
-    # use a plain path without @ for this test.
-    local reindex_key="raw/s3-direct/reindex-test.txt"
-    local reindex_data="direct-upload-$(date +%s)"
+    # Use a plain path because scoped-key roundtripping is already covered above.
+    local reindex_key="raw/s3-direct/${run_id}.txt"
+    local reindex_data
+    reindex_data="direct-upload-$(date +%s)"
     local uploaded=false
 
     case "$name" in
@@ -170,7 +266,7 @@ test_backend() {
         :
     elif [ "$uploaded" = "true" ]; then
         # 9a. File should be readable via NORA storage (direct read, no index needed)
-        content=$(curl -sf "${base}/raw/s3-direct/reindex-test.txt" 2>/dev/null || echo "")
+        content=$(curl -sf "${base}/raw/s3-direct/${run_id}.txt" 2>/dev/null || echo "")
         if [ "$content" = "$reindex_data" ]; then
             pass "${name}: direct S3 file readable via NORA"
         else
@@ -180,7 +276,7 @@ test_backend() {
         # 9b. File should NOT be in the index listing yet (index is stale)
         local list_before
         list_before=$(curl -sf "${base}/api/ui/raw/list" 2>/dev/null || echo "[]")
-        if echo "$list_before" | grep -q "s3-direct"; then
+        if echo "$list_before" | grep -Fq "$run_id"; then
             # Index may have been rebuilt already (lazy rebuild); not a hard failure
             skip "${name}: reindex pre-check (index already contains s3-direct, lazy rebuild)"
         else
@@ -198,7 +294,7 @@ test_backend() {
         # 9d. After reindex, file should appear in the index listing
         local list_after
         list_after=$(curl -sf "${base}/api/ui/raw/list" 2>/dev/null || echo "[]")
-        if echo "$list_after" | grep -q "s3-direct"; then
+        if echo "$list_after" | grep -Fq "$run_id"; then
             pass "${name}: reindex updated index (s3-direct found in listing)"
         else
             fail "${name}: reindex did not update index (s3-direct not in listing)"

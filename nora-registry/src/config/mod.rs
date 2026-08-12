@@ -12,6 +12,8 @@ mod auth;
 mod circuit_breaker;
 mod curation;
 mod gc;
+mod index;
+mod proxy_cache_cleanup;
 mod rate_limit;
 mod registries;
 pub mod registry;
@@ -34,6 +36,8 @@ pub use self::curation::{
     CurationConfig, CurationMode, CurationOnFailure, RegistryCurationOverride,
 };
 pub use self::gc::GcConfig;
+pub use self::index::IndexConfig;
+pub use self::proxy_cache_cleanup::ProxyCacheCleanupConfig;
 pub use self::rate_limit::RateLimitConfig;
 pub use self::registries::{EnableSpec, RegistriesSection};
 pub use self::retention::{RetentionConfig, RetentionRule};
@@ -51,8 +55,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use crate::registry_type::RegistryType;
+
+/// Shared lock for unit tests that mutate the process-wide configuration environment.
+///
+/// Keep this at the `config` module boundary so tests in sibling config modules use the same
+/// lock. A module-local lock does not prevent `NORA_STORAGE_MODE` writers from racing.
+#[cfg(test)]
+static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // --- Shared defaults (used by submodules via `super::default_*`) ---
 
@@ -118,6 +131,8 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
+    pub index: IndexConfig,
+    #[serde(default)]
     pub maven: MavenConfig,
     #[serde(default)]
     pub npm: NpmConfig,
@@ -157,6 +172,8 @@ pub struct Config {
     pub gc: GcConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub proxy_cache_cleanup: ProxyCacheCleanupConfig,
     #[serde(default)]
     pub curation: CurationConfig,
     #[serde(default)]
@@ -324,8 +341,16 @@ impl Config {
     fn is_enabled_proxy(&self, rt: RegistryType) -> bool {
         match rt {
             RegistryType::Docker => self.docker.enabled && !self.docker.upstreams.is_empty(),
-            RegistryType::Maven => self.maven.enabled && !self.maven.proxies.is_empty(),
-            RegistryType::Npm => self.npm.enabled && self.npm.proxy.is_some(),
+            RegistryType::Maven => self.maven.enabled && self.maven.has_proxy(),
+            RegistryType::Npm => {
+                self.npm.enabled
+                    && (self.npm.proxy.is_some()
+                        || self
+                            .npm
+                            .repositories
+                            .iter()
+                            .any(|repository| matches!(repository, NpmRepository::Proxy { .. })))
+            }
             RegistryType::Cargo => self.cargo.enabled && self.cargo.proxy.is_some(),
             RegistryType::PyPI => {
                 self.pypi.enabled && (self.pypi.proxy.is_some() || !self.pypi.proxies.is_empty())
@@ -451,6 +476,20 @@ impl Config {
                 );
             }
         }
+        for repository in &self.maven.repositories {
+            if let MavenRepository::Proxy {
+                name, url, auth, ..
+            } = repository
+            {
+                if auth.is_some() && std::env::var("NORA_MAVEN_REPOSITORIES_JSON").is_err() {
+                    tracing::warn!(
+                        repository = %name,
+                        url = %url,
+                        "Maven proxy credentials in config.toml are plaintext — consider NORA_MAVEN_REPOSITORIES_JSON"
+                    );
+                }
+            }
+        }
         // Go
         if self.go.proxy_auth.is_some() && std::env::var("NORA_GO_PROXY_AUTH").is_err() {
             tracing::warn!("Go proxy credentials in config.toml are plaintext — consider NORA_GO_PROXY_AUTH env var");
@@ -458,6 +497,20 @@ impl Config {
         // npm
         if self.npm.proxy_auth.is_some() && std::env::var("NORA_NPM_PROXY_AUTH").is_err() {
             tracing::warn!("npm proxy credentials in config.toml are plaintext — consider NORA_NPM_PROXY_AUTH env var");
+        }
+        for repository in &self.npm.repositories {
+            if let NpmRepository::Proxy {
+                name, url, auth, ..
+            } = repository
+            {
+                if auth.is_some() && std::env::var("NORA_NPM_REPOSITORIES_JSON").is_err() {
+                    tracing::warn!(
+                        repository = %name,
+                        url = %url,
+                        "npm proxy credentials in config.toml are plaintext — consider NORA_NPM_REPOSITORIES_JSON"
+                    );
+                }
+            }
         }
         // PyPI
         if self.pypi.proxy_auth.is_some() && std::env::var("NORA_PYPI_PROXY_AUTH").is_err() {
@@ -560,6 +613,20 @@ impl Config {
         for proxy in &self.maven.proxies {
             if let Some(host) = extract_host(proxy.url()) {
                 result.push(("maven".to_string(), host));
+            }
+        }
+        for repository in &self.maven.repositories {
+            if let MavenRepository::Proxy { url, .. } = repository {
+                if let Some(host) = extract_host(url) {
+                    result.push(("maven".to_string(), host));
+                }
+            }
+        }
+        for repository in &self.npm.repositories {
+            if let NpmRepository::Proxy { url, .. } = repository {
+                if let Some(host) = extract_host(url) {
+                    result.push(("npm".to_string(), host));
+                }
             }
         }
 
@@ -686,6 +753,26 @@ impl Config {
                 "storage.bucket must not be empty when storage mode is s3 or gcs".to_string(),
             );
         }
+        if matches!(self.storage.mode, StorageMode::S3 | StorageMode::Gcs) {
+            if self.storage.request_timeout_secs == 0 {
+                errors.push("storage.request_timeout_secs must be greater than 0".to_string());
+            }
+            if self.storage.retry_timeout_secs < self.storage.request_timeout_secs {
+                errors.push(
+                    "storage.retry_timeout_secs must be greater than or equal to storage.request_timeout_secs"
+                        .to_string(),
+                );
+            }
+            if self.storage.health_probe_timeout_secs == 0 {
+                errors.push("storage.health_probe_timeout_secs must be greater than 0".to_string());
+            }
+        }
+        if self.index.path.trim().is_empty() {
+            errors.push("index.path must not be empty".to_string());
+        }
+        if self.index.reconcile_interval_secs < 60 {
+            errors.push("index.reconcile_interval_secs must be at least 60".to_string());
+        }
 
         // 4. Rate limit values must be > 0 when rate limiting is enabled
         if self.rate_limit.enabled {
@@ -772,6 +859,50 @@ impl Config {
             warnings.push(
                 "retention.enabled=true but no retention rules configured — retention scheduler will run but do nothing. Add [retention.rules] or set retention.enabled=false".to_string(),
             );
+        }
+        if self.proxy_cache_cleanup.enabled {
+            if self.proxy_cache_cleanup.interval_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.interval_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.min_cache_age_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.min_cache_age_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.min_idle_secs == 0 {
+                errors.push(
+                    "proxy_cache_cleanup.min_idle_secs must be greater than 0 when enabled"
+                        .to_string(),
+                );
+            }
+            if self.proxy_cache_cleanup.dry_run {
+                warnings.push(
+                    "proxy_cache_cleanup.enabled=true with dry_run=true — cache cleanup will report but never delete payloads; hidden access tracking remains active"
+                        .to_string(),
+                );
+            }
+        }
+
+        errors.extend(self.maven.validate_repositories());
+        errors.extend(self.npm.validate_repositories());
+        let maven_repository_names: HashSet<&str> = self
+            .maven
+            .repositories
+            .iter()
+            .map(MavenRepository::name)
+            .collect();
+        for npm_repository in &self.npm.repositories {
+            if maven_repository_names.contains(npm_repository.name()) {
+                errors.push(format!(
+                    "repository name {:?} is declared by both Maven and npm; \
+                     /repository/{{repository}} must identify exactly one format",
+                    npm_repository.name()
+                ));
+            }
         }
 
         // 8. Curation validation.
@@ -1008,14 +1139,15 @@ impl Config {
 
         // Storage (fail-closed: unknown NORA_STORAGE_MODE is fatal)
         self.storage.apply_env_overrides()?;
+        self.index.apply_env_overrides();
 
         // Auth
         self.auth.apply_env_overrides();
 
         // Registry configs (each handles its own NORA_*_ENABLED + format-specific vars)
         self.docker.apply_env_overrides();
-        self.maven.apply_env_overrides();
-        self.npm.apply_env_overrides();
+        self.maven.apply_env_overrides()?;
+        self.npm.apply_env_overrides()?;
         self.pypi.apply_env_overrides();
         self.go.apply_env_overrides();
         self.cargo.apply_env_overrides();
@@ -1034,6 +1166,7 @@ impl Config {
         self.signing.apply_env_overrides();
         self.gc.apply_env_overrides();
         self.retention.apply_env_overrides();
+        self.proxy_cache_cleanup.apply_env_overrides()?;
 
         // Secrets — SecretsConfig lives in crate::secrets, no apply_env_overrides method
         if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
@@ -1058,10 +1191,6 @@ mod tests {
     use super::*;
     use crate::digest_quarantine::QuarantineMode;
     use crate::secrets::ProtectedString;
-    use std::sync::{LazyLock, Mutex};
-
-    /// Serializes tests that manipulate `NORA_CURATION_*` env vars.
-    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_rate_limit_default() {
@@ -1139,6 +1268,7 @@ mod tests {
         assert!(n.proxy_auth.is_none());
         assert_eq!(n.proxy_timeout, 30);
         assert_eq!(n.metadata_ttl, 300);
+        assert_eq!(n.validator_max_age_secs, 3_600);
     }
 
     #[test]
@@ -1196,6 +1326,7 @@ mod tests {
 
     #[test]
     fn test_env_override_anonymous_read() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ANONYMOUS_READ", "true");
         config.apply_env_overrides().unwrap();
@@ -1247,6 +1378,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_anon_pull() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_DOCKER_ANON_PULL", "true");
         config.apply_env_overrides().unwrap();
@@ -1289,6 +1421,7 @@ mod tests {
 
     #[test]
     fn test_env_override_server() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_HOST", "0.0.0.0");
         std::env::set_var("NORA_PORT", "8080");
@@ -1399,6 +1532,7 @@ mod tests {
 
     #[test]
     fn test_env_override_auth() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_AUTH_ENABLED", "true");
         std::env::set_var("NORA_AUTH_HTPASSWD_FILE", "/etc/nora/users");
@@ -1414,6 +1548,7 @@ mod tests {
 
     #[test]
     fn test_env_override_maven_proxies() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var(
             "NORA_MAVEN_PROXIES",
@@ -1429,17 +1564,74 @@ mod tests {
     }
 
     #[test]
-    fn test_env_override_maven_checksum_and_immutable() {
+    fn test_env_override_maven_immutable() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
-        assert!(config.maven.checksum_verify); // default true
         assert!(config.maven.immutable_releases); // default true
-        std::env::set_var("NORA_MAVEN_CHECKSUM_VERIFY", "false");
         std::env::set_var("NORA_MAVEN_IMMUTABLE_RELEASES", "false");
         config.apply_env_overrides().unwrap();
-        assert!(!config.maven.checksum_verify);
         assert!(!config.maven.immutable_releases);
-        std::env::remove_var("NORA_MAVEN_CHECKSUM_VERIFY");
         std::env::remove_var("NORA_MAVEN_IMMUTABLE_RELEASES");
+    }
+
+    #[test]
+    fn test_env_override_named_maven_repositories() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut config = Config::default();
+        std::env::set_var(
+            "NORA_MAVEN_REPOSITORIES_JSON",
+            r#"[
+                {"kind":"hosted","name":"releases","version_policy":"release","write_policy":"allow"},
+                {"kind":"proxy","name":"central","url":"https://repo.maven.apache.org/maven2"},
+                {"kind":"group","name":"public","members":["central","releases"]}
+            ]"#,
+        );
+        std::env::set_var("NORA_MAVEN_DEFAULT_REPOSITORY", "public");
+        config.apply_env_overrides().unwrap();
+
+        assert_eq!(config.maven.repositories.len(), 3);
+        assert_eq!(config.maven.default_repository.as_deref(), Some("public"));
+        assert!(config.maven.validate_repositories().is_empty());
+
+        std::env::remove_var("NORA_MAVEN_REPOSITORIES_JSON");
+        std::env::remove_var("NORA_MAVEN_DEFAULT_REPOSITORY");
+    }
+
+    #[test]
+    fn test_named_maven_repository_validation_rejects_unknown_group_member() {
+        let mut config = Config::default();
+        config.maven.repositories = vec![MavenRepository::Group {
+            name: "public".to_string(),
+            members: vec!["missing".to_string()],
+        }];
+        config.maven.default_repository = Some("public".to_string());
+
+        let errors = config.maven.validate_repositories();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown member \"missing\"")));
+    }
+
+    #[test]
+    fn repository_names_are_unique_across_maven_and_npm() {
+        let mut config = Config::default();
+        config.maven.repositories = vec![MavenRepository::Hosted {
+            name: "private".to_string(),
+            version_policy: MavenVersionPolicy::Mixed,
+            write_policy: MavenWritePolicy::Allow,
+        }];
+        config.maven.default_repository = Some("private".to_string());
+        config.npm.repositories = vec![NpmRepository::Hosted {
+            name: "private".to_string(),
+            write_policy: NpmWritePolicy::AllowOnce,
+        }];
+        config.npm.default_repository = Some("private".to_string());
+
+        let (_, errors) = config.validate();
+        assert!(errors.iter().any(|error| {
+            error.contains("declared by both Maven and npm")
+                && error.contains("/repository/{repository}")
+        }));
     }
 
     #[test]
@@ -1450,11 +1642,13 @@ mod tests {
 
     #[test]
     fn test_env_override_npm() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_NPM_PROXY", "https://npm.company.com");
         std::env::set_var("NORA_NPM_PROXY_AUTH", "user:token");
         std::env::set_var("NORA_NPM_PROXY_TIMEOUT", "60");
         std::env::set_var("NORA_NPM_METADATA_TTL", "600");
+        std::env::set_var("NORA_NPM_VALIDATOR_MAX_AGE_SECS", "7200");
         config.apply_env_overrides().unwrap();
         assert_eq!(
             config.npm.proxy,
@@ -1466,14 +1660,17 @@ mod tests {
         );
         assert_eq!(config.npm.proxy_timeout, 60);
         assert_eq!(config.npm.metadata_ttl, 600);
+        assert_eq!(config.npm.validator_max_age_secs, 7200);
         std::env::remove_var("NORA_NPM_PROXY");
         std::env::remove_var("NORA_NPM_PROXY_AUTH");
         std::env::remove_var("NORA_NPM_PROXY_TIMEOUT");
         std::env::remove_var("NORA_NPM_METADATA_TTL");
+        std::env::remove_var("NORA_NPM_VALIDATOR_MAX_AGE_SECS");
     }
 
     #[test]
     fn test_env_override_raw() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_RAW_ENABLED", "false");
         std::env::set_var("NORA_RAW_MAX_FILE_SIZE", "524288000");
@@ -1489,6 +1686,7 @@ mod tests {
 
     #[test]
     fn test_env_override_rate_limit() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_RATE_LIMIT_ENABLED", "false");
         std::env::set_var("NORA_RATE_LIMIT_AUTH_RPS", "10");
@@ -1909,6 +2107,32 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_proxy_cache_cleanup_requires_nonzero_policy_bounds() {
+        let mut config = Config::default();
+        config.proxy_cache_cleanup.enabled = true;
+        config.proxy_cache_cleanup.interval_secs = 0;
+        config.proxy_cache_cleanup.min_cache_age_secs = 0;
+        config.proxy_cache_cleanup.min_idle_secs = 0;
+        let (_, errors) = config.validate();
+        assert_eq!(errors.len(), 3);
+        assert!(errors
+            .iter()
+            .all(|error| error.contains("proxy_cache_cleanup")));
+    }
+
+    #[test]
+    fn test_validate_proxy_cache_cleanup_dry_run_warns() {
+        let mut config = Config::default();
+        config.proxy_cache_cleanup.enabled = true;
+        config.proxy_cache_cleanup.dry_run = true;
+        let (warnings, errors) = config.validate();
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("proxy_cache_cleanup.enabled=true")));
+    }
+
+    #[test]
     fn test_validate_retention_enabled_empty_rules() {
         let mut config = Config::default();
         config.retention.enabled = true;
@@ -1992,6 +2216,7 @@ mod tests {
 
     #[test]
     fn test_env_override_docker_proxies_and_backward_compat() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // Test new NORA_DOCKER_PROXIES name
         std::env::remove_var("NORA_DOCKER_UPSTREAMS");
         std::env::set_var(
@@ -2026,6 +2251,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY", "https://goproxy.company.com");
         config.apply_env_overrides().unwrap();
@@ -2038,6 +2264,7 @@ mod tests {
 
     #[test]
     fn test_env_override_go_proxy_auth() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let mut config = Config::default();
         std::env::set_var("NORA_GO_PROXY_AUTH", "user:pass");
         config.apply_env_overrides().unwrap();
@@ -3061,6 +3288,7 @@ mod tests {
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
+            ..StorageConfig::default()
         };
         let debug_output = format!("{:?}", config);
         assert!(

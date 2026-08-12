@@ -3,7 +3,7 @@
 
 use axum::{
     body::Body,
-    extract::{MatchedPath, State},
+    extract::State,
     http::Request,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -92,14 +92,15 @@ pub static PROXY_UPSTREAM_304_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| 
 });
 
 /// Upstream 4xx responses that carried a policy/geo block signature (e.g. an AWS
-/// WAF geo rule via `x-amzn-waf-reason`) and were relayed as a bare 404. Lets an
-/// operator tell an effective region/policy outage apart from a genuine not-found
-/// — which is otherwise invisible (a 4xx logs nothing and never trips the breaker).
+/// WAF geo rule via `x-amzn-waf-reason`). Lets an operator tell an effective
+/// region/policy outage apart from a genuine not-found. Protocol handlers may
+/// map the response differently; Maven, for example, maps a blocked 404 to 502
+/// so it cannot be mistaken for an authoritative negative-cacheable miss.
 /// Labels: `registry`, `reason` (bounded: `geo` | `waf`) (#881).
 pub static UPSTREAM_POLICY_BLOCKED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_upstream_policy_blocked_total",
-        "Upstream 4xx responses bearing a policy/geo block signature, relayed as 404",
+        "Upstream 4xx responses bearing a detected policy/geo block signature",
         &["registry", "reason"]
     )
     .expect("failed to create UPSTREAM_POLICY_BLOCKED_TOTAL metric at startup")
@@ -130,7 +131,7 @@ pub static PROXY_REVALIDATION_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::
 
 /// Concurrent upstream fetches collapsed into one by the single-flight
 /// coalescer: a follower served the leader's in-memory result without making
-/// its own upstream round-trip (#595).
+/// its own upstream round-trip.
 pub static PROXY_COALESCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_proxy_coalesced_total",
@@ -140,9 +141,7 @@ pub static PROXY_COALESCED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create PROXY_COALESCED_TOTAL metric at startup")
 });
 
-/// Current number of in-flight single-flight leaders (distinct keys being
-/// fetched right now). A flat zero under load means coalescing is not engaging;
-/// a monotonic climb signals a guard leak (#595).
+/// Current number of distinct in-flight single-flight leaders.
 pub static PROXY_INFLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_proxy_inflight",
@@ -152,11 +151,8 @@ pub static PROXY_INFLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("failed to create PROXY_INFLIGHT metric at startup")
 });
 
-/// Followers that did NOT get the leader's result and fell through to their own
-/// upstream fetch — because the leader failed/cancelled (`leader`) or the wait
-/// budget elapsed while the leader was still fetching (`budget`). A `budget`
-/// rate rivalling `PROXY_COALESCED_TOTAL` means a slow upstream is re-stampeding
-/// past the coalescer; without this it degrades silently (#595).
+/// Followers that could not consume the leader result and performed their own
+/// upstream request (`leader` failure/cancellation or elapsed `budget`).
 pub static PROXY_COALESCE_FALLTHROUGH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_proxy_coalesce_fallthrough_total",
@@ -317,14 +313,169 @@ pub static UPLOADS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create UPLOADS_TOTAL metric at startup")
 });
 
-/// Storage size in bytes by registry (#431)
+/// Logical artifact size in bytes by registry (#431)
 pub static STORAGE_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "nora_storage_bytes",
-        "Stored artifact bytes per registry (label \"total\" = full storage footprint incl. metadata)",
+        "Logical artifact bytes per registry when exposed by an authoritative index snapshot",
         &["registry"]
     )
     .expect("failed to create STORAGE_BYTES metric at startup")
+});
+
+/// Persistent Maven/npm derived-index state (0=warming, 1=ready, 2=degraded).
+pub static INDEX_STATE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_state",
+        "Persistent Maven/npm derived-index state (0=warming, 1=ready, 2=degraded)"
+    )
+    .expect("failed to create INDEX_STATE metric at startup")
+});
+
+/// Monotonic published redb generation.
+pub static INDEX_GENERATION: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_generation",
+        "Published persistent Maven/npm derived-index generation"
+    )
+    .expect("failed to create INDEX_GENERATION metric at startup")
+});
+
+/// Durable accepted changes not yet included by the active slot watermark.
+pub static INDEX_PENDING_CHANGES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_pending_changes",
+        "Accepted persistent-index changes not yet covered by the active generation"
+    )
+    .expect("failed to create INDEX_PENDING_CHANGES metric at startup")
+});
+
+/// Current redb file size. This is derived metadata only, never artifact bytes.
+pub static INDEX_DATABASE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_database_bytes",
+        "Persistent derived-index database file size in bytes"
+    )
+    .expect("failed to create INDEX_DATABASE_BYTES metric at startup")
+});
+
+/// Existing derived DBs preserved after the isolated preflight exceeded its
+/// startup budget and NORA fell back to a fresh S3-backed reseed.
+pub static INDEX_PREFLIGHT_TIMEOUT_RESEED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_index_preflight_timeout_reseed_total",
+        "Persistent derived-index reseeds after a child preflight timeout"
+    )
+    .expect("failed to create INDEX_PREFLIGHT_TIMEOUT_RESEED_TOTAL metric at startup")
+});
+
+/// Reconciliation outcomes, using bounded non-sensitive error classes.
+pub static INDEX_RECONCILE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_reconcile_total",
+        "Persistent derived-index reconciliation outcomes",
+        &["result", "error_class"]
+    )
+    .expect("failed to create INDEX_RECONCILE_TOTAL metric at startup")
+});
+
+/// End-to-end duration of each full persistent-index reconciliation attempt.
+pub static INDEX_RECONCILE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_reconcile_duration_seconds",
+        "Persistent derived-index full reconciliation duration",
+        &["result"],
+        vec![0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0]
+    )
+    .expect("failed to create INDEX_RECONCILE_DURATION_SECONDS metric at startup")
+});
+
+/// Major full-reconcile stage duration. Stage names are fixed and separate S3
+/// inventory work from npm authority projection work.
+pub static INDEX_RECONCILE_STAGE_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_reconcile_stage_duration_seconds",
+        "Persistent-index full reconciliation stage duration",
+        &["stage", "result"],
+        vec![0.01, 0.1, 0.5, 1.0, 5.0, 15.0, 30.0, 60.0, 300.0, 900.0, 1800.0]
+    )
+    .expect("failed to create INDEX_RECONCILE_STAGE_DURATION_SECONDS metric at startup")
+});
+
+/// Durable redb writer commands by bounded command class and outcome. Labels
+/// are a fixed enum and never contain repository, package, path or credential
+/// material.
+pub static INDEX_REDB_COMMAND_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_redb_commands_total",
+        "Persistent-index redb writer commands",
+        &["command", "result"]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_TOTAL metric at startup")
+});
+
+/// Time spent inside one synchronous Immediate+2PC redb writer command.
+pub static INDEX_REDB_COMMAND_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_duration_seconds",
+        "Persistent-index redb writer command duration",
+        &["command", "result"],
+        vec![
+            0.0001, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            60.0,
+        ]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_DURATION_SECONDS metric at startup")
+});
+
+/// Number of rows admitted to one redb writer command.
+pub static INDEX_REDB_COMMAND_ROWS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_rows",
+        "Rows admitted to one persistent-index redb writer command",
+        &["command"],
+        vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_ROWS metric at startup")
+});
+
+/// Exact key plus serialized envelope bytes admitted to one bounded batch.
+pub static INDEX_REDB_COMMAND_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "nora_index_redb_command_bytes",
+        "Encoded key and envelope bytes admitted to one persistent-index redb writer command",
+        &["command"],
+        vec![
+            1024.0,
+            16_384.0,
+            65_536.0,
+            262_144.0,
+            1_048_576.0,
+            4_194_304.0,
+            8_388_608.0,
+        ]
+    )
+    .expect("failed to create INDEX_REDB_COMMAND_BYTES metric at startup")
+});
+
+/// npm package authority decisions made by a full S2. This is intentionally
+/// aggregate-only: package and repository names never become metric labels.
+pub static INDEX_NPM_RECONCILE_PACKAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_index_npm_reconcile_packages_total",
+        "npm packages processed by persistent-index reconciliation",
+        &["outcome"]
+    )
+    .expect("failed to create INDEX_NPM_RECONCILE_PACKAGES_TOTAL metric at startup")
+});
+
+/// Unix timestamp of the last successful full persistent-index reconciliation.
+pub static INDEX_LAST_SUCCESS_TIMESTAMP: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "nora_index_last_success_timestamp_seconds",
+        "Unix timestamp of the last successful full persistent-index reconciliation"
+    )
+    .expect("failed to create INDEX_LAST_SUCCESS_TIMESTAMP metric at startup")
 });
 
 /// Process uptime in seconds (gauge)
@@ -343,7 +494,20 @@ pub static CACHE_WRITE_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create CACHE_WRITE_ERRORS metric at startup")
 });
 
-/// Corrupt metadata detected during publish (#533)
+/// Optional proxy-cache materializations rejected before spawning because the
+/// bounded background writer pool is saturated. The upstream response has
+/// already been produced, so rejecting this derived cache write protects
+/// process memory without failing the client request.
+pub static BACKGROUND_CACHE_DROPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_background_cache_dropped_total",
+        "Optional proxy-cache writes dropped because the background writer pool is saturated",
+        &["registry"]
+    )
+    .expect("failed to create BACKGROUND_CACHE_DROPPED_TOTAL metric at startup")
+});
+
+/// Corrupt metadata detected during publish.
 pub static METADATA_CORRUPT_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "nora_metadata_corrupt_total",
@@ -489,18 +653,20 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Middleware to record request metrics
 pub async fn metrics_middleware(
-    matched_path: Option<MatchedPath>,
+    State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
     let start = Instant::now();
     let method = request.method().to_string();
-    let path = matched_path
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+    let request_path = request.uri().path().to_string();
 
     // Determine registry from path
-    let registry = detect_registry(&path);
+    // The matched route for named Maven and npm is intentionally identical, so
+    // classification must use the concrete repository name from the request
+    // URI and resolve it through config. Guessing from a name prefix would make
+    // custom Nexus-compatible names silently report under the wrong format.
+    let registry = detect_registry(&request_path, Some(&state.config));
 
     // Process request
     let response = next.run(request).await;
@@ -721,11 +887,24 @@ fn is_own_surface(path: &str) -> bool {
 }
 
 /// Detect registry type from path
-fn detect_registry(path: &str) -> String {
+fn detect_registry(path: &str, config: Option<&crate::config::Config>) -> String {
     if path.starts_with("/v2") {
         "docker".to_string()
     } else if path.starts_with("/maven2") {
         "maven".to_string()
+    } else if let Some(repository_path) = path.strip_prefix("/repository/") {
+        let repository = repository_path.split('/').next().unwrap_or("");
+        match config {
+            Some(config)
+                if config.maven.enabled && config.maven.repository(repository).is_some() =>
+            {
+                "maven".to_string()
+            }
+            Some(config) if config.npm.enabled && config.npm.repository(repository).is_some() => {
+                "npm".to_string()
+            }
+            _ => "other".to_string(),
+        }
     } else if path.starts_with("/npm") {
         "npm".to_string()
     } else if path.starts_with("/cargo") {
@@ -765,69 +944,114 @@ mod tests {
 
     #[test]
     fn test_detect_registry_docker() {
-        assert_eq!(detect_registry("/v2/nginx/manifests/latest"), "docker");
-        assert_eq!(detect_registry("/v2/"), "docker");
         assert_eq!(
-            detect_registry("/v2/library/alpine/blobs/sha256:abc"),
+            detect_registry("/v2/nginx/manifests/latest", None),
+            "docker"
+        );
+        assert_eq!(detect_registry("/v2/", None), "docker");
+        assert_eq!(
+            detect_registry("/v2/library/alpine/blobs/sha256:abc", None),
             "docker"
         );
     }
 
     #[test]
     fn test_detect_registry_maven() {
-        assert_eq!(detect_registry("/maven2/com/example/artifact"), "maven");
+        assert_eq!(
+            detect_registry("/maven2/com/example/artifact", None),
+            "maven"
+        );
+        let mut config = crate::config::Config::default();
+        config.maven.repositories = vec![crate::config::MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        }];
+        assert_eq!(
+            detect_registry("/repository/releases/com/example/artifact", Some(&config)),
+            "maven"
+        );
+        config.maven.enabled = false;
+        assert_eq!(
+            detect_registry("/repository/releases/com/example/artifact", Some(&config)),
+            "other"
+        );
     }
 
     #[test]
     fn test_detect_registry_npm() {
-        assert_eq!(detect_registry("/npm/lodash"), "npm");
-        assert_eq!(detect_registry("/npm/@scope/package"), "npm");
+        assert_eq!(detect_registry("/npm/lodash", None), "npm");
+        assert_eq!(detect_registry("/npm/@scope/package", None), "npm");
+        let mut config = crate::config::Config::default();
+        config.npm.repositories = vec![crate::config::NpmRepository::Hosted {
+            name: "packages".to_string(),
+            write_policy: crate::config::NpmWritePolicy::AllowOnce,
+        }];
+        assert_eq!(
+            detect_registry("/repository/packages/@scope/package", Some(&config)),
+            "npm"
+        );
+        assert_eq!(
+            detect_registry("/repository/unknown/pkg", Some(&config)),
+            "other"
+        );
+        config.npm.enabled = false;
+        assert_eq!(
+            detect_registry("/repository/packages/@scope/package", Some(&config)),
+            "other"
+        );
     }
 
     #[test]
     fn test_detect_registry_cargo_path() {
-        assert_eq!(detect_registry("/cargo/api/v1/crates"), "cargo");
+        assert_eq!(detect_registry("/cargo/api/v1/crates", None), "cargo");
     }
 
     #[test]
     fn test_detect_registry_pypi() {
-        assert_eq!(detect_registry("/simple/requests/"), "pypi");
+        assert_eq!(detect_registry("/simple/requests/", None), "pypi");
         assert_eq!(
-            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz"),
+            detect_registry("/packages/requests/1.0/requests-1.0.tar.gz", None),
             "pypi"
         );
     }
 
     #[test]
     fn test_detect_registry_ui() {
-        assert_eq!(detect_registry("/ui/dashboard"), "ui");
-        assert_eq!(detect_registry("/ui"), "ui");
+        assert_eq!(detect_registry("/ui/dashboard", None), "ui");
+        assert_eq!(detect_registry("/ui", None), "ui");
     }
 
     #[test]
     fn test_detect_registry_other() {
-        assert_eq!(detect_registry("/health"), "other");
-        assert_eq!(detect_registry("/ready"), "other");
-        assert_eq!(detect_registry("/unknown/path"), "other");
+        assert_eq!(detect_registry("/health", None), "other");
+        assert_eq!(detect_registry("/ready", None), "other");
+        assert_eq!(detect_registry("/unknown/path", None), "other");
     }
 
     #[test]
     fn test_detect_registry_go_path() {
         assert_eq!(
-            detect_registry("/go/github.com/user/repo/@v/v1.0.0.info"),
+            detect_registry("/go/github.com/user/repo/@v/v1.0.0.info", None),
             "go"
         );
-        assert_eq!(detect_registry("/go/github.com/user/repo/@latest"), "go");
+        assert_eq!(
+            detect_registry("/go/github.com/user/repo/@latest", None),
+            "go"
+        );
         // Bare prefix without trailing slash should not match
-        assert_eq!(detect_registry("/goblin/something"), "other");
+        assert_eq!(detect_registry("/goblin/something", None), "other");
     }
 
     #[test]
     fn test_detect_registry_raw_path() {
-        assert_eq!(detect_registry("/raw/my-project/artifact.tar.gz"), "raw");
-        assert_eq!(detect_registry("/raw/data/file.bin"), "raw");
+        assert_eq!(
+            detect_registry("/raw/my-project/artifact.tar.gz", None),
+            "raw"
+        );
+        assert_eq!(detect_registry("/raw/data/file.bin", None), "raw");
         // Bare prefix without trailing slash should not match
-        assert_eq!(detect_registry("/rawdata/file"), "other");
+        assert_eq!(detect_registry("/rawdata/file", None), "other");
     }
 
     #[test]
