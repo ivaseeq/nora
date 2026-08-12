@@ -576,6 +576,26 @@ fn sidecar_keys(kind: CandidateKind, key: &str) -> Vec<String> {
     }
 }
 
+fn maven_bundle_key(key: &str) -> &str {
+    [".md5", ".sha1", ".sha256", ".sha512"]
+        .into_iter()
+        .find_map(|suffix| key.strip_suffix(suffix))
+        .unwrap_or(key)
+}
+
+fn record_cleanup_mutation(
+    target: &CleanupTarget,
+    key: &str,
+    invalidated: &mut HashSet<&'static str>,
+    invalidated_maven_paths: &mut HashSet<String>,
+) {
+    if target.kind == CandidateKind::Maven {
+        invalidated_maven_paths.insert(maven_bundle_key(key).to_string());
+    } else {
+        invalidated.insert(target.registry);
+    }
+}
+
 pub async fn run_proxy_cache_cleanup(
     storage: &Storage,
     publish_locks: &PublishLocks,
@@ -591,6 +611,7 @@ pub async fn run_proxy_cache_cleanup(
     let mut result = ProxyCacheCleanupResult::default();
     let mut recovery_complete = true;
     let mut invalidated = HashSet::new();
+    let mut invalidated_maven_paths = HashSet::new();
     // Persistent Maven/npm share one atomic generation. Capture the destructive
     // admission gate once: this run's own first DELETE deliberately makes the
     // runtime Warming, while per-page revision checks plus exact-key S3
@@ -675,6 +696,7 @@ pub async fn run_proxy_cache_cleanup(
                     &mut result,
                     &mut recovery_complete,
                     &mut invalidated,
+                    &mut invalidated_maven_paths,
                 )
                 .await;
                 if result.cancelled {
@@ -714,6 +736,7 @@ pub async fn run_proxy_cache_cleanup(
                 &mut result,
                 &mut recovery_complete,
                 &mut invalidated,
+                &mut invalidated_maven_paths,
             )
             .await;
         }
@@ -731,6 +754,9 @@ pub async fn run_proxy_cache_cleanup(
     }
     for registry in invalidated {
         repo_index.invalidate(registry);
+    }
+    for key in invalidated_maven_paths {
+        repo_index.invalidate_maven_storage_key(&key);
     }
     result.duration_secs = started.elapsed().as_secs_f64();
     CLEANUP_DURATION.observe(result.duration_secs);
@@ -752,6 +778,7 @@ async fn process_cleanup_entries(
     result: &mut ProxyCacheCleanupResult,
     recovery_complete: &mut bool,
     invalidated: &mut HashSet<&'static str>,
+    invalidated_maven_paths: &mut HashSet<String>,
 ) {
     for entry in entries {
         let key = &entry.key;
@@ -786,6 +813,7 @@ async fn process_cleanup_entries(
             now,
             result,
             invalidated,
+            invalidated_maven_paths,
         )
         .await;
     }
@@ -803,6 +831,7 @@ async fn process_candidate(
     now: u64,
     result: &mut ProxyCacheCleanupResult,
     invalidated: &mut HashSet<&'static str>,
+    invalidated_maven_paths: &mut HashSet<String>,
 ) {
     if !old_enough(listed_meta.modified, policy.min_cache_age_secs, now) {
         CLEANUP_SKIPPED.with_label_values(&["cache_age"]).inc();
@@ -925,8 +954,20 @@ async fn process_candidate(
         return;
     }
     for sidecar in sidecar_keys(target.kind, key) {
+        match storage.stat(&sidecar).await {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(_) => {
+                result.failures += 1;
+                CLEANUP_SKIPPED.with_label_values(&["sidecar_stat"]).inc();
+                return;
+            }
+        }
         match storage.delete(&sidecar).await {
-            Ok(()) | Err(StorageError::NotFound) => {}
+            Ok(()) => {
+                record_cleanup_mutation(target, &sidecar, invalidated, invalidated_maven_paths)
+            }
+            Err(StorageError::NotFound) => {}
             Err(_) => {
                 result.failures += 1;
                 CLEANUP_SKIPPED.with_label_values(&["sidecar_delete"]).inc();
@@ -935,7 +976,7 @@ async fn process_candidate(
         }
     }
     match storage.delete(key).await {
-        Ok(()) => {}
+        Ok(()) => record_cleanup_mutation(target, key, invalidated, invalidated_maven_paths),
         Err(StorageError::NotFound) => return,
         Err(_) => {
             result.failures += 1;
@@ -949,7 +990,6 @@ async fn process_candidate(
     CLEANUP_BYTES
         .with_label_values(&[target.registry])
         .inc_by(current_meta.size);
-    invalidated.insert(target.registry);
     if let Err(error) = storage.delete(&marker_key).await {
         if !matches!(error, StorageError::NotFound) {
             result.failures += 1;
@@ -1672,7 +1712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_cleanup_pages_redb_inventory_without_storage_list() {
+    async fn persistent_maven_cleanup_promotes_lower_group_member_without_full_reconcile() {
         let root = tempfile::tempdir().unwrap();
         let inner = Storage::new_local(root.path().to_str().unwrap());
         let backend = Arc::new(FaultInjectBackend::new(inner.clone()));
@@ -1684,12 +1724,18 @@ mod tests {
             .unwrap();
         access.mark_recovered();
         let key = "maven/repositories/central/com/acme/demo/1.0/demo-1.0.jar";
-        storage.put(key, b"artifact").await.unwrap();
+        let fallback_key = "maven/repositories/hosted/com/acme/demo/1.0/demo-1.0.jar";
+        storage.put(key, b"upper").await.unwrap();
+        storage.put(fallback_key, b"lower-member").await.unwrap();
         make_old(root.path(), key, Duration::from_secs(100));
         write_marker(&storage, key, now_unix_secs() - 100).await;
 
         let index_dir = tempfile::tempdir().unwrap();
         let mut config = test_config();
+        let MavenRepository::Group { members, .. } = &mut config.maven.repositories[2] else {
+            panic!("test topology must contain a Maven group");
+        };
+        *members = vec!["central".to_string(), "hosted".to_string()];
         config.index.path = index_dir
             .path()
             .join("index.redb")
@@ -1703,6 +1749,16 @@ mod tests {
             .await
             .unwrap();
         index.reconcile_persistent_for_test().await.unwrap();
+        let prefixes = vec![
+            "maven/repositories/central/".to_string(),
+            "maven/repositories/hosted/".to_string(),
+        ];
+        let before = index
+            .persistent_maven_files(prefixes.clone(), "com/acme/demo/1.0".to_string(), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(before.items.len(), 1);
+        assert_eq!(before.items[0].1.size, b"upper".len() as u64);
         list_attempts.lock().clear();
         storage.set_mutation_observer(index.clone());
 
@@ -1721,9 +1777,123 @@ mod tests {
         assert_eq!(result.deleted, 1);
         assert_eq!(result.failures, 0);
         assert!(matches!(inner.get(key).await, Err(StorageError::NotFound)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !index.persistent_protocol_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "exact Maven cleanup repair did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after = index
+            .persistent_maven_files(prefixes, "com/acme/demo/1.0".to_string(), None, 10)
+            .await
+            .unwrap();
+        assert!(after.generation > before.generation);
+        assert_eq!(after.items.len(), 1);
+        assert_eq!(after.items[0].1.size, b"lower-member".len() as u64);
+        let attempts = list_attempts.lock().clone();
         assert!(
-            list_attempts.lock().is_empty(),
-            "cleanup must page redb rather than issue a storage LIST"
+            !attempts.iter().any(|prefix| prefix == "maven/"),
+            "cleanup must not fall back to a root Maven inventory scan: {attempts:?}"
+        );
+        assert_eq!(
+            attempts,
+            vec!["maven/repositories/central/com/acme/demo/1.0/".to_string()],
+            "the typed repair should reread only the changed bundle parent"
+        );
+
+        storage.clear_mutation_observer();
+        index.shutdown_persistent().await;
+    }
+
+    #[tokio::test]
+    async fn partial_maven_sidecar_delete_with_unknown_outcome_requires_full_reconcile() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(root.path().to_str().unwrap());
+        let key = "maven/repositories/central/com/acme/demo/1.0/demo-1.0.jar";
+        let md5 = format!("{key}.md5");
+        let sha1 = format!("{key}.sha1");
+        let backend =
+            Arc::new(FaultInjectBackend::new(inner.clone()).fail_delete_after(sha1.clone()));
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(backend);
+        let locks = test_locks();
+        let access = ProxyCacheAccess::start_session(storage.clone(), locks.clone())
+            .await
+            .unwrap();
+        access.mark_recovered();
+        storage.put(key, b"artifact").await.unwrap();
+        storage.put(&md5, b"md5").await.unwrap();
+        storage.put(&sha1, b"sha1").await.unwrap();
+        make_old(root.path(), key, Duration::from_secs(100));
+        write_marker(&storage, key, now_unix_secs() - 100).await;
+
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = HashSet::from([
+            crate::registry_type::RegistryType::Maven,
+            crate::registry_type::RegistryType::Npm,
+        ]);
+        let index = RepoIndex::open_persistent_for_test(&config, &enabled, storage.clone())
+            .await
+            .unwrap();
+        index.reconcile_persistent_for_test().await.unwrap();
+        let before = index.persistent_meta_for_test().await.unwrap();
+        list_attempts.lock().clear();
+        storage.set_mutation_observer(index.clone());
+
+        let result = run_proxy_cache_cleanup(
+            &storage,
+            &locks,
+            &access,
+            &config,
+            &test_policy(),
+            &index,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(result.deleted, 0);
+        assert!(result.failures >= 1);
+        assert!(inner.get(key).await.is_ok(), "payload must be kept");
+        assert!(matches!(inner.get(&md5).await, Err(StorageError::NotFound)));
+        assert!(matches!(
+            inner.get(&sha1).await,
+            Err(StorageError::NotFound)
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let meta = index.persistent_meta_for_test().await.unwrap();
+            if meta.generation > before.generation {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "confirmed partial delete was not repaired semantically"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !index.persistent_protocol_ready(),
+            "ambiguous delete outcome must retain the authoritative reconcile fence"
+        );
+        assert!(
+            !list_attempts.lock().iter().any(|prefix| prefix == "maven/"),
+            "typed partial repair itself must remain narrow"
+        );
+
+        index.reconcile_persistent_for_test().await.unwrap();
+        assert!(index.persistent_protocol_ready());
+        assert!(
+            list_attempts.lock().iter().any(|prefix| prefix == "maven/"),
+            "Unknown outcome must be discharged only by authoritative S2"
         );
 
         storage.clear_mutation_observer();

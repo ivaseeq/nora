@@ -14,8 +14,8 @@ mod redb_store;
 
 pub(crate) use persistent_builder::{PersistentIndexPhase, PersistentIndexProgress};
 pub(crate) use redb_store::{
-    preflight_database, ChangeEvent, ChildPreflight, PersistentIndex, StoreError, StoredNpmPackage,
-    StoredNpmVersion, MAX_QUERY_EXAMINED,
+    preflight_database, ChangeEvent, ChildPreflight, MavenIndexView, PersistentIndex, StoreError,
+    StoredNpmPackage, StoredNpmVersion, MAX_QUERY_EXAMINED,
 };
 
 use crate::config::Config;
@@ -55,6 +55,8 @@ fn index_error_class(error: &StoreError) -> &'static str {
         StoreError::WriterUnavailable => "writer_unavailable",
         StoreError::Superseded => "superseded",
         StoreError::TransactionTooLarge => "transaction_too_large",
+        StoreError::ProjectionOverflow => "projection_overflow",
+        StoreError::ProjectionInvariant(_) => "projection_invariant",
         StoreError::DiskAdmission(_) => "disk_admission",
         StoreError::Serialization(_) => "serialization",
         StoreError::Database(_) => "database",
@@ -74,6 +76,31 @@ fn reconcile_error_class(error: &persistent_builder::ReconcileError) -> &'static
 
 fn persistent_config_digest(config: &Config) -> Result<String, StoreError> {
     persistent_config_digest_with_schema(config, PERSISTENT_TOPOLOGY_SCHEMA)
+}
+
+fn maven_index_views(config: &Config) -> Vec<MavenIndexView> {
+    use crate::config::MavenRepository;
+
+    if config.maven.repositories.is_empty() {
+        return vec![MavenIndexView::legacy()];
+    }
+    config
+        .maven
+        .repositories
+        .iter()
+        .map(|repository| match repository {
+            MavenRepository::Hosted { name, .. } | MavenRepository::Proxy { name, .. } => {
+                MavenIndexView {
+                    repository: name.clone(),
+                    members: vec![name.clone()],
+                }
+            }
+            MavenRepository::Group { name, members } => MavenIndexView {
+                repository: name.clone(),
+                members: members.clone(),
+            },
+        })
+        .collect()
 }
 
 fn persistent_config_digest_with_schema(
@@ -526,6 +553,7 @@ struct PersistentRuntime {
     reconcile_interval: Duration,
     maven_enabled: bool,
     maven_named: bool,
+    maven_views: Vec<MavenIndexView>,
     npm_enabled: bool,
     requested_sequence: AtomicU64,
     published_sequence: AtomicU64,
@@ -1111,6 +1139,7 @@ async fn process_persistent_change(
                     runtime.storage.clone(),
                     sequence,
                     event,
+                    &runtime.maven_views,
                 )
                 .await
                 {
@@ -1253,6 +1282,7 @@ impl RepoIndex {
             reconcile_interval: Duration::from_secs(config.index.reconcile_interval_secs),
             maven_enabled,
             maven_named: !config.maven.repositories.is_empty(),
+            maven_views: maven_index_views(config),
             npm_enabled,
             requested_sequence: AtomicU64::new(accepted_change_seq),
             published_sequence: AtomicU64::new(if persisted_is_usable {
@@ -1376,6 +1406,7 @@ impl RepoIndex {
             runtime.config_digest.clone(),
             runtime.maven_enabled,
             runtime.npm_enabled,
+            &runtime.maven_views,
             &runtime.progress,
         )
         .await
@@ -1621,6 +1652,7 @@ impl RepoIndex {
 
     pub(crate) async fn persistent_maven_children(
         &self,
+        repository: String,
         prefixes: Vec<String>,
         logical_path: String,
         after: Option<String>,
@@ -1632,7 +1664,7 @@ impl RepoIndex {
             .ok_or(StoreError::WriterUnavailable)?;
         let index = persistent_projection_index(runtime)?;
         let (items, next_after, generation, has_direct_files) = index
-            .maven_children_page(prefixes, logical_path, after, limit)
+            .maven_children_page(repository, prefixes, logical_path, after, limit)
             .await?;
         Ok(PersistentMavenPage {
             items,
@@ -1640,6 +1672,25 @@ impl RepoIndex {
             generation,
             config_digest: runtime.config_digest.clone(),
             has_direct_files,
+        })
+    }
+
+    pub(crate) async fn persistent_maven_roots(
+        &self,
+        repositories: Vec<String>,
+    ) -> Result<PersistentMavenPage, StoreError> {
+        let runtime = self
+            .persistent
+            .as_ref()
+            .ok_or(StoreError::WriterUnavailable)?;
+        let index = persistent_projection_index(runtime)?;
+        let (items, generation) = index.maven_repository_rows(repositories).await?;
+        Ok(PersistentMavenPage {
+            items,
+            next_after: None,
+            generation,
+            config_digest: runtime.config_digest.clone(),
+            has_direct_files: false,
         })
     }
 
@@ -2100,6 +2151,7 @@ impl RepoIndex {
                         runtime.config_digest.clone(),
                         runtime.maven_enabled,
                         runtime.npm_enabled,
+                        &runtime.maven_views,
                         &runtime.progress,
                     )
                     .await
@@ -2341,30 +2393,48 @@ impl RepoIndex {
         });
     }
 
-    /// Publish the narrowest semantic invalidation available for a completed
-    /// proxy-cache write. Maven storage keys encode both the repository and
-    /// logical path, so a single cached artifact/metadata bundle does not need
-    /// to force a full S3 reconciliation. Other formats retain their existing
-    /// registry-wide behavior.
-    pub fn invalidate_cached_path(&self, registry: &str, key: &str) {
-        if registry == "maven" {
-            let named_layout = self
-                .persistent
-                .as_ref()
-                .is_some_and(|runtime| runtime.maven_named);
-            if named_layout {
-                if let Some(named) = key.strip_prefix("maven/repositories/") {
-                    if let Some((repository, path)) = named.split_once('/') {
+    /// Publish the narrowest semantic invalidation encoded by one Maven
+    /// storage key. Unparseable or topology-incompatible keys fail closed to
+    /// the existing registry-wide authoritative reconciliation.
+    pub fn invalidate_maven_storage_key(&self, key: &str) {
+        fn valid_path(path: &str) -> bool {
+            !path.is_empty()
+                && path
+                    .split('/')
+                    .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+        }
+
+        let named_layout = self
+            .persistent
+            .as_ref()
+            .is_some_and(|runtime| runtime.maven_named);
+        if named_layout {
+            if let Some(named) = key.strip_prefix("maven/repositories/") {
+                if let Some((repository, path)) = named.split_once('/') {
+                    if !repository.is_empty() && valid_path(path) {
                         self.invalidate_maven_path(repository, path);
                         return;
                     }
                 }
-            } else if let Some(path) = key.strip_prefix("maven/") {
+            }
+        } else if let Some(path) = key.strip_prefix("maven/") {
+            if valid_path(path) {
                 self.invalidate_maven_path("", path);
                 return;
             }
         }
-        self.invalidate(registry);
+        self.invalidate("maven");
+    }
+
+    /// Publish the narrowest semantic invalidation available for a completed
+    /// proxy-cache write. Other formats retain their existing registry-wide
+    /// behavior.
+    pub fn invalidate_cached_path(&self, registry: &str, key: &str) {
+        if registry == "maven" {
+            self.invalidate_maven_storage_key(key);
+        } else {
+            self.invalidate(registry);
+        }
     }
 
     pub fn invalidate_maven_ga(&self, repository: &str, ga_path: &str) {
@@ -4502,6 +4572,7 @@ mod tests {
         assert!(matches!(
             reopened
                 .persistent_maven_children(
+                    "releases".to_string(),
                     vec!["maven/repositories/releases/".to_string()],
                     String::new(),
                     None,
@@ -4514,6 +4585,7 @@ mod tests {
         reopened.reconcile_persistent_for_test().await.unwrap();
         assert!(reopened
             .persistent_maven_children(
+                "releases".to_string(),
                 vec!["maven/repositories/releases/".to_string()],
                 String::new(),
                 None,

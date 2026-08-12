@@ -268,6 +268,7 @@ struct MavenVersionGroup {
     group_name: String,
     versions: Vec<VersionEntry>,
     kind: MavenRetentionKind,
+    repository: String,
     storage_prefix: String,
     group_path: String,
     artifact_id: String,
@@ -276,6 +277,7 @@ struct MavenVersionGroup {
 #[derive(Debug, Clone)]
 struct MavenRetentionContext {
     kind: MavenRetentionKind,
+    repository: String,
     storage_prefix: String,
     group_path: String,
     artifact_id: String,
@@ -396,6 +398,7 @@ async fn collect_maven_versions(storage: &Storage, config: &MavenConfig) -> Vec<
                 group_name,
                 versions,
                 kind,
+                repository,
                 storage_prefix,
                 group_path: group_path.to_string(),
                 artifact_id: artifact_id.to_string(),
@@ -1813,6 +1816,7 @@ async fn aggregate_meta(storage: &Storage, keys: &[String]) -> Option<(u64, u64)
 #[derive(Default)]
 struct MavenDeletionOutcome {
     applied: bool,
+    mutated: bool,
     deleted_keys: usize,
     bytes_freed: u64,
 }
@@ -1840,9 +1844,11 @@ fn is_checksum_sidecar(key: &str) -> bool {
 }
 
 async fn delete_retention_key(storage: &Storage, key: &str) -> Result<(usize, u64), StorageError> {
-    let size = storage.stat(key).await?.map(|meta| meta.size).unwrap_or(0);
+    let Some(meta) = storage.stat(key).await? else {
+        return Ok((0, 0));
+    };
     match storage.delete(key).await {
-        Ok(()) => Ok((1, size)),
+        Ok(()) => Ok((1, meta.size)),
         Err(StorageError::NotFound) => Ok((0, 0)),
         Err(error) => Err(error),
     }
@@ -1920,6 +1926,12 @@ async fn delete_maven_plan(
     }
 
     if context.kind == MavenRetentionKind::Hosted {
+        // The hosted helper can delete A-level checksum sidecars before a
+        // later read or metadata regeneration fails. Conservatively publish
+        // the exact GA repair even on its error path so a confirmed partial
+        // mutation cannot leave the persistent projection Warming until the
+        // periodic full reconcile.
+        outcome.mutated = true;
         match crate::registry::update_hosted_metadata_after_retention(
             storage,
             &context.storage_prefix,
@@ -1930,6 +1942,9 @@ async fn delete_maven_plan(
         .await
         {
             Ok((deleted_keys, bytes_freed)) => {
+                // A successful hosted metadata helper may have rewritten the
+                // A-level document while reporting zero permanently removed
+                // keys. It still requires an exact GA projection refresh.
                 outcome.deleted_keys += deleted_keys;
                 outcome.bytes_freed += bytes_freed;
             }
@@ -1954,6 +1969,7 @@ async fn delete_maven_plan(
     {
         match delete_retention_key(storage, key).await {
             Ok((deleted, bytes)) => {
+                outcome.mutated |= deleted > 0;
                 outcome.deleted_keys += deleted;
                 outcome.bytes_freed += bytes;
             }
@@ -1971,6 +1987,7 @@ async fn delete_maven_plan(
     for key in plan.keys.iter().filter(|key| is_maven_metadata_base(key)) {
         match delete_retention_key(storage, key).await {
             Ok((deleted, bytes)) => {
+                outcome.mutated |= deleted > 0;
                 outcome.deleted_keys += deleted;
                 outcome.bytes_freed += bytes;
             }
@@ -1997,6 +2014,7 @@ async fn delete_maven_plan(
     for key in payload_keys {
         match delete_retention_key(storage, key).await {
             Ok((deleted, bytes)) => {
+                outcome.mutated |= deleted > 0;
                 outcome.deleted_keys += deleted;
                 outcome.bytes_freed += bytes;
             }
@@ -2070,6 +2088,7 @@ pub(crate) async fn run_retention_configured(
             group.group_name.clone(),
             MavenRetentionContext {
                 kind: group.kind,
+                repository: group.repository,
                 storage_prefix: group.storage_prefix,
                 group_path: group.group_path,
                 artifact_id: group.artifact_id,
@@ -2096,6 +2115,8 @@ pub(crate) async fn run_retention_configured(
     let mut total_deleted_keys = 0usize;
     let mut total_bytes = 0u64;
     let mut mutated_registries: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut mutated_maven_gas: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
     // rpm/deb repos whose packages were deleted — their indexes must be
     // rebuilt (and re-signed) afterwards or they keep advertising ghosts.
@@ -2202,17 +2223,12 @@ pub(crate) async fn run_retention_configured(
             }
             for plan in &plans {
                 let applied = if let Some(context) = maven_contexts.get(&group_name) {
-                    // The helper may have changed A-level sidecars before
-                    // returning an error. Invalidate conservatively whenever a
-                    // hosted metadata mutation is attempted.
-                    if context.kind == MavenRetentionKind::Hosted {
-                        mutated_registries.insert("maven".to_string());
-                    }
+                    let ga_path = format!("{}/{}", context.group_path, context.artifact_id);
                     let outcome = delete_maven_plan(storage, publish_locks, context, plan).await;
                     total_deleted_keys += outcome.deleted_keys;
                     total_bytes += outcome.bytes_freed;
-                    if outcome.deleted_keys > 0 {
-                        mutated_registries.insert("maven".to_string());
+                    if outcome.mutated {
+                        mutated_maven_gas.insert((context.repository.clone(), ga_path));
                     }
                     if !outcome.applied {
                         // A storage failure on one version is evidence that
@@ -2300,6 +2316,9 @@ pub(crate) async fn run_retention_configured(
 
     if !dry_run {
         if let Some(repo_index) = repo_index {
+            for (repository, ga_path) in mutated_maven_gas {
+                repo_index.invalidate_maven_ga(&repository, &ga_path);
+            }
             for registry in mutated_registries {
                 repo_index.invalidate(&registry);
             }
@@ -3092,6 +3111,7 @@ mod tests {
             .unwrap();
         let context = MavenRetentionContext {
             kind: group.kind,
+            repository: group.repository,
             storage_prefix: group.storage_prefix,
             group_path: group.group_path,
             artifact_id: group.artifact_id,
@@ -3331,6 +3351,119 @@ mod tests {
             !attempts.contains(&payload),
             "A-level metadata failure must abort before every version-object delete"
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_maven_partial_metadata_failure_repairs_index_without_full_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let prefix = "maven/repositories/releases/com/example/lib";
+        for version in ["1.0", "2.0"] {
+            inner
+                .put(
+                    &format!("{prefix}/{version}/lib-{version}.jar"),
+                    version.as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let a_metadata = format!("{prefix}/maven-metadata.xml");
+        seed_maven_metadata(
+            &inner,
+            &a_metadata,
+            br#"<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><latest>2.0</latest><release>2.0</release><versions><version>1.0</version><version>2.0</version></versions></versioning></metadata>"#,
+        )
+        .await;
+
+        // The helper deletes .md5 first, then this read fails before it can
+        // inspect/delete .sha1. This is a confirmed partial mutation without
+        // an Unknown write/delete outcome, so an exact GA repair is sufficient.
+        let failed_read = format!("{a_metadata}.sha1");
+        let backend =
+            crate::test_helpers::FaultInjectBackend::new(inner.clone()).fail_get(&failed_read);
+        let list_attempts = backend.list_attempts();
+        let storage = Storage::from_backend(Arc::new(backend));
+        let maven = single_named_maven(MavenRepository::Hosted {
+            name: "releases".to_string(),
+            version_policy: crate::config::MavenVersionPolicy::Mixed,
+            write_policy: crate::config::MavenWritePolicy::AllowOnce,
+        });
+        let index_dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            maven: maven.clone(),
+            ..crate::config::Config::default()
+        };
+        config.index.path = index_dir
+            .path()
+            .join("index.redb")
+            .to_string_lossy()
+            .into_owned();
+        let enabled = std::collections::HashSet::from([crate::registry_type::RegistryType::Maven]);
+        let repo_index = crate::repo_index::RepoIndex::open_persistent_for_test(
+            &config,
+            &enabled,
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        repo_index.reconcile_persistent_for_test().await.unwrap();
+        let before = repo_index.persistent_meta_for_test().await.unwrap();
+        list_attempts.lock().clear();
+        storage.set_mutation_observer(repo_index.clone());
+
+        let rules = vec![RetentionRule {
+            registry: "maven".to_string(),
+            name_glob: None,
+            keep_last: Some(1),
+            older_than_days: None,
+            exclude_tags: vec![],
+        }];
+        let result = run_retention_configured(
+            &storage,
+            &test_publish_locks(),
+            None,
+            &rules,
+            false,
+            &maven,
+            Some(repo_index.as_ref()),
+        )
+        .await;
+
+        assert_eq!(result.planned, 1);
+        assert!(inner
+            .get(&format!("{prefix}/1.0/lib-1.0.jar"))
+            .await
+            .is_ok());
+        assert!(matches!(
+            inner.get(&format!("{a_metadata}.md5")).await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(inner.get(&failed_read).await.is_ok());
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !repo_index.persistent_protocol_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "exact GA repair did not settle after partial hosted metadata mutation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let after = repo_index.persistent_meta_for_test().await.unwrap();
+        assert!(after.generation > before.generation);
+        assert!(!after.global_dirty);
+        assert_eq!(after.accepted_change_seq, after.active_watermark());
+        let attempts = list_attempts.lock().clone();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|prefix| prefix.as_str() == "maven/")
+                .count(),
+            1,
+            "retention performs one planning inventory; an additional root Maven LIST would be a full reconcile: {attempts:?}"
+        );
+
+        storage.clear_mutation_observer();
+        repo_index.shutdown_persistent().await;
     }
 
     #[tokio::test]

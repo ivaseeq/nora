@@ -180,6 +180,35 @@ all four exact harnesses, and binds the tested Harbor image digest. The Helm
 chart package/render has its own later digest gate because it does not exist at
 application build time.
 
+Use `scripts/redb-production-gate.sh` as the app-side entrypoint. `qualify`
+accepts the exact clean staged Git tree, archives that tree itself, builds and
+pushes the amd64 Harbor image by digest, runs the matrix, publishes and reads
+back OCI evidence, then emits one reviewable patch replacing exactly the
+approval JSON and its unique allowlist row. It never accepts a caller-supplied
+image. After that two-file patch is reviewed and checked in, argument-free
+`verify` derives the image and source tree only from the checked-in approval,
+re-fetches both immutable evidence and image, and fails closed on any source,
+lock, harness, label, digest, duplicate row or locator drift. It does not
+publish a chart or deploy Helm. The connected downstream command is
+`scripts/redb-production-promotion.sh preflight <chart-directory>` (or `apply`).
+The read-only `preflight` first runs argument-free app verification, requires
+the chart source annotation and default image digest to equal that approval,
+rejects an existing chart version, packages privately, renders locally and runs
+a server dry-run without pushing or applying. `apply` repeats those checks,
+pushes and reads back the chart manifest, repeats render and dry-run only by the
+immutable chart digest, then upgrades `testcloud-k8s/nora/nora` and verifies the
+running Pod's `status.containerStatuses[].imageID` against the same approved
+image digest. Both modes fail closed unless Harbor already has one enabled
+all-tags immutability rule scoped exactly to `helm-charts/nora`; the gate reads
+that policy with inline Docker auth but never creates or changes it.
+The hard CSI selector override explicitly deletes any reused
+`kubernetes.io/hostname` key from a private copy of the current user values,
+sets `storage.just-ai.com/linstor-csi-node=true`, and uses that complete copy
+with `--reset-values` so Helm cannot deep-merge the old hostname back. While
+redb is pinned to an exact Git revision, the public tag workflow is deliberately
+fail-closed so it cannot rebuild or publish an artifact different from the
+qualified Harbor image.
+
 ```bash
 # Auth
 docker run -d -p 4000:4000 \

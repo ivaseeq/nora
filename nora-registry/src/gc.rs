@@ -87,6 +87,10 @@ pub struct GcResult {
     pub deleted: usize,
     pub bytes_freed: u64,
     pub orphan_keys: Vec<String>,
+    /// Exact objects that were confirmed deleted during an apply run. This is
+    /// intentionally distinct from `orphan_keys`, which also contains dry-run
+    /// and grace-protected candidates.
+    pub deleted_keys: Vec<String>,
     pub duration_secs: f64,
     /// Registries with data but no GC orphan detection (name, file_count)
     pub uncovered: Vec<(String, usize)>,
@@ -227,6 +231,7 @@ pub async fn run_gc(
     });
 
     let mut deleted = 0usize;
+    let mut deleted_keys = Vec::new();
     let mut bytes_freed = 0u64;
     let mut skipped_recent = 0usize;
     let mut stat_failures = detection_read_failures + maintenance_failures.len();
@@ -330,6 +335,7 @@ pub async fn run_gc(
         };
         if removed {
             deleted += 1;
+            deleted_keys.push(key.clone());
             bytes_freed += meta.size;
             info!("Deleted: {}", key);
         }
@@ -412,6 +418,7 @@ pub async fn run_gc(
         deleted,
         bytes_freed,
         orphan_keys: all_orphans,
+        deleted_keys,
         duration_secs: duration,
         uncovered,
         metadata_phantoms_removed,
@@ -1683,10 +1690,28 @@ pub fn spawn_gc_scheduler(
             let result = run_gc(&storage, &publish_locks, dry_run, grace_secs).await;
             if !dry_run {
                 if result.deleted > 0 {
-                    for key in &result.orphan_keys {
-                        if let Some(registry) = key.split('/').next() {
-                            repo_index.invalidate(registry);
+                    let mut maven_paths = std::collections::HashSet::new();
+                    let mut registries = std::collections::HashSet::new();
+                    for key in &result.deleted_keys {
+                        match key.split('/').next() {
+                            Some("maven") => {
+                                let bundle = [".md5", ".sha1", ".sha256", ".sha512"]
+                                    .into_iter()
+                                    .find_map(|suffix| key.strip_suffix(suffix))
+                                    .unwrap_or(key);
+                                maven_paths.insert(bundle.to_string());
+                            }
+                            Some(registry) => {
+                                registries.insert(registry.to_string());
+                            }
+                            None => {}
                         }
+                    }
+                    for key in maven_paths {
+                        repo_index.invalidate_maven_storage_key(&key);
+                    }
+                    for registry in registries {
+                        repo_index.invalidate(&registry);
                     }
                 }
                 if result.metadata_phantoms_removed > 0 {
@@ -2071,6 +2096,7 @@ mod tests {
             deleted: 0,
             bytes_freed: 0,
             orphan_keys: vec![],
+            deleted_keys: vec![],
             duration_secs: 0.0,
             uncovered: vec![],
             metadata_phantoms_removed: 0,

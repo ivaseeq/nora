@@ -121,6 +121,12 @@ jobs:
       - name: Test redb production gate
         run: scripts/test-redb-production-release-gate.sh
 
+      - name: Test redb production entrypoint
+        run: scripts/redb-production-gate-test.sh
+
+      - name: Test connected redb app/chart promotion gate
+        run: scripts/redb-production-promotion-test.sh
+
       - name: Run tests
         run: cargo test --package nora-registry
 

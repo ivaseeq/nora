@@ -215,13 +215,16 @@ if [[ -z "$engine_revision" || -z "$schema_version" ]]; then
     exit 1
 fi
 
-approval=$(git -C "$ROOT" cat-file blob "$allowlist_oid" \
-    | awk -v kind="$source_kind" -v ref="$source_ref" \
-        '$1 == kind && $2 == ref && $1 !~ /^#/ { print; exit }')
-if [[ -z "$approval" ]]; then
-    echo "release blocked: redb $source_kind revision $source_ref has no reviewed crash/ENOSPC/recovery evidence" >&2
+mapfile -t approvals < <(
+    git -C "$ROOT" cat-file blob "$allowlist_oid" \
+        | awk -v kind="$source_kind" -v ref="$source_ref" \
+            '$1 == kind && $2 == ref && $1 !~ /^#/ { print }'
+)
+if ((${#approvals[@]} != 1)); then
+    echo "release blocked: redb $source_kind revision $source_ref must have exactly one reviewed crash/ENOSPC/recovery approval" >&2
     exit 1
 fi
+approval=${approvals[0]}
 read -r approved_kind approved_ref approved_commit approved_engine approved_schema evidence_digest evidence_locator extra <<<"$approval"
 if [[ -n "${extra:-}" \
     || "$approved_kind" != "$source_kind" \

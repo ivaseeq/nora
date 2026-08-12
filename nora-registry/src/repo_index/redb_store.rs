@@ -13,6 +13,7 @@ use redb::{
     WriteTransaction,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 /// Application-level identity of the redb engine contract. This MUST change
 /// together with `SCHEMA_VERSION` whenever the pinned development revision or
 /// the approved stable redb line changes, forcing a fresh derived DB rather
@@ -39,6 +40,10 @@ const OBJECTS_A: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects_a
 const OBJECTS_B: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects_b_v1");
 const REPOS_A: TableDefinition<&[u8], &[u8]> = TableDefinition::new("repos_a_v1");
 const REPOS_B: TableDefinition<&[u8], &[u8]> = TableDefinition::new("repos_b_v1");
+const MAVEN_PREFIX_STATS_A: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("maven_prefix_stats_a_v1");
+const MAVEN_PREFIX_STATS_B: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("maven_prefix_stats_b_v1");
 const NPM_PACKAGES_A: TableDefinition<&[u8], &[u8]> = TableDefinition::new("npm_packages_a_v1");
 const NPM_PACKAGES_B: TableDefinition<&[u8], &[u8]> = TableDefinition::new("npm_packages_b_v1");
 const NPM_VERSIONS_A: TableDefinition<&[u8], &[u8]> = TableDefinition::new("npm_versions_a_v1");
@@ -160,6 +165,36 @@ pub struct StoredRepo {
     pub is_file: bool,
 }
 
+/// Credential-free logical Maven view used by both the shadow builder and
+/// incremental first-wins repair. `members` contains physical direct
+/// repositories in lookup order. The empty member denotes the legacy
+/// `maven/` namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MavenIndexView {
+    pub repository: String,
+    pub members: Vec<String>,
+}
+
+impl MavenIndexView {
+    pub fn legacy() -> Self {
+        Self {
+            repository: String::new(),
+            members: vec![String::new()],
+        }
+    }
+}
+
+/// Exact, rebuildable aggregate for one logical Maven directory. Timestamps
+/// are intentionally absent: max-mtime cannot be decremented exactly on
+/// delete without another index or a subtree scan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MavenPrefixStats {
+    pub direct_files: u64,
+    pub direct_bytes: u64,
+    pub subtree_files: u64,
+    pub subtree_bytes: u64,
+}
+
 impl StoredRepo {
     fn into_repo_info(self) -> RepoInfo {
         RepoInfo {
@@ -266,11 +301,13 @@ impl ChangeEvent {
 pub enum IncrementalUpdate {
     Maven {
         entity_key: Vec<u8>,
+        repository: String,
         object_prefix: Vec<u8>,
         repo_prefix: Vec<u8>,
         repo_recursive: bool,
         objects: Vec<(Vec<u8>, StoredObject)>,
         repos: Vec<(Vec<u8>, StoredRepo)>,
+        views: Vec<MavenIndexView>,
     },
     Npm {
         entity_key: Vec<u8>,
@@ -295,6 +332,10 @@ pub enum StoreError {
     Superseded,
     #[error("index transaction exceeds {MAX_TX_ROWS} rows or {MAX_TX_BYTES} serialized bytes")]
     TransactionTooLarge,
+    #[error("index projection arithmetic overflow")]
+    ProjectionOverflow,
+    #[error("index projection invariant failed: {0}")]
+    ProjectionInvariant(String),
     #[error("index shadow build rejected: {0}")]
     DiskAdmission(String),
     #[error("index serialization failed: {0}")]
@@ -385,6 +426,28 @@ fn repo_table(slot: Slot) -> TableDefinition<'static, &'static [u8], &'static [u
         Slot::A => REPOS_A,
         Slot::B => REPOS_B,
     }
+}
+
+fn maven_prefix_stats_table(slot: Slot) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
+    match slot {
+        Slot::A => MAVEN_PREFIX_STATS_A,
+        Slot::B => MAVEN_PREFIX_STATS_B,
+    }
+}
+
+pub fn maven_member_prefix(repository: &str) -> String {
+    if repository.is_empty() {
+        "maven/".to_string()
+    } else {
+        format!("maven/repositories/{repository}/")
+    }
+}
+
+pub fn maven_prefix_stats_key(repository: &str, logical_path: &str) -> Vec<u8> {
+    let mut key = repository.as_bytes().to_vec();
+    key.push(0);
+    key.extend_from_slice(logical_path.trim_matches('/').as_bytes());
+    key
 }
 
 fn npm_package_table(slot: Slot) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
@@ -600,6 +663,16 @@ fn initialise(db: &Database, config_digest: String) -> Result<(), StoreError> {
                     .map_err(|error| StoreError::Database(error.to_string()))?,
             );
         }
+        for table in [
+            maven_prefix_stats_table(Slot::A),
+            maven_prefix_stats_table(Slot::B),
+        ] {
+            drop(
+                transaction
+                    .open_table(table)
+                    .map_err(|error| StoreError::Database(error.to_string()))?,
+            );
+        }
         for table in [npm_package_table(Slot::A), npm_package_table(Slot::B)] {
             drop(
                 transaction
@@ -654,6 +727,12 @@ enum WriterCommand {
     PutRepos {
         slot: Slot,
         rows: Vec<(Vec<u8>, StoredRepo)>,
+        encoded_bytes: usize,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    PutMavenPrefixStats {
+        slot: Slot,
+        rows: Vec<(Vec<u8>, MavenPrefixStats)>,
         encoded_bytes: usize,
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
@@ -989,6 +1068,21 @@ impl PersistentIndex {
         .await
     }
 
+    pub async fn put_maven_prefix_stats(
+        &self,
+        slot: Slot,
+        rows: Vec<(Vec<u8>, MavenPrefixStats)>,
+    ) -> Result<(), StoreError> {
+        let encoded_bytes = Self::check_batch(&rows)?;
+        self.send(|reply| WriterCommand::PutMavenPrefixStats {
+            slot,
+            rows,
+            encoded_bytes,
+            reply,
+        })
+        .await
+    }
+
     pub async fn clear_slot(&self, slot: Slot) -> Result<(), StoreError> {
         loop {
             let more = self
@@ -1225,12 +1319,63 @@ impl PersistentIndex {
         .await
     }
 
+    /// Read exact root aggregates for configured logical repositories. A
+    /// missing row remains unavailable; an explicit zero row is an exact empty
+    /// repository and must not be conflated with warming/incomplete state.
+    pub async fn maven_repository_rows(
+        &self,
+        repositories: Vec<String>,
+    ) -> Result<(Vec<RepoInfo>, u64), StoreError> {
+        self.read(move |transaction, state| {
+            let Some(slot) = state.active_slot else {
+                return Ok((
+                    repositories
+                        .into_iter()
+                        .map(|name| RepoInfo {
+                            name,
+                            versions: 0,
+                            size: 0,
+                            size_available: false,
+                            updated: "N/A".to_string(),
+                            is_file: false,
+                        })
+                        .collect(),
+                    state.generation,
+                ));
+            };
+            let table = transaction
+                .open_table(maven_prefix_stats_table(slot))
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let mut rows = Vec::with_capacity(repositories.len());
+            for name in repositories {
+                let stats = table
+                    .get(maven_prefix_stats_key(&name, "").as_slice())
+                    .map_err(|error| StoreError::Database(error.to_string()))?
+                    .map(|value| decode::<MavenPrefixStats>(value.value()))
+                    .transpose()?;
+                rows.push(RepoInfo {
+                    name,
+                    versions: stats
+                        .map(|stats| usize::try_from(stats.subtree_files).unwrap_or(usize::MAX))
+                        .unwrap_or(0),
+                    size: stats.map_or(0, |stats| stats.subtree_bytes),
+                    size_available: stats.is_some() && state.completeness.maven,
+                    updated: "N/A".to_string(),
+                    is_file: false,
+                });
+            }
+            Ok((rows, state.generation))
+        })
+        .await
+    }
+
     /// Read immediate Maven child directories with prefix seeks. Each member
     /// contributes at most `limit + 1` child names; group members are merged in
-    /// configured order and directory aggregates are intentionally unavailable
-    /// rather than requiring a subtree scan.
+    /// configured order and exact subtree aggregates come from the same active
+    /// A/B generation.
     pub async fn maven_children_page(
         &self,
+        repository: String,
         prefixes: Vec<String>,
         logical_path: String,
         after: Option<String>,
@@ -1245,6 +1390,9 @@ impl PersistentIndex {
             };
             let table = transaction
                 .open_table(object_table(slot))
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let stats_table = transaction
+                .open_table(maven_prefix_stats_table(slot))
                 .map_err(|error| StoreError::Database(error.to_string()))?;
             let mut children = std::collections::BTreeMap::<String, usize>::new();
             let mut has_direct_files = false;
@@ -1308,15 +1456,29 @@ impl PersistentIndex {
             let next = has_more.then(|| names.last().cloned()).flatten();
             let rows = names
                 .into_iter()
-                .map(|name| RepoInfo {
-                    name,
-                    versions: 0,
-                    size: 0,
-                    size_available: false,
-                    updated: "N/A".to_string(),
-                    is_file: false,
+                .map(|name| {
+                    let child_path = if logical_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{name}", logical_path.trim_matches('/'))
+                    };
+                    let stats = stats_table
+                        .get(maven_prefix_stats_key(&repository, &child_path).as_slice())
+                        .map_err(|error| StoreError::Database(error.to_string()))?
+                        .map(|value| decode::<MavenPrefixStats>(value.value()))
+                        .transpose()?;
+                    Ok(RepoInfo {
+                        name,
+                        versions: stats
+                            .map(|stats| usize::try_from(stats.subtree_files).unwrap_or(usize::MAX))
+                            .unwrap_or(0),
+                        size: stats.map_or(0, |stats| stats.subtree_bytes),
+                        size_available: stats.is_some() && state.completeness.maven,
+                        updated: "N/A".to_string(),
+                        is_file: false,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, StoreError>>()?;
             Ok((rows, next, state.generation, has_direct_files))
         })
         .await
@@ -2319,40 +2481,50 @@ fn put_npm_batch(
 fn clear_table_chunk(
     transaction: &WriteTransaction,
     definition: TableDefinition<'static, &'static [u8], &'static [u8]>,
-) -> Result<bool, StoreError> {
+    limit: usize,
+) -> Result<(bool, usize), StoreError> {
     let mut table = transaction
         .open_table(definition)
         .map_err(|error| StoreError::Database(error.to_string()))?;
     let keys: Vec<Vec<u8>> = table
         .iter()
         .map_err(|error| StoreError::Database(error.to_string()))?
-        .take(MAX_TX_ROWS + 1)
+        .take(limit.saturating_add(1))
         .map(|entry| {
             entry
                 .map(|(key, _)| key.value().to_vec())
                 .map_err(|error| StoreError::Database(error.to_string()))
         })
         .collect::<Result<_, _>>()?;
-    let more = keys.len() > MAX_TX_ROWS;
-    for key in keys.into_iter().take(MAX_TX_ROWS) {
+    let more = keys.len() > limit;
+    let removed = keys.len().min(limit);
+    for key in keys.into_iter().take(limit) {
         table
             .remove(key.as_slice())
             .map_err(|error| StoreError::Database(error.to_string()))?;
     }
-    Ok(more)
+    Ok((more, removed))
 }
 
 fn clear_slot_chunk(db: &Database, slot: Slot) -> Result<bool, StoreError> {
     commit(db, |transaction| {
         let mut more = false;
+        let mut remaining = MAX_TX_ROWS;
         for table in [
             object_table(slot),
             repo_table(slot),
+            maven_prefix_stats_table(slot),
             npm_package_table(slot),
             npm_version_table(slot),
             npm_observation_table(slot),
         ] {
-            more |= clear_table_chunk(transaction, table)?;
+            if remaining == 0 {
+                // Later tables were not inspected in this transaction.
+                return Ok(true);
+            }
+            let (table_more, removed) = clear_table_chunk(transaction, table, remaining)?;
+            more |= table_more;
+            remaining = remaining.saturating_sub(removed);
         }
         Ok(more)
     })
@@ -2590,6 +2762,282 @@ pub(crate) fn apply_totals_delta(totals: &mut RegistryTotals, delta: TotalsDelta
         .saturating_add(delta.new_bytes);
 }
 
+#[derive(Debug, Default, Serialize)]
+struct MavenStatsReplacement {
+    old_direct_files: u64,
+    old_direct_bytes: u64,
+    new_direct_files: u64,
+    new_direct_bytes: u64,
+    old_subtree_files: u64,
+    old_subtree_bytes: u64,
+    new_subtree_files: u64,
+    new_subtree_bytes: u64,
+    requires_existing: bool,
+}
+
+fn checked_accumulate(value: &mut u64, delta: u64) -> Result<(), StoreError> {
+    *value = value
+        .checked_add(delta)
+        .ok_or(StoreError::ProjectionOverflow)?;
+    Ok(())
+}
+
+fn replace_counter(value: u64, old: u64, new: u64) -> Result<u64, StoreError> {
+    value
+        .checked_sub(old)
+        .and_then(|value| value.checked_add(new))
+        .ok_or(StoreError::ProjectionOverflow)
+}
+
+fn maven_directory_ancestors(logical_path: &str) -> Result<(String, Vec<String>), StoreError> {
+    if logical_path
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(StoreError::ProjectionInvariant(
+            "Maven object path contains an invalid component".to_string(),
+        ));
+    }
+    let parent = logical_path
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+        .to_string();
+    let mut ancestors = vec![String::new()];
+    if !parent.is_empty() {
+        let mut current = String::new();
+        for component in parent.split('/') {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            ancestors.push(current.clone());
+        }
+    }
+    Ok((parent, ancestors))
+}
+
+fn add_maven_winner_replacement(
+    replacements: &mut BTreeMap<Vec<u8>, (String, MavenStatsReplacement)>,
+    repository: &str,
+    logical_path: &str,
+    old: Option<&FileMeta>,
+    new: Option<&FileMeta>,
+) -> Result<(), StoreError> {
+    if old.map(|meta| meta.size) == new.map(|meta| meta.size) {
+        return Ok(());
+    }
+    let (parent, ancestors) = maven_directory_ancestors(logical_path)?;
+    let direct_key = maven_prefix_stats_key(repository, &parent);
+    let direct = &mut replacements
+        .entry(direct_key)
+        .or_insert_with(|| (parent, MavenStatsReplacement::default()))
+        .1;
+    if let Some(meta) = old {
+        checked_accumulate(&mut direct.old_direct_files, 1)?;
+        checked_accumulate(&mut direct.old_direct_bytes, meta.size)?;
+        direct.requires_existing = true;
+    }
+    if let Some(meta) = new {
+        checked_accumulate(&mut direct.new_direct_files, 1)?;
+        checked_accumulate(&mut direct.new_direct_bytes, meta.size)?;
+    }
+    for ancestor in ancestors {
+        let key = maven_prefix_stats_key(repository, &ancestor);
+        let replacement = &mut replacements
+            .entry(key)
+            .or_insert_with(|| (ancestor, MavenStatsReplacement::default()))
+            .1;
+        if let Some(meta) = old {
+            checked_accumulate(&mut replacement.old_subtree_files, 1)?;
+            checked_accumulate(&mut replacement.old_subtree_bytes, meta.size)?;
+            replacement.requires_existing = true;
+        }
+        if let Some(meta) = new {
+            checked_accumulate(&mut replacement.new_subtree_files, 1)?;
+            checked_accumulate(&mut replacement.new_subtree_bytes, meta.size)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_maven_object_meta(
+    objects: &redb::Table<&[u8], &[u8]>,
+    key: &[u8],
+) -> Result<Option<FileMeta>, StoreError> {
+    objects
+        .get(key)
+        .map_err(|error| StoreError::Database(error.to_string()))?
+        .map(|value| decode::<StoredObject>(value.value()).map(|stored| stored.meta))
+        .transpose()
+}
+
+fn maven_winner(
+    objects: &redb::Table<&[u8], &[u8]>,
+    view: &MavenIndexView,
+    logical_path: &str,
+    changed_repository: &str,
+    changed_after: Option<&BTreeMap<String, FileMeta>>,
+) -> Result<Option<FileMeta>, StoreError> {
+    for member in &view.members {
+        let meta = if changed_after.is_some() && member == changed_repository {
+            changed_after.and_then(|objects| objects.get(logical_path).cloned())
+        } else {
+            let key = format!("{}{logical_path}", maven_member_prefix(member));
+            read_maven_object_meta(objects, key.as_bytes())?
+        };
+        if meta.is_some() {
+            return Ok(meta);
+        }
+    }
+    Ok(None)
+}
+
+fn apply_maven_prefix_replacements(
+    transaction: &WriteTransaction,
+    slot: Slot,
+    replacements: BTreeMap<Vec<u8>, (String, MavenStatsReplacement)>,
+) -> Result<(), StoreError> {
+    let mut table = transaction
+        .open_table(maven_prefix_stats_table(slot))
+        .map_err(|error| StoreError::Database(error.to_string()))?;
+    for (key, (path, replacement)) in replacements {
+        let existing = table
+            .get(key.as_slice())
+            .map_err(|error| StoreError::Database(error.to_string()))?
+            .map(|value| decode::<MavenPrefixStats>(value.value()))
+            .transpose()?;
+        if existing.is_none() && replacement.requires_existing {
+            return Err(StoreError::ProjectionInvariant(format!(
+                "missing Maven prefix aggregate for {path:?}"
+            )));
+        }
+        let mut stats = existing.unwrap_or_default();
+        stats.direct_files = replace_counter(
+            stats.direct_files,
+            replacement.old_direct_files,
+            replacement.new_direct_files,
+        )?;
+        stats.direct_bytes = replace_counter(
+            stats.direct_bytes,
+            replacement.old_direct_bytes,
+            replacement.new_direct_bytes,
+        )?;
+        stats.subtree_files = replace_counter(
+            stats.subtree_files,
+            replacement.old_subtree_files,
+            replacement.new_subtree_files,
+        )?;
+        stats.subtree_bytes = replace_counter(
+            stats.subtree_bytes,
+            replacement.old_subtree_bytes,
+            replacement.new_subtree_bytes,
+        )?;
+        let empty = stats == MavenPrefixStats::default();
+        if empty && !path.is_empty() {
+            table
+                .remove(key.as_slice())
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+        } else {
+            let value = encode(stats)?;
+            table
+                .insert(key.as_slice(), value.as_slice())
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_maven_prefix_replacements(
+    objects: &redb::Table<&[u8], &[u8]>,
+    repository: &str,
+    old_keys: &[Vec<u8>],
+    new_rows: &[(Vec<u8>, StoredObject)],
+    views: &[MavenIndexView],
+) -> Result<BTreeMap<Vec<u8>, (String, MavenStatsReplacement)>, StoreError> {
+    if views.is_empty() {
+        return Err(StoreError::ProjectionInvariant(format!(
+            "Maven repository {repository:?} has no logical view"
+        )));
+    }
+    let base = maven_member_prefix(repository);
+    let mut logical_paths = BTreeSet::new();
+    for key in old_keys.iter().chain(new_rows.iter().map(|(key, _)| key)) {
+        let key = std::str::from_utf8(key)
+            .map_err(|_| StoreError::ProjectionInvariant("non-UTF-8 Maven key".to_string()))?;
+        let logical = key.strip_prefix(&base).ok_or_else(|| {
+            StoreError::ProjectionInvariant(
+                "Maven incremental row escaped its repository prefix".to_string(),
+            )
+        })?;
+        if repository.is_empty() && logical.starts_with("repositories/") {
+            continue;
+        }
+        logical_paths.insert(logical.to_string());
+    }
+    let new_by_logical = new_rows
+        .iter()
+        .filter_map(|(key, row)| {
+            let key = std::str::from_utf8(key).ok()?;
+            let logical = key.strip_prefix(&base)?;
+            Some((logical.to_string(), row.meta.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut work = 0usize;
+    let mut replacements = BTreeMap::new();
+    for view in views {
+        if !view.members.iter().any(|member| member == repository) {
+            return Err(StoreError::ProjectionInvariant(format!(
+                "Maven view {:?} does not contain changed repository {repository:?}",
+                view.repository
+            )));
+        }
+        work = work
+            .checked_add(
+                logical_paths
+                    .len()
+                    .checked_mul(view.members.len())
+                    .and_then(|lookups| lookups.checked_mul(2))
+                    .ok_or(StoreError::ProjectionOverflow)?,
+            )
+            .ok_or(StoreError::ProjectionOverflow)?;
+        if work > MAX_TX_ROWS {
+            return Err(StoreError::TransactionTooLarge);
+        }
+        for logical in &logical_paths {
+            let before = maven_winner(objects, view, logical, repository, None)?;
+            let after = maven_winner(objects, view, logical, repository, Some(&new_by_logical))?;
+            add_maven_winner_replacement(
+                &mut replacements,
+                &view.repository,
+                logical,
+                before.as_ref(),
+                after.as_ref(),
+            )?;
+        }
+    }
+    if replacements.len() > MAX_TX_ROWS {
+        return Err(StoreError::TransactionTooLarge);
+    }
+    let encoded_bytes = maven_replacements_encoded_bytes(&replacements)?;
+    if encoded_bytes > MAX_TX_BYTES {
+        return Err(StoreError::TransactionTooLarge);
+    }
+    Ok(replacements)
+}
+
+fn maven_replacements_encoded_bytes(
+    replacements: &BTreeMap<Vec<u8>, (String, MavenStatsReplacement)>,
+) -> Result<usize, StoreError> {
+    replacements
+        .iter()
+        .try_fold(0usize, |total, (key, (_, row))| {
+            total
+                .checked_add(encoded_row_bytes(key, row)?)
+                .ok_or(StoreError::ProjectionOverflow)
+        })
+}
+
 fn apply_update_to_slot(
     transaction: &WriteTransaction,
     slot: Slot,
@@ -2597,11 +3045,13 @@ fn apply_update_to_slot(
 ) -> Result<TotalsDelta, StoreError> {
     match update {
         IncrementalUpdate::Maven {
+            repository,
             object_prefix,
             repo_prefix,
             repo_recursive,
             objects: rows,
             repos,
+            views,
             ..
         } => {
             let mut objects = transaction
@@ -2627,6 +3077,25 @@ fn apply_update_to_slot(
                 child_prefix.push(b'/');
                 repo_keys.extend(table_prefix_keys(&repos_table, &child_prefix)?);
             }
+            let prefix_replacements =
+                prepare_maven_prefix_replacements(&objects, repository, &object_keys, rows, views)?;
+            let delete_key_bytes =
+                object_keys
+                    .iter()
+                    .chain(&repo_keys)
+                    .try_fold(0usize, |total, key| {
+                        total
+                            .checked_add(key.len())
+                            .ok_or(StoreError::ProjectionOverflow)
+                    })?;
+            let projected_bytes = serde_json::to_vec(update)?
+                .len()
+                .checked_add(maven_replacements_encoded_bytes(&prefix_replacements)?)
+                .and_then(|bytes| bytes.checked_add(delete_key_bytes))
+                .ok_or(StoreError::ProjectionOverflow)?;
+            if projected_bytes > MAX_TX_BYTES {
+                return Err(StoreError::TransactionTooLarge);
+            }
             let mut old_artifacts = 0u64;
             let mut old_bytes = 0u64;
             for key in &repo_keys {
@@ -2649,6 +3118,7 @@ fn apply_update_to_slot(
                 .saturating_add(repo_keys.len())
                 .saturating_add(rows.len())
                 .saturating_add(repos.len())
+                .saturating_add(prefix_replacements.len())
                 > MAX_TX_ROWS
             {
                 return Err(StoreError::TransactionTooLarge);
@@ -2675,6 +3145,7 @@ fn apply_update_to_slot(
                     .insert(key.as_slice(), value.as_slice())
                     .map_err(|error| StoreError::Database(error.to_string()))?;
             }
+            apply_maven_prefix_replacements(transaction, slot, prefix_replacements)?;
             Ok(TotalsDelta {
                 npm: false,
                 old_artifacts,
@@ -2956,6 +3427,29 @@ fn writer_loop(
                 let started = std::time::Instant::now();
                 let result = put_batch(&db, repo_table(slot), rows);
                 observe_writer_command("repos", row_count, encoded_bytes, started, &result);
+                let failed = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(StoreError::poisons_writer);
+                let _ = reply.send(result);
+                failed
+            }
+            WriterCommand::PutMavenPrefixStats {
+                slot,
+                rows,
+                encoded_bytes,
+                reply,
+            } => {
+                let row_count = rows.len();
+                let started = std::time::Instant::now();
+                let result = put_batch(&db, maven_prefix_stats_table(slot), rows);
+                observe_writer_command(
+                    "maven_prefix_stats",
+                    row_count,
+                    encoded_bytes,
+                    started,
+                    &result,
+                );
                 let failed = result
                     .as_ref()
                     .err()

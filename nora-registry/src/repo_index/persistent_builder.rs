@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: MIT
 
 use super::redb_store::{
-    apply_totals_delta, encoded_row_bytes, npm_package_key, npm_version_key, repo_key, ChangeEvent,
-    IncrementalUpdate, MetaState, PersistentIndex, RegistryCompleteness, RegistryTotals, Slot,
+    apply_totals_delta, encoded_row_bytes, maven_member_prefix, maven_prefix_stats_key,
+    npm_package_key, npm_version_key, repo_key, ChangeEvent, IncrementalUpdate, MavenIndexView,
+    MavenPrefixStats, MetaState, PersistentIndex, RegistryCompleteness, RegistryTotals, Slot,
     StoreError, StoredNpmPackage, StoredNpmVersion, StoredObject, StoredRepo, MAX_QUERY_EXAMINED,
     MAX_TX_BYTES, MAX_TX_ROWS,
 };
 use super::{npm_search_projection, valid_index_sha256};
 use crate::storage::{FileMeta, Storage, StorageError};
 use futures::StreamExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -236,6 +237,283 @@ impl<'a> NpmVersionBatch<'a> {
     async fn finish(mut self) -> Result<(), ReconcileError> {
         self.flush().await
     }
+}
+
+fn checked_add_counter(value: &mut u64, delta: u64) -> Result<(), StoreError> {
+    *value = value
+        .checked_add(delta)
+        .ok_or(StoreError::ProjectionOverflow)?;
+    Ok(())
+}
+
+const MAVEN_STATS_SCAN_PAGE_ROWS: usize = 64;
+
+struct MavenMemberCursor {
+    base: String,
+    after: Option<Vec<u8>>,
+    buffered: VecDeque<(String, FileMeta)>,
+    complete: bool,
+    exclude_named_layout: bool,
+}
+
+impl MavenMemberCursor {
+    fn new(member: &str, exclude_named_layout: bool) -> Self {
+        Self {
+            base: maven_member_prefix(member),
+            after: None,
+            buffered: VecDeque::new(),
+            complete: false,
+            exclude_named_layout,
+        }
+    }
+
+    async fn next(
+        &mut self,
+        index: &PersistentIndex,
+        slot: Slot,
+    ) -> Result<Option<(String, FileMeta)>, ReconcileError> {
+        loop {
+            if let Some(row) = self.buffered.pop_front() {
+                return Ok(Some(row));
+            }
+            if self.complete {
+                return Ok(None);
+            }
+            let (rows, next) = index
+                .scan_objects(
+                    slot,
+                    self.base.as_bytes().to_vec(),
+                    self.after.take(),
+                    MAVEN_STATS_SCAN_PAGE_ROWS,
+                )
+                .await?;
+            self.after = next;
+            self.complete = self.after.is_none();
+            for (key, meta) in rows {
+                let logical = key.strip_prefix(&self.base).ok_or_else(|| {
+                    StoreError::ProjectionInvariant(
+                        "Maven inventory scan escaped its member prefix".to_string(),
+                    )
+                })?;
+                if self.exclude_named_layout && logical.starts_with("repositories/") {
+                    continue;
+                }
+                self.buffered.push_back((logical.to_string(), meta));
+            }
+        }
+    }
+}
+
+struct MavenPrefixBatch<'a> {
+    index: &'a PersistentIndex,
+    slot: Slot,
+    repository: &'a str,
+    rows: Vec<(Vec<u8>, MavenPrefixStats)>,
+    bytes: usize,
+}
+
+impl<'a> MavenPrefixBatch<'a> {
+    fn new(index: &'a PersistentIndex, slot: Slot, repository: &'a str) -> Self {
+        Self {
+            index,
+            slot,
+            repository,
+            rows: Vec::with_capacity(MAX_TX_ROWS),
+            bytes: 0,
+        }
+    }
+
+    async fn push(&mut self, path: String, row: MavenPrefixStats) -> Result<(), ReconcileError> {
+        let key = maven_prefix_stats_key(self.repository, &path);
+        let row_bytes = encoded_row_bytes(&key, &row)?;
+        if row_bytes > MAX_TX_BYTES {
+            return Err(StoreError::TransactionTooLarge.into());
+        }
+        if !self.rows.is_empty()
+            && (self.rows.len() == MAX_TX_ROWS
+                || self
+                    .bytes
+                    .checked_add(row_bytes)
+                    .ok_or(StoreError::ProjectionOverflow)?
+                    > MAX_TX_BYTES)
+        {
+            self.flush().await?;
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(row_bytes)
+            .ok_or(StoreError::ProjectionOverflow)?;
+        self.rows.push((key, row));
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), ReconcileError> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        self.index
+            .put_maven_prefix_stats(self.slot, std::mem::take(&mut self.rows))
+            .await?;
+        self.bytes = 0;
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<(), ReconcileError> {
+        self.flush().await
+    }
+}
+
+#[derive(Debug)]
+struct MavenDirectoryFrame {
+    path: String,
+    stats: MavenPrefixStats,
+}
+
+struct MavenStatsAccumulator {
+    /// Lexicographic traversal keeps only the current ancestor chain open.
+    frames: Vec<MavenDirectoryFrame>,
+}
+
+impl MavenStatsAccumulator {
+    fn new() -> Self {
+        Self {
+            frames: vec![MavenDirectoryFrame {
+                path: String::new(),
+                stats: MavenPrefixStats::default(),
+            }],
+        }
+    }
+
+    fn parent_paths(logical_path: &str) -> Result<Vec<String>, StoreError> {
+        if logical_path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(StoreError::ProjectionInvariant(
+                "Maven object path contains an invalid component".to_string(),
+            ));
+        }
+        let parent = logical_path
+            .rsplit_once('/')
+            .map_or("", |(parent, _)| parent);
+        let mut paths = vec![String::new()];
+        if !parent.is_empty() {
+            let mut current = String::new();
+            for component in parent.split('/') {
+                if !current.is_empty() {
+                    current.push('/');
+                }
+                current.push_str(component);
+                paths.push(current.clone());
+            }
+        }
+        Ok(paths)
+    }
+
+    fn add(
+        &mut self,
+        logical_path: &str,
+        size: u64,
+    ) -> Result<Vec<MavenDirectoryFrame>, StoreError> {
+        let paths = Self::parent_paths(logical_path)?;
+        let common = self
+            .frames
+            .iter()
+            .zip(&paths)
+            .take_while(|(frame, path)| frame.path == **path)
+            .count();
+        let mut finalized = Vec::with_capacity(self.frames.len().saturating_sub(common));
+        while self.frames.len() > common {
+            finalized.push(self.frames.pop().ok_or_else(|| {
+                StoreError::ProjectionInvariant("Maven prefix stack underflow".to_string())
+            })?);
+        }
+        for path in paths.into_iter().skip(common) {
+            self.frames.push(MavenDirectoryFrame {
+                path,
+                stats: MavenPrefixStats::default(),
+            });
+        }
+        for frame in &mut self.frames {
+            checked_add_counter(&mut frame.stats.subtree_files, 1)?;
+            checked_add_counter(&mut frame.stats.subtree_bytes, size)?;
+        }
+        let direct = self.frames.last_mut().ok_or_else(|| {
+            StoreError::ProjectionInvariant("Maven prefix stack is empty".to_string())
+        })?;
+        checked_add_counter(&mut direct.stats.direct_files, 1)?;
+        checked_add_counter(&mut direct.stats.direct_bytes, size)?;
+        Ok(finalized)
+    }
+
+    fn finish(mut self) -> Vec<MavenDirectoryFrame> {
+        let mut finalized = Vec::with_capacity(self.frames.len());
+        while let Some(frame) = self.frames.pop() {
+            finalized.push(frame);
+        }
+        finalized
+    }
+}
+
+/// Build exact logical Maven directory aggregates after the raw object
+/// inventory is complete. Ordered member cursors are merged by logical path;
+/// ties consume every member while the earliest member supplies the winner.
+/// The directory stack finalizes prefixes as lexical traversal leaves them,
+/// bounding memory by member pages, path depth and one writer batch.
+async fn build_maven_prefix_stats(
+    index: &PersistentIndex,
+    slot: Slot,
+    views: &[MavenIndexView],
+) -> Result<(), ReconcileError> {
+    for view in views {
+        if view.members.is_empty() {
+            return Err(StoreError::ProjectionInvariant(format!(
+                "Maven view {:?} has no members",
+                view.repository
+            ))
+            .into());
+        }
+        let mut cursors = view
+            .members
+            .iter()
+            .map(|member| MavenMemberCursor::new(member, view.repository.is_empty()))
+            .collect::<Vec<_>>();
+        let mut heads = Vec::with_capacity(cursors.len());
+        for cursor in &mut cursors {
+            heads.push(cursor.next(index, slot).await?);
+        }
+        let mut accumulator = MavenStatsAccumulator::new();
+        let mut batch = MavenPrefixBatch::new(index, slot, &view.repository);
+        while let Some(winner_index) = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.as_ref().map(|(path, _)| (index, path)))
+            .min_by(|(left_index, left), (right_index, right)| {
+                left.cmp(right).then_with(|| left_index.cmp(right_index))
+            })
+            .map(|(index, _)| index)
+        {
+            let (logical, meta) = heads[winner_index].as_ref().cloned().ok_or_else(|| {
+                StoreError::ProjectionInvariant("Maven merge winner disappeared".to_string())
+            })?;
+            for finalized in accumulator.add(&logical, meta.size)? {
+                batch.push(finalized.path, finalized.stats).await?;
+            }
+            for cursor_index in 0..heads.len() {
+                if heads[cursor_index]
+                    .as_ref()
+                    .is_some_and(|(path, _)| path == &logical)
+                {
+                    heads[cursor_index] = cursors[cursor_index].next(index, slot).await?;
+                }
+            }
+        }
+        for finalized in accumulator.finish() {
+            batch.push(finalized.path, finalized.stats).await?;
+        }
+        batch.finish().await?;
+    }
+    Ok(())
 }
 
 async fn stage_prefix(
@@ -777,6 +1055,7 @@ async fn prepare_maven_incremental(
     repository: &str,
     path: &str,
     recursive: bool,
+    views: &[MavenIndexView],
 ) -> Result<IncrementalUpdate, ReconcileError> {
     if path.is_empty() || path == "*" {
         return Err(StoreError::TransactionTooLarge.into());
@@ -861,11 +1140,17 @@ async fn prepare_maven_incremental(
     };
     Ok(IncrementalUpdate::Maven {
         entity_key: format!("maven\0{repository}\0{logical}").into_bytes(),
+        repository: repository.to_string(),
         object_prefix: object_prefix.into_bytes(),
         repo_prefix: repo_key("maven", &repo_name),
         repo_recursive: recursive,
         objects,
         repos,
+        views: views
+            .iter()
+            .filter(|view| view.members.iter().any(|member| member == repository))
+            .cloned()
+            .collect(),
     })
 }
 
@@ -1154,15 +1439,16 @@ async fn prepare_proxy_npm_incremental(
 async fn prepare_change(
     storage: &Storage,
     event: ChangeEvent,
+    maven_views: &[MavenIndexView],
 ) -> Result<IncrementalUpdate, ReconcileError> {
     match event {
         ChangeEvent::MavenPathChanged { repository, path } => {
-            prepare_maven_incremental(storage, &repository, &path, false).await
+            prepare_maven_incremental(storage, &repository, &path, false, maven_views).await
         }
         ChangeEvent::MavenGaChanged {
             repository,
             ga_path,
-        } => prepare_maven_incremental(storage, &repository, &ga_path, true).await,
+        } => prepare_maven_incremental(storage, &repository, &ga_path, true, maven_views).await,
         ChangeEvent::NpmHostedChanged {
             repository,
             package,
@@ -1182,8 +1468,9 @@ pub async fn apply_change(
     storage: Storage,
     sequence: u64,
     event: ChangeEvent,
+    maven_views: &[MavenIndexView],
 ) -> Result<MetaState, ReconcileError> {
-    let update = prepare_change(&storage, event).await?;
+    let update = prepare_change(&storage, event, maven_views).await?;
     Ok(index.apply_incremental(sequence, update).await?)
 }
 
@@ -1367,12 +1654,35 @@ pub async fn reconcile(
     maven_enabled: bool,
     npm_enabled: bool,
 ) -> Result<MetaState, ReconcileError> {
+    let maven_views = [MavenIndexView::legacy()];
     reconcile_inner(
         index,
         storage,
         config_digest,
         maven_enabled,
         npm_enabled,
+        &maven_views,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn reconcile_with_maven_views(
+    index: Arc<PersistentIndex>,
+    storage: Storage,
+    config_digest: String,
+    maven_enabled: bool,
+    npm_enabled: bool,
+    maven_views: &[MavenIndexView],
+) -> Result<MetaState, ReconcileError> {
+    reconcile_inner(
+        index,
+        storage,
+        config_digest,
+        maven_enabled,
+        npm_enabled,
+        maven_views,
         None,
     )
     .await
@@ -1384,6 +1694,7 @@ pub(super) async fn reconcile_with_progress(
     config_digest: String,
     maven_enabled: bool,
     npm_enabled: bool,
+    maven_views: &[MavenIndexView],
     progress: &ReconcileProgress,
 ) -> Result<MetaState, ReconcileError> {
     progress.begin();
@@ -1393,6 +1704,7 @@ pub(super) async fn reconcile_with_progress(
         config_digest,
         maven_enabled,
         npm_enabled,
+        maven_views,
         Some(progress),
     )
     .await;
@@ -1408,6 +1720,7 @@ async fn reconcile_inner(
     config_digest: String,
     maven_enabled: bool,
     npm_enabled: bool,
+    maven_views: &[MavenIndexView],
     progress: Option<&ReconcileProgress>,
 ) -> Result<MetaState, ReconcileError> {
     index.admit_shadow_build()?;
@@ -1459,6 +1772,19 @@ async fn reconcile_inner(
             .with_label_values(&["maven_inventory", result])
             .observe(started.elapsed().as_secs_f64());
         let (count, artifacts, bytes) = staged?;
+        let prefix_started = std::time::Instant::now();
+        let prefix_result = build_maven_prefix_stats(&index, slot, maven_views).await;
+        crate::metrics::INDEX_RECONCILE_STAGE_DURATION_SECONDS
+            .with_label_values(&[
+                "maven_prefix_stats",
+                if prefix_result.is_ok() {
+                    "success"
+                } else {
+                    "error"
+                },
+            ])
+            .observe(prefix_started.elapsed().as_secs_f64());
+        prefix_result?;
         totals.maven_artifacts = artifacts;
         totals.maven_bytes = bytes;
         completeness.maven = true;
@@ -1564,7 +1890,7 @@ async fn reconcile_inner(
             latest_by_entity.insert(entity, (sequence, event));
         }
         for (_, event) in latest_by_entity.into_values() {
-            let update = prepare_change(&storage, event).await?;
+            let update = prepare_change(&storage, event, maven_views).await?;
             let delta = index.apply_shadow(slot, update).await?;
             apply_totals_delta(&mut totals, delta);
         }
@@ -1661,6 +1987,7 @@ mod tests {
             "cfg".to_string(),
             true,
             false,
+            &[MavenIndexView::legacy()],
             &progress,
         )
         .await
@@ -1729,6 +2056,7 @@ mod tests {
                 "cfg".to_string(),
                 true,
                 true,
+                &[MavenIndexView::legacy()],
                 reconcile_progress.as_ref(),
             )
             .await
@@ -1937,6 +2265,7 @@ mod tests {
             "cfg".to_string(),
             false,
             true,
+            &[MavenIndexView::legacy()],
             &progress,
         )
         .await
@@ -2156,12 +2485,17 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let index =
             PersistentIndex::open(db_dir.path().join("index.redb"), "cfg".to_string()).unwrap();
-        let before = reconcile(
+        let views = [MavenIndexView {
+            repository: "releases".to_string(),
+            members: vec!["releases".to_string()],
+        }];
+        let before = reconcile_with_maven_views(
             Arc::clone(&index),
             storage.clone(),
             "cfg".to_string(),
             true,
             false,
+            &views,
         )
         .await
         .unwrap();
@@ -2183,6 +2517,7 @@ mod tests {
                 repository: "releases".to_string(),
                 path: metadata_path.to_string(),
             },
+            &views,
         )
         .await
         .unwrap();
@@ -2191,6 +2526,269 @@ mod tests {
             after.totals.maven_bytes,
             before.totals.maven_bytes - 3 + b"new-metadata".len() as u64
         );
+        index.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn maven_prefix_stats_are_exact_incremental_grouped_and_warm_reusable() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let logical = "com/acme/app/1.0/app.jar";
+        let releases_key = format!("maven/repositories/releases/{logical}");
+        let public_key = format!("maven/repositories/public/{logical}");
+        storage.put(&releases_key, b"one").await.unwrap();
+        storage.put(&public_key, b"shadowed").await.unwrap();
+        storage
+            .put(
+                "maven/repositories/public/com/acme/other/1.0/other.jar",
+                b"xy",
+            )
+            .await
+            .unwrap();
+        let views = vec![
+            MavenIndexView {
+                repository: "releases".to_string(),
+                members: vec!["releases".to_string()],
+            },
+            MavenIndexView {
+                repository: "public".to_string(),
+                members: vec!["public".to_string()],
+            },
+            MavenIndexView {
+                repository: "all".to_string(),
+                members: vec!["releases".to_string(), "public".to_string()],
+            },
+            MavenIndexView {
+                repository: "empty".to_string(),
+                members: vec!["empty".to_string()],
+            },
+        ];
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.redb");
+        let index = PersistentIndex::open(&db_path, "cfg".to_string()).unwrap();
+        let first = reconcile_with_maven_views(
+            Arc::clone(&index),
+            storage.clone(),
+            "cfg".to_string(),
+            true,
+            false,
+            &views,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.generation, 1);
+        let (roots, generation) = index
+            .maven_repository_rows(vec![
+                "releases".to_string(),
+                "public".to_string(),
+                "all".to_string(),
+                "empty".to_string(),
+                "missing".to_string(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!((roots[0].versions, roots[0].size), (1, 3));
+        assert_eq!((roots[1].versions, roots[1].size), (2, 10));
+        assert_eq!((roots[2].versions, roots[2].size), (2, 5));
+        assert_eq!((roots[3].versions, roots[3].size), (0, 0));
+        assert!(roots[..4].iter().all(|row| row.size_available));
+        assert!(!roots[4].size_available);
+
+        storage.put(&releases_key, b"12345").await.unwrap();
+        let replace_sequence = index
+            .register_change(ChangeEvent::MavenPathChanged {
+                repository: "releases".to_string(),
+                path: logical.to_string(),
+            })
+            .await
+            .unwrap();
+        let replaced = apply_change(
+            Arc::clone(&index),
+            storage.clone(),
+            replace_sequence,
+            ChangeEvent::MavenPathChanged {
+                repository: "releases".to_string(),
+                path: logical.to_string(),
+            },
+            &views,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.generation, 2);
+        let (roots, _) = index
+            .maven_repository_rows(vec!["releases".to_string(), "all".to_string()])
+            .await
+            .unwrap();
+        assert_eq!((roots[0].versions, roots[0].size), (1, 5));
+        assert_eq!((roots[1].versions, roots[1].size), (2, 7));
+
+        storage.delete(&releases_key).await.unwrap();
+        let delete_sequence = index
+            .register_change(ChangeEvent::MavenPathChanged {
+                repository: "releases".to_string(),
+                path: logical.to_string(),
+            })
+            .await
+            .unwrap();
+        let deleted = apply_change(
+            Arc::clone(&index),
+            storage.clone(),
+            delete_sequence,
+            ChangeEvent::MavenPathChanged {
+                repository: "releases".to_string(),
+                path: logical.to_string(),
+            },
+            &views,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted.generation, 3);
+        let (roots, _) = index
+            .maven_repository_rows(vec!["releases".to_string(), "all".to_string()])
+            .await
+            .unwrap();
+        assert_eq!((roots[0].versions, roots[0].size), (0, 0));
+        assert!(roots[0].size_available);
+        assert_eq!((roots[1].versions, roots[1].size), (2, 10));
+        let (children, _, _, _) = index
+            .maven_children_page(
+                "all".to_string(),
+                vec![
+                    "maven/repositories/releases/".to_string(),
+                    "maven/repositories/public/".to_string(),
+                ],
+                String::new(),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "com");
+        assert_eq!((children[0].versions, children[0].size), (2, 10));
+        assert!(children[0].size_available);
+        let (files, _, _) = index
+            .maven_files_page(
+                vec![
+                    "maven/repositories/releases/".to_string(),
+                    "maven/repositories/public/".to_string(),
+                ],
+                "com/acme/app/1.0".to_string(),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(files[0].1.size, 8, "lower member becomes the winner");
+
+        let flipped = reconcile_with_maven_views(
+            Arc::clone(&index),
+            storage,
+            "cfg".to_string(),
+            true,
+            false,
+            &views,
+        )
+        .await
+        .unwrap();
+        assert_ne!(flipped.active_slot, first.active_slot);
+        let expected_generation = flipped.generation;
+        index.shutdown().await;
+        drop(index);
+
+        let reopened =
+            PersistentIndex::open_with_startup_state_for_test(&db_path, "cfg".to_string(), true)
+                .unwrap();
+        assert!(reopened.startup_clean());
+        let (roots, generation) = reopened
+            .maven_repository_rows(vec!["all".to_string(), "empty".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(generation, expected_generation);
+        assert_eq!((roots[0].versions, roots[0].size), (2, 10));
+        assert_eq!((roots[1].versions, roots[1].size), (0, 0));
+        assert!(roots.iter().all(|row| row.size_available));
+        reopened.shutdown().await;
+    }
+
+    #[test]
+    fn maven_prefix_stats_reject_counter_overflow() {
+        let mut stats = MavenStatsAccumulator::new();
+        stats.frames[0].stats.subtree_files = u64::MAX;
+        assert!(matches!(
+            stats.add("artifact.jar", 0),
+            Err(StoreError::ProjectionOverflow)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_group_incremental_fails_closed_without_partial_publication() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(storage_dir.path().to_str().unwrap());
+        let logical = "com/acme/app/1.0/app.jar";
+        let key = format!("maven/repositories/member000/{logical}");
+        storage.put(&key, b"old").await.unwrap();
+        let members = (0..=500)
+            .map(|index| format!("member{index:03}"))
+            .collect::<Vec<_>>();
+        let views = [MavenIndexView {
+            repository: "all".to_string(),
+            members,
+        }];
+        let db_dir = tempfile::tempdir().unwrap();
+        let index =
+            PersistentIndex::open(db_dir.path().join("index.redb"), "cfg".to_string()).unwrap();
+        let before = reconcile_with_maven_views(
+            Arc::clone(&index),
+            storage.clone(),
+            "cfg".to_string(),
+            true,
+            false,
+            &views,
+        )
+        .await
+        .unwrap();
+        storage.put(&key, b"replacement").await.unwrap();
+        let sequence = index
+            .register_change(ChangeEvent::MavenPathChanged {
+                repository: "member000".to_string(),
+                path: logical.to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            apply_change(
+                Arc::clone(&index),
+                storage,
+                sequence,
+                ChangeEvent::MavenPathChanged {
+                    repository: "member000".to_string(),
+                    path: logical.to_string(),
+                },
+                &views,
+            )
+            .await,
+            Err(ReconcileError::Store(StoreError::TransactionTooLarge))
+        ));
+        let meta = index.meta().await.unwrap();
+        assert_eq!(meta.generation, before.generation);
+        let active = meta.active_slot.unwrap();
+        assert_eq!(
+            index
+                .get_object_in_slot(active, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            3
+        );
+        let (roots, generation) = index
+            .maven_repository_rows(vec!["all".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(generation, before.generation);
+        assert_eq!((roots[0].versions, roots[0].size), (1, 3));
         index.shutdown().await;
     }
 
@@ -2253,12 +2851,17 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let index =
             PersistentIndex::open(db_dir.path().join("index.redb"), "cfg".to_string()).unwrap();
-        reconcile(
+        let views = [MavenIndexView {
+            repository: "releases".to_string(),
+            members: vec!["releases".to_string()],
+        }];
+        reconcile_with_maven_views(
             Arc::clone(&index),
             storage.clone(),
             "cfg".to_string(),
             true,
             false,
+            &views,
         )
         .await
         .unwrap();
@@ -2286,6 +2889,7 @@ mod tests {
                 repository: "releases".to_string(),
                 path: "com/acme/app/1.0/app-1.0.jar".to_string(),
             },
+            &views,
         )
         .await
         .unwrap();
@@ -2332,12 +2936,17 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let index =
             PersistentIndex::open(db_dir.path().join("index.redb"), "cfg".to_string()).unwrap();
-        reconcile(
+        let views = vec![MavenIndexView {
+            repository: "releases".to_string(),
+            members: vec!["releases".to_string()],
+        }];
+        reconcile_with_maven_views(
             index.clone(),
             authoritative.clone(),
             "cfg".to_string(),
             true,
             false,
+            &views,
         )
         .await
         .unwrap();
@@ -2354,13 +2963,19 @@ mod tests {
                 release.clone(),
             ),
         ));
-        let scan = tokio::spawn(reconcile(
-            index.clone(),
-            scan_storage,
-            "cfg".to_string(),
-            true,
-            false,
-        ));
+        let scan_index = index.clone();
+        let scan_views = views.clone();
+        let scan = tokio::spawn(async move {
+            reconcile_with_maven_views(
+                scan_index,
+                scan_storage,
+                "cfg".to_string(),
+                true,
+                false,
+                &scan_views,
+            )
+            .await
+        });
         captured.wait().await;
         authoritative.put(artifact, b"replacement").await.unwrap();
         index
@@ -2395,13 +3010,19 @@ mod tests {
                 release.clone(),
             ),
         ));
-        let scan = tokio::spawn(reconcile(
-            index.clone(),
-            scan_storage,
-            "cfg".to_string(),
-            true,
-            false,
-        ));
+        let scan_index = index.clone();
+        let scan_views = views.clone();
+        let scan = tokio::spawn(async move {
+            reconcile_with_maven_views(
+                scan_index,
+                scan_storage,
+                "cfg".to_string(),
+                true,
+                false,
+                &scan_views,
+            )
+            .await
+        });
         captured.wait().await;
         authoritative.put(artifact, b"unresolved").await.unwrap();
         index
@@ -2491,6 +3112,7 @@ mod tests {
                 repository: "npm-private".to_string(),
                 package: "pkg".to_string(),
             },
+            &[MavenIndexView::legacy()],
         )
         .await
         .unwrap();
@@ -2524,6 +3146,7 @@ mod tests {
                 repository: "npm-private".to_string(),
                 package: "pkg".to_string(),
             },
+            &[MavenIndexView::legacy()],
         )
         .await
         .unwrap();

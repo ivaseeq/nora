@@ -530,6 +530,12 @@ git -C "$FIXTURE" add scripts/redb-production-allowlist.txt
 expect_rejected "allowlist resolved commit substitution" "approval is not bound"
 
 write_valid_fixture
+approval_row=$(<"$FIXTURE/scripts/redb-production-allowlist.txt")
+printf '%s\n' "$approval_row" >>"$FIXTURE/scripts/redb-production-allowlist.txt"
+git -C "$FIXTURE" add scripts/redb-production-allowlist.txt
+expect_rejected "duplicate allowlist approval" "exactly one reviewed"
+
+write_valid_fixture
 printf '\n' >>"$FIXTURE/scripts/redb-production-evidence/$REVISION.json"
 git -C "$FIXTURE" add "scripts/redb-production-evidence/$REVISION.json"
 expect_rejected "modified evidence manifest" "manifest digest does not match"

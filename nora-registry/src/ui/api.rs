@@ -1239,17 +1239,6 @@ pub async fn get_maven_dir_page(
     }
 
     if !state.config.maven.repositories.is_empty() && path.is_empty() {
-        let identity = state
-            .repo_index
-            .persistent_maven_children(Vec::new(), String::new(), None, 1)
-            .await
-            .map_err(|_| PageError::Unavailable)?;
-        if cursor.as_ref().is_some_and(|cursor| {
-            cursor.generation != identity.generation
-                || cursor.config_digest != identity.config_digest
-        }) {
-            return Err(PageError::GenerationChanged);
-        }
         let mut names = state
             .config
             .maven
@@ -1259,20 +1248,24 @@ pub async fn get_maven_dir_page(
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
-        let mut rows = names
+        let names = names
             .into_iter()
             .filter(|name| after.as_ref().is_none_or(|after| name > after))
             .take(limit + 1)
-            .map(|name| RepoInfo {
-                name,
-                versions: 0,
-                size: 0,
-                size_available: false,
-                updated: "N/A".to_string(),
-                is_file: false,
-            })
             .collect::<Vec<_>>();
-        let has_more = rows.len() > limit;
+        let has_more = names.len() > limit;
+        let mut identity = state
+            .repo_index
+            .persistent_maven_roots(names)
+            .await
+            .map_err(|_| PageError::Unavailable)?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            cursor.generation != identity.generation
+                || cursor.config_digest != identity.config_digest
+        }) {
+            return Err(PageError::GenerationChanged);
+        }
+        let rows = &mut identity.items;
         rows.truncate(limit);
         let continuation_token = has_more
             .then(|| rows.last().map(|row| row.name.as_bytes().to_vec()))
@@ -1288,14 +1281,15 @@ pub async fn get_maven_dir_page(
                 })
             });
         return Ok(MavenDirectoryEnvelope {
-            items: rows,
+            items: std::mem::take(rows),
             continuation_token,
             is_leaf: false,
         });
     }
 
-    let (prefixes, logical_path) = if state.config.maven.repositories.is_empty() {
+    let (stats_repository, prefixes, logical_path) = if state.config.maven.repositories.is_empty() {
         (
+            String::new(),
             vec!["maven/".to_string()],
             path.trim_matches('/').to_string(),
         )
@@ -1308,11 +1302,15 @@ pub async fn get_maven_dir_page(
                 is_leaf: false,
             });
         };
-        (prefixes, logical_path.trim_matches('/').to_string())
+        (
+            repository.to_string(),
+            prefixes,
+            logical_path.trim_matches('/').to_string(),
+        )
     };
     let mut page = state
         .repo_index
-        .persistent_maven_children(prefixes, logical_path, after, limit)
+        .persistent_maven_children(stats_repository, prefixes, logical_path, after, limit)
         .await
         .map_err(|_| PageError::Unavailable)?;
     if cursor.as_ref().is_some_and(|cursor| {
@@ -1772,6 +1770,30 @@ mod named_maven_tests {
         indexed_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
         indexed_only.repo_index = Arc::clone(&index);
 
+        let group_root = get_maven_dir_page(&indexed_only, "", None, 100)
+            .await
+            .unwrap();
+        let public = group_root
+            .items
+            .iter()
+            .find(|row| row.name == "public")
+            .unwrap();
+        assert_eq!((public.versions, public.size), (2, 8));
+        assert!(public.size_available);
+        let group_children = get_maven_dir_page(&indexed_only, "public/com/example", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(group_children.items.len(), 1);
+        assert_eq!(
+            (
+                group_children.items[0].name.as_str(),
+                group_children.items[0].versions,
+                group_children.items[0].size,
+            ),
+            ("app", 2, 8)
+        );
+        assert!(group_children.items[0].size_available);
+
         let (entries, leaf) = get_maven_dir_listing(&indexed_only, "public/com/example/app/1.0")
             .await
             .unwrap();
@@ -1849,16 +1871,34 @@ mod named_maven_tests {
         indexed_only.storage = Storage::from_backend(std::sync::Arc::new(backend));
         indexed_only.repo_index = Arc::clone(&index);
 
+        let root = get_maven_dir_page(&indexed_only, "", None, 100)
+            .await
+            .unwrap();
+        assert_eq!(root.items.len(), 1);
+        assert_eq!(root.items[0].name, "releases");
+        assert_eq!((root.items[0].versions, root.items[0].size), (210, 735));
+        assert!(root.items[0].size_available);
+
         let first = get_maven_dir_page(&indexed_only, "releases/com/example", None, 100)
             .await
             .unwrap();
         assert_eq!(first.items.len(), 100);
+        assert!(first.items.iter().all(|row| {
+            row.versions == 1 && row.size == 3 && row.size_available && row.updated == "N/A"
+        }));
         let token = first
             .continuation_token
             .expect("children need a second page");
         let second = get_maven_dir_page(&indexed_only, "releases/com/example", Some(token), 100)
             .await
             .unwrap();
+        let bundle = second
+            .items
+            .iter()
+            .find(|row| row.name == "bundle")
+            .unwrap();
+        assert_eq!((bundle.versions, bundle.size), (105, 420));
+        assert!(bundle.size_available);
         let child_names = first
             .items
             .into_iter()

@@ -33,6 +33,9 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Block public image rebuilds for exact-git redb
+        run: scripts/verify-public-release-redb-policy.sh
+
       - name: Install ORAS for immutable redb evidence verification
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
         with:
@@ -40,6 +43,9 @@ jobs:
 
       - name: Test redb production release gate
         run: scripts/test-redb-production-release-gate.sh
+
+      - name: Test redb production entrypoint
+        run: scripts/redb-production-gate-test.sh
 
       - name: Block unreviewed redb engine releases
         run: scripts/verify-redb-production-release.sh
