@@ -76,6 +76,23 @@ require_one_line() {
     printf '%s\n' "${matches[0]}"
 }
 
+require_consistent_line() {
+    local label=$1 key=$2 pattern=$3 file=$4 candidate
+    local -a matches
+    mapfile -t matches < <(grep -E -- "^${key}=" "$file" || true)
+    ((${#matches[@]} >= 1)) \
+        || fail "$label was not reported"
+    for candidate in "${matches[@]}"; do
+        [[ "$candidate" =~ $pattern ]] \
+            || fail "$label reported a malformed value"
+    done
+    for candidate in "${matches[@]:1}"; do
+        [[ "$candidate" == "${matches[0]}" ]] \
+            || fail "$label reported conflicting values"
+    done
+    printf '%s\n' "${matches[0]}"
+}
+
 require_harbor_immutability() {
     local docker_config_file curl_config response
     HARBOR_POLICY_CHECKS=$((HARBOR_POLICY_CHECKS + 1))
@@ -314,7 +331,7 @@ run_promotion() {
     verify_log="$RUN_ROOT/app-verify.log"
     "$APP_GATE" verify >"$verify_log" \
         || fail "argument-free app approval verification failed"
-    image_line=$(require_one_line "approved image" \
+    image_line=$(require_consistent_line "approved image" image \
         '^image=docker-hub\.just-ai\.com/infra/artifact-nora@sha256:[0-9a-f]{64}$' \
         "$verify_log")
     tree_line=$(require_one_line "approved app tree" \

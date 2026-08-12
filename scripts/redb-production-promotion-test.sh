@@ -42,6 +42,13 @@ set -Eeuo pipefail
 echo "app-verify" >>"\$NORA_PROMOTION_TEST_LOG"
 echo "PASS: fixture approval"
 echo "image=$IMAGE"
+echo "image=$IMAGE"
+if [[ \${NORA_PROMOTION_TEST_CONFLICTING_IMAGE:-0} == 1 ]]; then
+    echo "image=docker-hub.just-ai.com/infra/artifact-nora@sha256:$(printf 'c%.0s' {1..64})"
+fi
+if [[ \${NORA_PROMOTION_TEST_MALFORMED_IMAGE:-0} == 1 ]]; then
+    echo "image=not-a-digest"
+fi
 echo "image_source_tree=$SOURCE_TREE"
 EOF
 cat >"$APP_REPO/nora-registry/Cargo.toml" <<'EOF'
@@ -387,6 +394,12 @@ grep -Fq 'sanitized-values' "$LOG"
 
 expect_failure "Harbor must have one enabled immutable rule" \
     env NORA_PROMOTION_TEST_BAD_POLICY=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
+expect_failure "approved image reported conflicting values" \
+    env NORA_PROMOTION_TEST_CONFLICTING_IMAGE=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
+expect_failure "approved image reported a malformed value" \
+    env NORA_PROMOTION_TEST_MALFORMED_IMAGE=1 \
     "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
 
 printf 'untracked chart input\n' >"$CHART/untracked.txt"
