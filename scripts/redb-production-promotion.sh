@@ -316,17 +316,20 @@ verify_live_result() {
         --arg digest "$expected_digest" '
         [.items[]
          | select(.metadata.deletionTimestamp == null)
+         | select([.spec.containers[]?
+                   | select(.name == $container)
+                   | .image] == [$image])
          | select(.status.phase == "Running")
          | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
          | .status.containerStatuses[]?
          | select(.name == $container)
-         | select(.ready == true and .image == $image)
+         | select(.ready == true)
          | select(.imageID == $digest
                   or (.imageID | endswith("@" + $digest))
                   or (.imageID | endswith("/" + $digest)))]
         | length == 1
     ' "$pods_json" >/dev/null \
-        || fail "running Pod imageID does not match the approved digest"
+        || fail "running Pod does not match the approved image and imageID"
 }
 
 run_promotion() {

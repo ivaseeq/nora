@@ -358,16 +358,26 @@ elif [[ "$1 $2" == "get pods" && "$3" == -l \
     if [[ ${NORA_PROMOTION_TEST_BAD_IMAGE_ID:-0} == 1 ]]; then
         image_id="containerd://sha256:$(printf 'c%.0s' {1..64})"
     fi
-    jq -n --arg image_id "$image_id" '{
+    pod_digest=$(printf 'b%.0s' {1..64})
+    if [[ $(printenv NORA_PROMOTION_TEST_BAD_POD_SPEC_IMAGE 2>/dev/null || true) == 1 ]]; then
+        pod_digest=$(printf 'c%.0s' {1..64})
+    fi
+    jq -n --arg image_id "$image_id" --arg pod_digest "$pod_digest" '{
       items: [{
         metadata: {deletionTimestamp: null},
+        spec: {
+          containers: [{
+            name: "nora",
+            image: ("docker-hub.just-ai.com/infra/artifact-nora@sha256:" + $pod_digest)
+          }]
+        },
         status: {
           phase: "Running",
           conditions: [{type: "Ready", status: "True"}],
           containerStatuses: [{
             name: "nora",
             ready: true,
-            image: "docker-hub.just-ai.com/infra/artifact-nora@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            image: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             imageID: $image_id
           }]
         }
@@ -499,7 +509,11 @@ expect_failure "deployed Deployment does not match" \
     env NORA_PROMOTION_TEST_BAD_DEPLOYMENT=1 \
     "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
 
-expect_failure "running Pod imageID does not match" \
+expect_failure "running Pod does not match the approved image and imageID" \
+    env NORA_PROMOTION_TEST_BAD_POD_SPEC_IMAGE=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
+
+expect_failure "running Pod does not match the approved image and imageID" \
     env NORA_PROMOTION_TEST_BAD_IMAGE_ID=1 \
     "$APP_REPO/scripts/redb-production-promotion.sh" apply "$CHART"
 
