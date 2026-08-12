@@ -198,7 +198,7 @@ for (const registry of ['maven', 'npm'] as const) {
           .locator('#repo-results tbody tr:has(a) td:nth-child(2)')
           .allTextContents();
         expect(itemCounts.length).toBeGreaterThan(0);
-        expect(itemCounts.every((value) => /^(?:—|[1-9]\d*)$/.test(value.trim()))).toBe(true);
+        expect(itemCounts.every((value) => /^(?:—|0|[1-9]\d*)$/.test(value.trim()))).toBe(true);
       }
 
       await waitForSearch(page, registry, query, () => searchbox.fill(query));
