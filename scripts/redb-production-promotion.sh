@@ -165,7 +165,11 @@ PY
     jq -e '
         type == "array"
         and ([.[]
-              | select(.disabled == false and .action == "immutable")
+              # Harbor serializes the active false value with omitempty, so
+              # an enabled rule may omit disabled. Reject explicit null and
+              # every non-boolean value instead of treating them as enabled.
+              | select(((has("disabled") | not) or (.disabled == false))
+                       and .action == "immutable")
               | select((.scope_selectors | keys) == ["repository"])
               | select(.scope_selectors.repository | length == 1)
               | select(.scope_selectors.repository[0].kind == "doublestar")

@@ -153,9 +153,21 @@ done
 grep -Fq 'user = "user:pass"' "$config"
 if [[ ${NORA_PROMOTION_TEST_BAD_POLICY:-0} == 1 ]]; then
     printf '[]\n' >"$output"
+elif [[ ${NORA_PROMOTION_TEST_DISABLED_POLICY:-0} == 1 ]]; then
+    cat >"$output" <<'JSON'
+[{"disabled":true,"action":"immutable","scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"nora"}]},"tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}]}]
+JSON
+elif [[ ${NORA_PROMOTION_TEST_NULL_POLICY:-0} == 1 ]]; then
+    cat >"$output" <<'JSON'
+[{"disabled":null,"action":"immutable","scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"nora"}]},"tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}]}]
+JSON
+elif [[ ${NORA_PROMOTION_TEST_MALFORMED_POLICY:-0} == 1 ]]; then
+    cat >"$output" <<'JSON'
+[{"disabled":"false","action":"immutable","scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"nora"}]},"tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}]}]
+JSON
 else
     cat >"$output" <<'JSON'
-[{"disabled":false,"action":"immutable","scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"nora"}]},"tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}]}]
+[{"action":"immutable","scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"nora"}]},"tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}]}]
 JSON
 fi
 EOF
@@ -394,6 +406,15 @@ grep -Fq 'sanitized-values' "$LOG"
 
 expect_failure "Harbor must have one enabled immutable rule" \
     env NORA_PROMOTION_TEST_BAD_POLICY=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
+expect_failure "Harbor must have one enabled immutable rule" \
+    env NORA_PROMOTION_TEST_DISABLED_POLICY=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
+expect_failure "Harbor must have one enabled immutable rule" \
+    env NORA_PROMOTION_TEST_NULL_POLICY=1 \
+    "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
+expect_failure "Harbor must have one enabled immutable rule" \
+    env NORA_PROMOTION_TEST_MALFORMED_POLICY=1 \
     "$APP_REPO/scripts/redb-production-promotion.sh" preflight "$CHART"
 expect_failure "approved image reported conflicting values" \
     env NORA_PROMOTION_TEST_CONFLICTING_IMAGE=1 \
